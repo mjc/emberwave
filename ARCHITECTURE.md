@@ -1864,3 +1864,22 @@ The last frame's detail, always, gains everything on a still picture and loses u
 **Not done.** The iPhone half of #81, which needs the phone. A real client's pipeline, with its other threads and a heavier draw. HEVC into BGRA in the loop.
 
 **Consequence.** The shared benchmark code gains a `PictureSink` type, a settable `FrameClock.rate`, and entry points that decode a prepared HEVC stream paced with a sink; the iOS app's behaviour is unchanged. The script's deployment target is macOS 14.
+
+### 2026-11-16 — D73: What the shared library exports
+
+**Context.** Before 1.0 the C library's export table is part of what a client can depend on, and a name that a dependency leaves in it can become one. Nothing checked it. The item was on the list of what was left for 1.0 (D70).
+
+**Measured, on 2026-11-16 (release 0.18.1 plus wgpu 30.0.2).**
+- The macOS shared library (`nm -gU`) exports 66 names: the 62 functions of `include/emberwave.h`, and 4 more, `___CLASS_`, `___DROP_FLAG_OFFSET_`, `___IVAR_OFFSET_` and `___REGISTER_CLASS_` followed by `RawWindowMetalLayer`, the Objective-C class registration of a class that raw-window-metal declares with objc2's `define_class!`.
+- The Linux shared library (`nm -D --defined-only`, in a Debian 12 container with the current stable Rust) exports the 62 functions and nothing else. Windows was not measured here: rustc exports the `#[no_mangle]` functions of the crate there too.
+- The static library has about 18,600 external symbols, nearly all Rust-mangled names of the standard library, wgpu and the like. A static library has no export table to restrict: a program that links it into an executable exports none of them.
+- No client needs the four names: the C examples, the Swift package and the iOS app do not use them.
+
+**Decision.** A test, `crates/emberwave-ffi/tests/exports.rs`, builds the shared library, reads its export table with `nm` and fails unless it is the functions of the header and nothing else, on macOS and on Linux, where CI runs it. The header is the list, as the header test already makes it the truth about the source, so a new C function cannot be forgotten and a new stray name cannot pass. The test knows one exception, the four Objective-C class names per class on macOS.
+
+**Not done: hiding the four names.** A linker list for them was tried: ld64 refuses `-unexported_symbols_list` together with an exported list, and rustc passes its own `-exported_symbols_list` for every `#[no_mangle]` item of the dependencies, so the names cannot be taken out through a flag. Taking them out of the file after linking has no standard tool on macOS. They are bookkeeping of an Objective-C class that a client's program never meets, so the exception stays, in the test, with its reason. A different raw-window-metal or objc2 that stops exporting them would not fail the test.
+
+**Not done: restricting the Linux and Windows tables** with a version script or a `.def` file: rustc's own already gives the functions and nothing else, and a second one would fight it.
+
+**Consequence.** No client-visible change: no function, name or behaviour changes. A change that adds a C function without updating the header fails the header test, one that exports another name fails this one.
+
