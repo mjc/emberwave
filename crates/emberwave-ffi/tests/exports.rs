@@ -5,11 +5,11 @@
 //! fails the test. Rust's standard library, wgpu and the dependencies' leftovers
 //! stay inside the library.
 //!
-//! One exception, on macOS: four names per Objective-C class that a dependency
-//! declares with objc2's `define_class!` (raw-window-metal's
-//! `RawWindowMetalLayer` is the one there is), `___CLASS_`,
-//! `___DROP_FLAG_OFFSET_`, `___IVAR_OFFSET_` and `___REGISTER_CLASS_` followed
-//! by the class's name. rustc exports every `#[no_mangle]` item of the
+//! One exception, on macOS: the four names of the Objective-C class that a
+//! dependency, raw-window-metal, declares with objc2's `define_class!`:
+//! `___CLASS_RawWindowMetalLayer`, `___DROP_FLAG_OFFSET_RawWindowMetalLayer`,
+//! `___IVAR_OFFSET_RawWindowMetalLayer` and `___REGISTER_CLASS_RawWindowMetalLayer`.
+//! rustc exports every `#[export_name]` and `#[no_mangle]` item of the
 //! dependencies, passes the linker a list of them with `-exported_symbols_list`,
 //! and ld64 takes no second list that removes names from it (`-unexported_*`
 //! cannot be used with `-exported_*`), so they stay in the export table; no
@@ -52,17 +52,54 @@ fn header_functions() -> BTreeSet<String> {
     names
 }
 
-/// The shared library, built anew, at the place cargo reports for it: `cargo
-/// test` builds the library for the tests as an rlib only, so a shared library
-/// left from an earlier build would be checked otherwise, and where cargo puts
-/// the files depends on its version and its settings.
-fn library() -> PathBuf {
-    let profile = {
-        let exe = std::env::current_exe().expect("the test's path is known");
-        // The profile's directory is named after it: debug or release.
-        exe.ancestors()
-            .any(|dir| dir.file_name().is_some_and(|name| name == "release"))
+/// Where cargo puts what this test run builds: the target directory, the
+/// target triple if there is one (`cargo test --target`), and the profile's
+/// directory. They are read from the test's own path, which is below
+/// `TARGET/[TRIPLE/]PROFILE/`, so that the build below goes to the same place
+/// whatever `--target-dir`, `CARGO_TARGET_DIR`, `--target` and `--profile`
+/// the test was started with.
+struct Layout {
+    target_dir: PathBuf,
+    triple: Option<String>,
+    profile_dir: String,
+}
+
+fn layout() -> Layout {
+    let exe = std::env::current_exe().expect("the test's path is known");
+    // The outermost directory that cargo marked as a target directory.
+    let target_dir = exe
+        .ancestors()
+        .filter(|dir| dir.join("CACHEDIR.TAG").exists())
+        .last()
+        .expect("the test runs below a target directory")
+        .to_path_buf();
+    let rest: Vec<String> = exe
+        .strip_prefix(&target_dir)
+        .expect("the test is below the target directory")
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    // TARGET/PROFILE/... or TARGET/TRIPLE/PROFILE/...: a triple has dashes,
+    // which no profile's directory has.
+    let (triple, profile_dir) = if rest[0].contains('-') {
+        (Some(rest[0].clone()), rest[1].clone())
+    } else {
+        (None, rest[0].clone())
     };
+    Layout {
+        target_dir,
+        triple,
+        profile_dir,
+    }
+}
+
+/// The shared library, built anew, at the place cargo reports for it: `cargo
+/// test` compiles the library for the tests but does not put the shared
+/// library at the top of the profile's directory, where a C program looks for
+/// it, and a shared library left there from an earlier build would be checked
+/// otherwise.
+fn library() -> PathBuf {
+    let layout = layout();
     let mut build = Command::new(env!("CARGO"));
     build.args([
         "build",
@@ -71,9 +108,22 @@ fn library() -> PathBuf {
         "--lib",
         "--locked",
         "--message-format=json",
+        "--target-dir",
     ]);
-    if profile {
-        build.arg("--release");
+    build.arg(&layout.target_dir);
+    if let Some(triple) = &layout.triple {
+        build.args(["--target", triple]);
+    }
+    // The dev and release profiles have directories of their own, others are
+    // named after the profile.
+    match layout.profile_dir.as_str() {
+        "debug" => {}
+        "release" => {
+            build.arg("--release");
+        }
+        other => {
+            build.args(["--profile", other]);
+        }
     }
     let output = build.output().expect("cargo runs");
     assert!(
@@ -130,18 +180,19 @@ fn exported(library: &PathBuf) -> BTreeSet<String> {
         .collect()
 }
 
-/// The Objective-C class registration names that objc2 leaves in the table of a
-/// macOS library, as nm prints them after the leading underscore is removed.
+/// The four names of the Objective-C class that raw-window-metal declares,
+/// `RawWindowMetalLayer`, as nm prints them after the leading underscore is
+/// removed. A class that another dependency declares, or a change of these
+/// names, fails the test until someone has looked at it.
 fn objc_class_leftover(name: &str) -> bool {
     cfg!(target_os = "macos")
         && [
-            "__CLASS_",
-            "__DROP_FLAG_OFFSET_",
-            "__IVAR_OFFSET_",
-            "__REGISTER_CLASS_",
+            "__CLASS_RawWindowMetalLayer",
+            "__DROP_FLAG_OFFSET_RawWindowMetalLayer",
+            "__IVAR_OFFSET_RawWindowMetalLayer",
+            "__REGISTER_CLASS_RawWindowMetalLayer",
         ]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
+        .contains(&name)
 }
 
 #[test]

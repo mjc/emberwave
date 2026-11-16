@@ -27,7 +27,7 @@ cargo rustc --release -p emberwave-ffi --lib --crate-type staticlib \
 
 The commands below assume an archive unpacked into `emberwave/` and a program `app.c`.
 
-The shared library exports the functions of `emberwave.h` and nothing else, on Linux and Windows; on macOS four more names beside them belong to an Objective-C class of a dependency (`___CLASS_RawWindowMetalLayer` and three like it) and are not part of the API (decision D73). `tests/exports.rs` checks this.
+The shared library exports the functions of `emberwave.h` and nothing else: checked by `tests/exports.rs` on Linux, and on macOS apart from four more names beside them that belong to an Objective-C class of a dependency (`___CLASS_RawWindowMetalLayer` and three like it) and are not part of the API (decision D73). On Windows rustc's own export table is used, and the test does not run.
 
 The shared library names itself `@rpath/libemberwave_ffi.dylib` on macOS and `libemberwave_ffi.so` on Linux, so a program looks for it on its run path. These commands set the run path to a `lib` directory next to the program and put the library there:
 
