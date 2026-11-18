@@ -7,7 +7,7 @@
 #   --frames N     frames measured per number (default 600: ten passes over
 #                  each 60-frame stream, so that the 99th percentile is not
 #                  simply the slowest frame); the CPU encoder, which takes a
-#                  quarter of a second for a 4K frame, gets a tenth of it
+#                  fifth of a second for a 4K frame, gets a tenth of it
 #   --no-upstream  do not time upstream's Metal decoder and encoder for
 #                  comparison
 #
@@ -82,7 +82,7 @@ for stream in $STREAMS; do
     fi
 done
 
-# The CPU encoder takes a quarter of a second for a 4K frame: a tenth of the
+# The CPU encoder takes a fifth of a second for a 4K frame: a tenth of the
 # frames, one at least.
 CPU_FRAMES=$(( FRAMES >= 10 ? FRAMES / 10 : 1 ))
 for entry in $ENCODE; do

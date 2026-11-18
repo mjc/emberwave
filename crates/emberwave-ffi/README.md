@@ -105,7 +105,7 @@ swift run --package-path crates/emberwave-ffi/examples/swift \
     emberwave-decode testdata/noise_192x136_420.pwv1 out.y4m
 ```
 
-`scripts/check_xcframework.sh` builds the C examples and the Swift example against every library of the XCFramework. It also builds the Swift example from `Emberwave.xcframework.zip` as a binary target, as an app's package takes a release's archive. CI runs them on a Mac and in an iOS Simulator, and links them for devices. They have not run on an iPhone or an iPad yet, where an app has to be signed by its developer. The Swift example is for macOS 12, the oldest that the Swift Build of Xcode 27 takes; the library runs on macOS 11.
+`scripts/check_xcframework.sh` builds the C examples and the Swift example against every library of the XCFramework. It also builds the Swift example from `Emberwave.xcframework.zip` as a binary target, as an app's package takes a release's archive. CI runs them on a Mac and in an iOS Simulator, and links them for devices. The examples have not run on an iPhone or an iPad, where an app has to be signed by its developer; the benchmark app has (decision D35). The Swift example is for macOS 12, the oldest that the Swift Build of Xcode 27 takes; the library runs on macOS 11.
 
 ## Use
 
