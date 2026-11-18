@@ -13,7 +13,9 @@
 
 // One 8-bit 4:2:0 Y4M, fetched whole: its header, then FRAME and the planes.
 async function loadY4M(url, maxFrames) {
-  const data = new Uint8Array(await (await fetch(url)).arrayBuffer());
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url}: ${response.status}`);
+  const data = new Uint8Array(await response.arrayBuffer());
   let end = data.indexOf(10);
   const header = new TextDecoder().decode(data.subarray(0, end));
   const width = Number(/ W(\d+)/.exec(header)[1]);
@@ -146,7 +148,6 @@ window.run = async function (cfg) {
   out.encoderSupported = support.supported;
   if (!support.supported) return out;
   encoder.configure(config);
-  const t0 = performance.now();
   out.encoderHeld = 0;
   for (let i = 0; i < frames.length; i++) {
     const frame = new VideoFrame(frames[i], { format: 'I420', codedWidth: width, codedHeight: height, timestamp: timestampOf(i), duration: Math.round(step) });
@@ -161,75 +162,93 @@ window.run = async function (cfg) {
   }
   await encoder.flush();
   encoder.close();
-  out.encodeWallMs = performance.now() - t0;
   if (chunks.some((c) => c === null)) { out.error = `${chunks.filter((c) => c).length} chunks for ${frames.length} frames`; return out; }
   out.encodeMs = encodeMs;
   out.chunkBytes = chunks.map((c) => c.data.length);
   out.chunkTypes = chunks.map((c) => c.type);
 
-  // Decoding, one chunk at a time, the time from decode() until its frame,
-  // held back frames as above (no flush in between: a decoder needs a key
-  // frame after one).
-  const decoded = new Array(frames.length).fill(null);
-  const decodeMs = new Array(frames.length).fill(null);
-  const decodeSubmitted = new Map();
-  const decodeArrivals = new Map();
-  let decoderError = null;
-  const decoder = new VideoDecoder({
-    output: async (frame) => {
-      const at = performance.now();
-      const index = indexOf(frame.timestamp);
-      decodeMs[index] = at - decodeSubmitted.get(index);
-      if (decodeArrivals.has(index)) decodeArrivals.get(index)();
-      decoded[index] = await planes(frame, width, height);
-      frame.close();
-    },
-    error: (e) => { decoderError = e; for (const r of decodeArrivals.values()) r(); },
-  });
-  const dconfig = { codec, codedWidth: width, codedHeight: height, hardwareAcceleration: decodeHw };
+  // The chunks are decoded three times, so that what is timed is not copied
+  // out of the decoder and what is compared is not timed.
   const description = chunks.find((c) => c.description)?.description;
+  const dconfig = { codec, codedWidth: width, codedHeight: height, hardwareAcceleration: decodeHw };
   if (description) dconfig.description = description;
   const dsupport = await VideoDecoder.isConfigSupported(dconfig);
   out.decoderSupported = dsupport.supported;
   if (!dsupport.supported) return out;
-  decoder.configure(dconfig);
-  out.decoderHeld = 0;
-  const d0 = performance.now();
-  for (let i = 0; i < chunks.length; i++) {
-    const c = chunks[i];
-    const got = new Promise((resolve) => { decodeArrivals.set(i, resolve); });
-    decodeSubmitted.set(i, performance.now());
-    decoder.decode(new EncodedVideoChunk({ type: c.type, timestamp: c.timestamp, data: c.data }));
-    if ((await within(got, 1000)) === null) out.decoderHeld++;
-    if (decoderError) { out.decoderError = String(decoderError); return out; }
-  }
-  await decoder.flush();
-  // The last frames' copies out of the decoder may still be under way.
-  for (let i = 0; i < 100 && decoded.some((d) => d === null); i++) await sleep(50);
-  decoder.close();
-  out.decodeWallMs = performance.now() - d0;
-  out.decodeMs = decodeMs;
-  out.decodedFrames = decoded.filter((d) => d).length;
+  const chunkOf = (c) => new EncodedVideoChunk({ type: c.type, timestamp: c.timestamp, data: c.data });
+  const decoded = new Array(frames.length).fill(null);
+  try {
+    // 1. One chunk at a time: the time from decode() until its frame is out,
+    // matched by the frame's timestamp, as for the encoder. A decoder that holds
+    // frames back is not waited for longer than a second, and no flush comes
+    // in between: a decoder needs a key frame after one.
+    const decodeMs = new Array(frames.length).fill(null);
+    const submittedAt = new Map();
+    const arrivalOf = new Map();
+    let decoderError = null;
+    const serial = new VideoDecoder({
+      output: (frame) => {
+        const at = performance.now();
+        const index = indexOf(frame.timestamp);
+        decodeMs[index] = at - submittedAt.get(index);
+        frame.close();
+        if (arrivalOf.has(index)) arrivalOf.get(index)();
+      },
+      error: (e) => { decoderError = e; for (const r of arrivalOf.values()) r(); },
+    });
+    serial.configure(dconfig);
+    out.decoderHeld = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      const got = new Promise((resolve) => { arrivalOf.set(i, resolve); });
+      submittedAt.set(i, performance.now());
+      serial.decode(chunkOf(chunks[i]));
+      if ((await within(got, 1000)) === null) out.decoderHeld++;
+      if (decoderError) throw decoderError;
+    }
+    await serial.flush();
+    serial.close();
+    out.decodeMs = decodeMs;
 
-  // The same chunks again, all given at once: how fast a decoder works
-  // through a queue, for decoders that hold frames back one at a time. Without
-  // copying the pictures out.
-  let counted = 0;
-  const queue = new VideoDecoder({ output: (frame) => { counted++; frame.close(); }, error: (e) => { decoderError = e; } });
-  queue.configure(dconfig);
-  const q0 = performance.now();
-  for (const c of chunks) queue.decode(new EncodedVideoChunk({ type: c.type, timestamp: c.timestamp, data: c.data }));
-  await queue.flush();
-  out.decodeQueueMsPerFrame = (performance.now() - q0) / chunks.length;
-  out.decodeQueueFrames = counted;
-  queue.close();
+    // 2. All chunks at once: the time from the first frame out to the last,
+    // divided by the frames between them, which leaves out the decoder's start
+    // and the key frame.
+    const outAt = [];
+    const queued = new VideoDecoder({ output: (frame) => { outAt.push(performance.now()); frame.close(); }, error: (e) => { decoderError = e; } });
+    queued.configure(dconfig);
+    for (const c of chunks) queued.decode(chunkOf(c));
+    await queued.flush();
+    queued.close();
+    if (decoderError) throw decoderError;
+    out.decodeQueueFrames = outAt.length;
+    out.decodeQueueMsPerFrame = outAt.length > 1 ? (outAt[outAt.length - 1] - outAt[0]) / (outAt.length - 1) : null;
+
+    // 3. For the comparison: the frames are copied out, untimed.
+    const compared = new VideoDecoder({
+      output: async (frame) => {
+        const index = indexOf(frame.timestamp);
+        decoded[index] = await planes(frame, width, height);
+        frame.close();
+      },
+      error: (e) => { decoderError = e; },
+    });
+    compared.configure(dconfig);
+    for (const c of chunks) compared.decode(chunkOf(c));
+    await compared.flush();
+    // The last frames' copies out of the decoder may still be under way.
+    for (let i = 0; i < 100 && decoded.some((d) => d === null) && !decoderError; i++) await sleep(50);
+    compared.close();
+    if (decoderError) throw decoderError;
+  } catch (e) {
+    // What the encoder made stays in the result.
+    out.decoderError = String(e);
+    return out;
+  }
+  out.decodedFrames = decoded.filter((d) => d).length;
 
   // How much the source itself changes from one frame to the next, as a PSNR
   // of the change: the hardness of the sequence for a codec that predicts.
   out.sourceChange = [];
   for (let i = 1; i < frames.length; i++) out.sourceChange.push(psnr(frames[i].subarray(0, width * height), frames[i - 1].subarray(0, width * height)));
-  out.decodedChange = [];
-  for (let i = 1; i < decoded.length; i++) if (decoded[i] && decoded[i - 1]) out.decodedChange.push(psnr(decoded[i][0], decoded[i - 1][0]));
 
   // Picture quality of each decoded frame against its source.
   const cw = width >> 1, ch = height >> 1;
