@@ -66,10 +66,13 @@ struct Layout {
 
 fn layout() -> Layout {
     let exe = std::env::current_exe().expect("the test's path is known");
-    // The outermost directory that cargo marked as a target directory.
+    // The outermost directory that cargo marked as a target directory: with
+    // CACHEDIR.TAG where cargo made the directory, and with .rustc_info.json,
+    // which it writes into a directory that was there already (an empty
+    // CARGO_TARGET_DIR from mktemp, say).
     let target_dir = exe
         .ancestors()
-        .filter(|dir| dir.join("CACHEDIR.TAG").exists())
+        .filter(|dir| dir.join("CACHEDIR.TAG").exists() || dir.join(".rustc_info.json").exists())
         .last()
         .expect("the test runs below a target directory")
         .to_path_buf();
