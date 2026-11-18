@@ -132,7 +132,7 @@ Apple M3 Max(Metal)에서 2026-10-26에 측정한 프레임당 디코딩 시간�
 
 iPhone 17의 Safari에서는 [벤치마크 페이지](https://with-developer.github.io/emberwave/bench.html)가 1080p 프레임을 2.4 ms, 4K 프레임을 8.1 ms에 GPU 메모리의 RGB로 디코딩합니다([`BENCHMARKS.md`](BENCHMARKS.md#in-the-browser-phones-included)). XCFramework를 쓰는 네이티브 [벤치마크 앱](crates/emberwave-ffi/examples/ios)은 같은 프레임을 Metal 텍스처 한 장에는 1.6 ms와 6.2~6.3 ms, Y·Cb·Cr 텍스처에는 1.3 ms와 4.8 ms에 디코딩합니다([`BENCHMARKS.md`](BENCHMARKS.md#on-the-iphone-natively)).
 
-같은 앱으로 Moonlight가 쓰는 하드웨어 HEVC 디코더도 Moonlight의 기본 비트레이트에서 측정했습니다. 프레임을 연달아 디코딩하면 emberwave의 텍스처 디코딩이 M3 Max에서 2.2~3.9배(4K 기준 1.0 ms 대 2.6~3.4 ms), iPhone 17에서 1.4~1.7배(4.5 ms 대 HEVC 6.2~6.3 ms) 빠릅니다(위 측정의 하루 뒤에 잰 값). 하지만 프레임이 초당 60개씩 들어오면, GPU는 프레임 사이에 쉬면서 느려지는 반면 미디어 엔진은 그렇지 않습니다. 이때 Mac에서는 둘이 비슷하고, iPhone에서는 HEVC가 1.5~2.7배 빠릅니다([`BENCHMARKS.md`](BENCHMARKS.md#against-hevc-on-the-same-device)).
+같은 앱으로 Moonlight가 쓰는 하드웨어 HEVC 디코더도 Moonlight의 기본 비트레이트에서 측정했습니다. 프레임을 연달아 디코딩하면 emberwave의 텍스처 디코딩이 M3 Max에서 2.2~3.9배(4K 기준 1.0 ms 대 2.6~3.4 ms), iPhone 17에서 1.4~1.7배(4.5 ms 대 HEVC 6.2~6.3 ms) 빠릅니다(위 측정의 하루 뒤에 잰 값). 하지만 프레임이 초당 60개씩 들어오면, GPU는 프레임 사이에 쉬면서 느려지는 반면 미디어 엔진은 그렇지 않습니다. 이 측정에서 Mac의 두 디코더는 비슷했지만, 0.18.1 라이브러리를 화면 출력 루프와 함께 재면 1440p와 4K에서는 emberwave의 플레인 디코딩이 HEVC보다 빠릅니다([`BENCHMARKS.md`](BENCHMARKS.md#in-a-display-loop-on-the-mac)). iPhone에서는 HEVC가 1.5~2.7배 빠릅니다([`BENCHMARKS.md`](BENCHMARKS.md#against-hevc-on-the-same-device)).
 
 ## 목표
 
@@ -155,7 +155,7 @@ iPhone 17의 Safari에서는 [벤치마크 페이지](https://with-developer.git
 
 1.0.0의 날짜는 정하지 않았습니다. 1.0.0은 C·Rust API를 호환되게 유지하겠다는 약속이고, 아래 네 가지가 갖춰지면 태그를 달며, 그 판단은 관리자가 합니다.
 
-- [ ] **안정된 C·Rust API.** 정리된 것: C API가 프로그램을 깨지 않고 늘어나는 규칙(결정 D69), Rust API의 모양(D70), 공유 라이브러리가 헤더의 함수만 내보내는 것(macOS에서 Objective-C 이름 4개만 예외, D73). 남은 것: 라이브러리 이름에 아직 버전이 없고, Rust API의 공개 항목 26개가 wgpu 타입을 받거나 돌려주므로 wgpu의 새 주 버전이 나오면 깨지며, 클라이언트 자신의 Metal·Vulkan·Direct3D 객체를 받는 호출은 실제로 쓰이기 전까지 잠정입니다. 앞의 두 가지는 [#165](https://github.com/with-developer/emberwave/issues/165)에 질문으로 올려 두었습니다.
+- [ ] **안정된 C·Rust API.** 정리된 것: C API가 프로그램을 깨지 않고 늘어나는 규칙(결정 D69), Rust API의 모양(D70), 공유 라이브러리가 헤더의 함수만 내보내는 것(macOS에서 Objective-C 이름 4개만 예외, D73). 남은 것: 라이브러리 이름에 아직 버전이 없고, Rust API의 공개 항목 약 서른 개가 wgpu 타입을 받거나 돌려주므로(결정 D70) wgpu의 새 주 버전이 나오면 깨지며, 클라이언트 자신의 Metal·Vulkan·Direct3D 객체를 받는 호출은 실제로 쓰이기 전까지 잠정입니다. 앞의 두 가지는 [#165](https://github.com/with-developer/emberwave/issues/165)에 질문으로 올려 두었습니다.
 - [ ] **실제로 쓰이는 클라이언트 하나.** 별도 저장소의 브라우저 클라이언트 `emberwave-stream`이 Mac의 화면을 같은 Mac의 탭으로 스트리밍하는 것까지 됩니다. 로컬 네트워크를 건너는 것은 아직 보이지 못했습니다. 두 번째 기기가 필요하거나, 루프백 에뮬레이터로 대신해도 된다는 판단이 필요합니다.
 - [ ] **스트림 속도에서 업스트림과 같은 수준의 디코딩.** 4K는 도달했고, 1080p는 0.15~0.3 ms 느립니다([#150](https://github.com/with-developer/emberwave/issues/150)).
 - [ ] **패키지.** crates.io에는 `emberwave-core`와 `emberwave-cli` 0.18.1이 올라가 있습니다. 아직 없는 것은 브라우저 플레이어용 패키지와, Swift용으로 저장소 루트에 두는 `Package.swift`입니다(결정 D64: 릴리스 워크플로를 바꿔야 합니다).

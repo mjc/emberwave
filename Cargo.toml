@@ -13,7 +13,9 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/with-developer/emberwave"
 rust-version = "1.87"
-# Releases are GitHub Releases only; keep cargo from publishing by accident.
+# Releases are GitHub Releases; emberwave-core and emberwave-cli also go to
+# crates.io (decision D74) and do not inherit this; it keeps cargo from
+# publishing the other crates by accident.
 publish = false
 
 [workspace.dependencies]

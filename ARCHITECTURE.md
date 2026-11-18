@@ -322,8 +322,8 @@ The packed planes are copied to a mappable buffer and returned as a `Frame`. Whe
 | payload (`array<u32>`) | received blocks, padded with four zero words; on Apple silicon the CPU writes them in place, with the block offsets (D53) | grows on demand, 64 KiB at least |
 | block offsets (`array<u32>`) | word offset of every block, `u32::MAX` if missing | 49 KiB |
 | pyramid (`array<f32>`) | the four bands of every level of every component, back to back | 63.6 MiB |
-| packed planes (`array<u32>`) | 8-bit planes, four pixels per word, rows padded to words | 11.9 MiB |
-| readback (`MAP_READ`) | copy of the packed planes for the CPU, created by the first decode that reads them back | 11.9 MiB |
+| packed planes (`array<u32>`) | 8-bit planes, four pixels per word, rows padded to 256 bytes, planes at multiples of 512 bytes | 12.1 MiB |
+| readback (`MAP_READ`) | copy of the packed planes for the CPU, created by the first decode that reads them back | 12.1 MiB |
 | RGBA words (`array<u32>`) | one word per pixel, created on the first RGB decode | 31.6 MiB |
 | RGB readback (`MAP_READ`) | copy of the RGBA words, likewise | 31.6 MiB |
 | last coarsest level (`array<f32>`) | the coarsest level's bands of every component as the last decode left them, copied before a decode that conceals; created on the first (D66) | 383 KiB |
@@ -420,7 +420,7 @@ The wall-clock time exceeds the sum of the stages, because submitting work and n
 
 ### Portability
 
-The shaders, the decoder's and the encoder's, use only what WebGPU guarantees: no subgroup operations, no 8-bit or 16-bit storage, no `f16`, no immediates (push constants), no storage textures. One shader is the exception, on a path of its own: on Metal, where the adapter offers it, `idwt_planes.wgsl` stores the planes into `r8unorm` storage textures (D52), and the portable copies stay the fallback; likewise the frames written where the shaders read them on Apple silicon need `MAPPABLE_PRIMARY_BUFFERS` (D53). Neither is asked for under strict WebGPU. All buffers are plain storage or uniform buffers and every workgroup stays within 256 invocations and 16 KiB. The encoder reads pictures in textures as sampled `r8unorm` and `rg8unorm` textures with `textureGather` and a non-filtering sampler, and pictures in RGB as sampled `rgba8unorm` and `bgra8unorm` textures with `textureLoad` (D65), which WebGPU has without any feature. The encoder's rate control adds with 32-bit integer atomics, which WGSL has without any feature. Two tests hold this to account:
+The shaders, the decoder's and the encoder's, use only what WebGPU guarantees: no subgroup operations, no 8-bit or 16-bit storage, no `f16`, no immediates (push constants), no storage textures. One shader is the exception, on a path of its own: on Metal, where the adapter offers it, `idwt_planes.wgsl` stores the planes into `r8unorm` storage textures (D52), and the portable copies stay the fallback; likewise the frames written where the shaders read them on Apple silicon need `MAPPABLE_PRIMARY_BUFFERS` (D53). Neither is asked for under strict WebGPU. All buffers are plain storage or uniform buffers and every workgroup stays within 256 invocations and 16 KiB. The encoder reads pictures in textures as sampled `r8unorm` and `rg8unorm` textures with `textureGather` and a non-filtering sampler, and pictures in RGB as sampled `rgba8unorm` and `bgra8unorm` textures with `textureLoad` (D65), which WebGPU has without any feature. The encoder's rate control adds with 32-bit integer atomics, which WGSL has without any feature. Two tests hold this to account, and a unit test checks one rule on the real backend:
 
 - `tests/shaders.rs` validates the WGSL of every shader with naga using an empty capability set, without a GPU, and checks the entry points, the workgroup sizes and memory.
 - `tests/gpu.rs` and `tests/gpu_encoder.rs` create a device with `InstanceFlags::STRICT_WEBGPU_COMPLIANCE` and the default limits and decode a vector on it, and encode pictures on it.
@@ -489,7 +489,7 @@ Nothing in a browser may block, so the player uses only the parts of the decoder
 - `GpuContext::from_adapter` creates the device on an adapter that can draw on the canvas. `GpuContext::new`, which blocks, does not exist in the browser build.
 - `Decoder::record_rgb_to_texture` records the decode and the colour conversion into the player's command encoder and puts the picture into the canvas's texture: by a copy where the canvas allows it and is a multiple of 64 pixels wide, and otherwise by a draw (`draw.wgsl`: one triangle over the canvas, which has the size of the picture, so a fragment reads one word; decisions D40 and D42). One submission per frame, and the picture never leaves the GPU.
 - Error scopes cannot be waited for, so in the browser build `with_error_scope` just runs its work. The player catches what the browser reports instead (`on_uncaptured_error`) and shows the first error on the page with the next frame. Pictures wider or taller than the browser can draw (`max_texture_dimension_2d`, 8192 by default) are refused when the file is loaded.
-- The methods that read a frame back or time it wait for the GPU, and are not for the browser. The decoder makes its read-back buffers only when a decode first reads back, so the player has none: 43.5 MiB fewer at 4K.
+- The methods that read a frame back or time it wait for the GPU, and are not for the browser. The decoder makes its read-back buffers only when a decode first reads back, so the player has none: 43.8 MiB fewer at 4K.
 - In a browser, dropping a wgpu buffer only lets go of the JavaScript object, and the GPU memory waits for the garbage collector. `Decoder` therefore destroys its large buffers when it is dropped, and the player drops the old stream before it loads the next file: about 110 MiB for a 4K stream.
 - The player keeps one copy of the file in the module's memory and walks its frames in place. When it loads a file it reads the frames from the first up to one that is cut off, or shorter than the start of frame header every frame begins with; it plays those, and says why it does not play the rest. It loads files of up to 1 GiB and pictures of up to 8192x4320 pixels' worth (D39).
 - A lost device ends the stream, and the next file or sample gets a new player with a new device. A panic in the module leaves its objects in use, so the page then asks to be reloaded and disables its controls.
@@ -649,7 +649,7 @@ Short-form ADRs, newest last. Each entry is dated.
 
 ### 2026-10-23 — D5: Toolchain and lints
 
-**Decision.** Rust edition 2024, resolver 3, `rust-version` 1.85 (to be revisited when wgpu is added). Workspace lints: `unsafe_code = "forbid"` (the FFI crate will define its own lint table when it needs `unsafe`) and `missing_docs = "warn"`. CI turns warnings into errors through `clippy -D warnings`. Crates are `publish = false` because releases are GitHub Releases.
+**Decision.** Rust edition 2024, resolver 3, `rust-version` 1.85 (to be revisited when wgpu is added). Workspace lints: `unsafe_code = "forbid"` (the FFI crate will define its own lint table when it needs `unsafe`) and `missing_docs = "warn"`. CI turns warnings into errors through `clippy -D warnings`. Crates are `publish = false` because releases are GitHub Releases. (Superseded in part by D74: `emberwave-core` and `emberwave-cli` are on crates.io.)
 
 ### 2026-10-23 — D6: Workflow conventions
 
@@ -1883,4 +1883,20 @@ The last frame's detail, always, gains everything on a still picture and loses u
 **Not done: restricting the Linux and Windows tables** with a version script or a `.def` file: rustc's own already gives the functions and nothing else, and a second one would fight it.
 
 **Consequence.** No client-visible change: no function, name or behaviour changes. A change that adds a C function without updating the header fails the header test, one that exports another name fails this one.
+
+### 2026-11-18 — D74: emberwave-core and emberwave-cli on crates.io
+
+**Context.** The crates were `publish = false` (D5) and the releases GitHub Releases alone. Rust users could use the library and the command line tool only through a git dependency or a release archive. The maintainer asked what crates.io was on 2026-11-04, was recommended the two crates, and approved publishing them that night ("네, 올려"). The first upload was refused until the maintainer's crates.io e-mail address was verified; it went through on 2026-11-05.
+
+**Decision.** `emberwave-core` and `emberwave-cli` 0.18.1 are on crates.io (https://crates.io/crates/emberwave-core, https://crates.io/crates/emberwave-cli). `emberwave-ffi` and `emberwave-web` stay unpublished: C and Swift users take the GitHub release and the XCFramework, and the browser takes the web build. The workspace keeps `publish = false`, and the two crates set their own metadata: keywords, categories, `readme = "../../README.md"` and a copy of `LICENSE` in each crate directory, since a package holds nothing outside its directory. A release publishes the two after its tag's release is out, core first (`CONTRIBUTING.md`).
+
+**Why.** `cargo install emberwave-cli` and `cargo add emberwave-core` are the way Rust users look for software; the crates were ready and the cost is one more step of a release.
+
+**How it is done.**
+- The upload uses a token that the maintainer made on crates.io with the scopes `publish-new` and `publish-update` and a 30-day expiry (to about 2026-12-04), stored by their own `cargo login`. It is never read, printed or passed on.
+- The approval covered the first publish. A later version needs the maintainer's approval again, or Trusted Publishing: in each crate's settings on crates.io, GitHub with owner `with-developer`, repository `emberwave` and workflow `release.yml`, after which the release workflow could publish without a long-lived token.
+
+**Not done.** `THIRD_PARTY_NOTICES.md` is not in the packages: `cargo package --list` shows `LICENSE` and no notices file, where the release archives carry both (D51). Whether a crate has to carry PyroWave's notice is the maintainer's to judge, not settled here. Trusted Publishing is not set up.
+
+**Consequence.** A published version cannot be taken back, only yanked, so a release that publishes is a step to confirm. The workspace version, `EMBERWAVE_VERSION` and the crates' dependency on `emberwave-core` move together (D69).
 
