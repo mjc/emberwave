@@ -149,7 +149,16 @@ Done: the milestones to the first release, M0 to M5 ([#1](https://github.com/wit
 Next, each in a release when it is ready:
 
 - **Measured in real use.** Decoding inside a client's display loop, timed to the screen, on a Mac and an iPhone ([#81](https://github.com/with-developer/emberwave/issues/81); the Mac's half is done, decision D72); NVENC's HEVC and AV1 streams decoded beside emberwave's, and the quality of moving game footage against HEVC with predicted frames at the same bit rate, which also tells whether chroma's band weights should change ([#82](https://github.com/with-developer/emberwave/issues/82), decision D67; a first stage with Chrome's encoders on synthetic pictures is in [BENCHMARKS.md](BENCHMARKS.md#against-av1-and-hevc-in-chrome-stand-in-for-nvenc)); and 1080p at a stream's pace, still 0.15 to 0.3 ms behind upstream's FP32 decoder where 4K has caught up ([#150](https://github.com/with-developer/emberwave/issues/150)).
-- **Toward 1.0, clients.** Streaming to a browser, in a repository of its own so that emberwave stays a codec: a host's screen encoded on its GPU, sent over the local network and decoded with WebGPU in a tab, its latency measured first. After that, emberwave's encoder offered to the hosts that stream PyroWave. 1.0 needs stable C and Rust APIs, one client in real use, and decoding at a stream's pace level with upstream's.
+- **Toward 1.0, clients.** Streaming to a browser, in a repository of its own so that emberwave stays a codec: a host's screen encoded on its GPU, sent over the local network and decoded with WebGPU in a tab, its latency measured first. After that, emberwave's encoder offered to the hosts that stream PyroWave.
+
+### What 1.0.0 needs
+
+1.0.0 has no date. It is the promise that the C and Rust APIs stay compatible, and it will be tagged when the four things below are true; the maintainer makes that call.
+
+- [ ] **Stable C and Rust APIs.** Settled: the rules by which the C API grows without breaking programs (decision D69), the shape of the Rust API (D70), and the shared library exporting the header's functions and nothing else, apart from four Objective-C names on macOS (D73). Open: the library's name carries no version yet, 26 public items of the Rust API take or return wgpu's types, which a new major version of wgpu would break, and the calls on a client's own Metal, Vulkan and Direct3D objects are provisional until a client has used them. The first two are put as a question in [#165](https://github.com/with-developer/emberwave/issues/165).
+- [ ] **One client in real use.** `emberwave-stream`, the browser client in a repository of its own, streams a Mac's screen to a tab on the same Mac. Across a local network it is not shown yet: that needs a second device, or the loopback emulator accepted in its place.
+- [ ] **Decoding at a stream's pace level with upstream's.** 4K is there; 1080p is 0.15 to 0.3 ms behind ([#150](https://github.com/with-developer/emberwave/issues/150)).
+- [ ] **Packages.** On crates.io: `emberwave-core` and `emberwave-cli`, 0.18.1. Not yet: a package for the browser player, and a `Package.swift` at the root of the repository for Swift (decision D64: the release workflow would have to change).
 
 ## Repository layout
 
