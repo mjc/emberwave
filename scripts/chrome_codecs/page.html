@@ -1,0 +1,267 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>emberwave: Chrome's WebCodecs on a Y4M</title>
+<!--
+  Driven by scripts/chrome_codecs.mjs over the DevTools protocol; not part of
+  the browser player and not shipped. window.probe() says which codecs this
+  Chrome encodes and decodes, window.run(config) encodes a Y4M with
+  WebCodecs' VideoEncoder, decodes it again with VideoDecoder and returns
+  sizes, times and the PSNR of every frame against the source.
+-->
+<script>
+'use strict';
+
+// One 8-bit 4:2:0 Y4M, fetched whole: its header, then FRAME and the planes.
+async function loadY4M(url, maxFrames) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url}: ${response.status}`);
+  const data = new Uint8Array(await response.arrayBuffer());
+  let end = data.indexOf(10);
+  const header = new TextDecoder().decode(data.subarray(0, end));
+  const width = Number(/ W(\d+)/.exec(header)[1]);
+  const height = Number(/ H(\d+)/.exec(header)[1]);
+  if (!/C420/.test(header) && /C4/.test(header)) throw new Error('not 4:2:0: ' + header);
+  const frameSize = width * height * 3 / 2;
+  const frames = [];
+  let at = end + 1;
+  while (at < data.length && frames.length < maxFrames) {
+    const lineEnd = data.indexOf(10, at);
+    at = lineEnd + 1; // "FRAME\n"
+    frames.push(data.subarray(at, at + frameSize));
+    at += frameSize;
+  }
+  return { width, height, frames, header };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Waits for `promise` for `ms` milliseconds; null if it does not come.
+const within = (promise, ms) => Promise.race([promise, sleep(ms).then(() => null)]);
+
+// The planes of a decoded frame as Y, Cb and Cr arrays, 4:2:0, cropped to the
+// visible size, whatever layout the decoder gave.
+async function planes(frame, width, height) {
+  const size = frame.allocationSize();
+  const buffer = new Uint8Array(size);
+  const layout = await frame.copyTo(buffer);
+  const cw = width >> 1, ch = height >> 1;
+  const y = new Uint8Array(width * height);
+  for (let r = 0; r < height; r++) {
+    y.set(buffer.subarray(layout[0].offset + r * layout[0].stride, layout[0].offset + r * layout[0].stride + width), r * width);
+  }
+  const cb = new Uint8Array(cw * ch), cr = new Uint8Array(cw * ch);
+  if (frame.format === 'I420') {
+    for (let r = 0; r < ch; r++) {
+      cb.set(buffer.subarray(layout[1].offset + r * layout[1].stride, layout[1].offset + r * layout[1].stride + cw), r * cw);
+      cr.set(buffer.subarray(layout[2].offset + r * layout[2].stride, layout[2].offset + r * layout[2].stride + cw), r * cw);
+    }
+  } else if (frame.format === 'NV12') {
+    for (let r = 0; r < ch; r++) {
+      const row = layout[1].offset + r * layout[1].stride;
+      for (let c = 0; c < cw; c++) {
+        cb[r * cw + c] = buffer[row + 2 * c];
+        cr[r * cw + c] = buffer[row + 2 * c + 1];
+      }
+    }
+  } else {
+    throw new Error('unexpected decoded format ' + frame.format);
+  }
+  return [y, cb, cr];
+}
+
+function psnr(a, b) {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = a[i] - b[i];
+    sum += d * d;
+  }
+  return sum === 0 ? 99 : 10 * Math.log10(255 * 255 * a.length / sum);
+}
+
+// Which codecs this Chrome encodes and decodes at a size, by hardware preference.
+window.probe = async function (width, height, bitrate, framerate) {
+  const codecs = {
+    'AV1': height > 1080 ? 'av01.0.13M.08' : 'av01.0.08M.08',
+    'HEVC': height > 1080 ? 'hvc1.1.6.L153.B0' : 'hvc1.1.6.L123.B0',
+    'H.264': height > 1080 ? 'avc1.640033' : 'avc1.640028',
+    'VP9': 'vp09.00.41.08',
+  };
+  const result = { userAgent: navigator.userAgent, hardwareConcurrency: navigator.hardwareConcurrency, sizes: { width, height, bitrate, framerate }, codecs: {} };
+  for (const [name, codec] of Object.entries(codecs)) {
+    result.codecs[name] = { codec, encode: {}, decode: {} };
+    for (const hw of ['no-preference', 'prefer-hardware', 'prefer-software']) {
+      const config = { codec, width, height, bitrate, framerate, hardwareAcceleration: hw, latencyMode: 'realtime', bitrateMode: 'constant' };
+      if (name === 'HEVC') config.hevc = { format: 'annexb' };
+      if (name === 'H.264') config.avc = { format: 'annexb' };
+      try {
+        result.codecs[name].encode[hw] = (await VideoEncoder.isConfigSupported(config)).supported;
+      } catch (e) {
+        result.codecs[name].encode[hw] = 'error: ' + e.message;
+      }
+      try {
+        result.codecs[name].decode[hw] = (await VideoDecoder.isConfigSupported({ codec, codedWidth: width, codedHeight: height, hardwareAcceleration: hw })).supported;
+      } catch (e) {
+        result.codecs[name].decode[hw] = 'error: ' + e.message;
+      }
+    }
+  }
+  return result;
+};
+
+// Encodes the Y4M at `url` as `codec` at `bitrate` bits a second, a key frame
+// first and predicted frames after it, decodes the chunks again and compares
+// every frame with the source.
+window.run = async function (cfg) {
+  const { url, codec, bitrate, hw = 'no-preference', frames: maxFrames = 20, framerate = 60, name = codec, decodeHw = hw } = cfg;
+  const y4m = await loadY4M(url, maxFrames);
+  const { width, height, frames } = y4m;
+  const out = { name, codec, bitrate, hw, decodeHw, width, height, frames: frames.length, framerate };
+
+  // Encoding, one frame at a time: the time from encode() until its chunk,
+  // matched by the frame's timestamp. An encoder that holds a frame back is
+  // not waited for longer than a second: the next frame goes in, and the held
+  // one comes out with the later ones, its time as long as it was held.
+  const step = 1e6 / framerate;
+  const timestampOf = (i) => Math.round(i * step);
+  const indexOf = (timestamp) => Math.round(timestamp / step);
+  const chunks = new Array(frames.length).fill(null);
+  const encodeMs = new Array(frames.length).fill(null);
+  const submitted = new Map();
+  const arrivals = new Map();
+  let encoderError = null;
+  const encoder = new VideoEncoder({
+    output: (chunk, metadata) => {
+      const at = performance.now();
+      const index = indexOf(chunk.timestamp);
+      const copy = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(copy);
+      chunks[index] = { type: chunk.type, timestamp: chunk.timestamp, data: copy, description: metadata?.decoderConfig?.description };
+      encodeMs[index] = at - submitted.get(index);
+      if (arrivals.has(index)) arrivals.get(index)();
+    },
+    error: (e) => { encoderError = e; for (const r of arrivals.values()) r(); },
+  });
+  const config = { codec, width, height, bitrate, framerate, hardwareAcceleration: hw, latencyMode: 'realtime', bitrateMode: 'constant' };
+  if (/^hvc1|^hev1/.test(codec)) config.hevc = { format: 'annexb' };
+  if (/^avc1/.test(codec)) config.avc = { format: 'annexb' };
+  const support = await VideoEncoder.isConfigSupported(config);
+  out.encoderSupported = support.supported;
+  if (!support.supported) return out;
+  encoder.configure(config);
+  out.encoderHeld = 0;
+  for (let i = 0; i < frames.length; i++) {
+    const frame = new VideoFrame(frames[i], { format: 'I420', codedWidth: width, codedHeight: height, timestamp: timestampOf(i), duration: Math.round(step) });
+    const got = new Promise((resolve) => { arrivals.set(i, resolve); });
+    submitted.set(i, performance.now());
+    encoder.encode(frame, { keyFrame: i === 0 });
+    frame.close();
+    if ((await within(got, 1000)) === null) out.encoderHeld++;
+    if (encoderError) { out.encoderError = String(encoderError); return out; }
+    // The encoder's queue is short: do not run ahead of it.
+    while (encoder.encodeQueueSize > 2) await sleep(1);
+  }
+  await encoder.flush();
+  encoder.close();
+  if (chunks.some((c) => c === null)) { out.error = `${chunks.filter((c) => c).length} chunks for ${frames.length} frames`; return out; }
+  out.encodeMs = encodeMs;
+  out.chunkBytes = chunks.map((c) => c.data.length);
+  out.chunkTypes = chunks.map((c) => c.type);
+
+  // The chunks are decoded three times, so that what is timed is not copied
+  // out of the decoder and what is compared is not timed.
+  const description = chunks.find((c) => c.description)?.description;
+  const dconfig = { codec, codedWidth: width, codedHeight: height, hardwareAcceleration: decodeHw };
+  if (description) dconfig.description = description;
+  const dsupport = await VideoDecoder.isConfigSupported(dconfig);
+  out.decoderSupported = dsupport.supported;
+  if (!dsupport.supported) return out;
+  const chunkOf = (c) => new EncodedVideoChunk({ type: c.type, timestamp: c.timestamp, data: c.data });
+  const decoded = new Array(frames.length).fill(null);
+  try {
+    // 1. One chunk at a time: the time from decode() until its frame is out,
+    // matched by the frame's timestamp, as for the encoder. A decoder that holds
+    // frames back is not waited for longer than a second, and no flush comes
+    // in between: a decoder needs a key frame after one.
+    const decodeMs = new Array(frames.length).fill(null);
+    const submittedAt = new Map();
+    const arrivalOf = new Map();
+    let decoderError = null;
+    const serial = new VideoDecoder({
+      output: (frame) => {
+        const at = performance.now();
+        const index = indexOf(frame.timestamp);
+        decodeMs[index] = at - submittedAt.get(index);
+        frame.close();
+        if (arrivalOf.has(index)) arrivalOf.get(index)();
+      },
+      error: (e) => { decoderError = e; for (const r of arrivalOf.values()) r(); },
+    });
+    serial.configure(dconfig);
+    out.decoderHeld = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      const got = new Promise((resolve) => { arrivalOf.set(i, resolve); });
+      submittedAt.set(i, performance.now());
+      serial.decode(chunkOf(chunks[i]));
+      if ((await within(got, 1000)) === null) out.decoderHeld++;
+      if (decoderError) throw decoderError;
+    }
+    await serial.flush();
+    serial.close();
+    out.decodeMs = decodeMs;
+
+    // 2. All chunks at once: the time from the first frame out to the last,
+    // divided by the frames between them, which leaves out the decoder's start
+    // and the key frame.
+    const outAt = [];
+    const queued = new VideoDecoder({ output: (frame) => { outAt.push(performance.now()); frame.close(); }, error: (e) => { decoderError = e; } });
+    queued.configure(dconfig);
+    for (const c of chunks) queued.decode(chunkOf(c));
+    await queued.flush();
+    queued.close();
+    if (decoderError) throw decoderError;
+    out.decodeQueueFrames = outAt.length;
+    out.decodeQueueMsPerFrame = outAt.length > 1 ? (outAt[outAt.length - 1] - outAt[0]) / (outAt.length - 1) : null;
+
+    // 3. For the comparison: the frames are copied out, untimed.
+    const compared = new VideoDecoder({
+      output: async (frame) => {
+        const index = indexOf(frame.timestamp);
+        decoded[index] = await planes(frame, width, height);
+        frame.close();
+      },
+      error: (e) => { decoderError = e; },
+    });
+    compared.configure(dconfig);
+    for (const c of chunks) compared.decode(chunkOf(c));
+    await compared.flush();
+    // The last frames' copies out of the decoder may still be under way.
+    for (let i = 0; i < 100 && decoded.some((d) => d === null) && !decoderError; i++) await sleep(50);
+    compared.close();
+    if (decoderError) throw decoderError;
+  } catch (e) {
+    // What the encoder made stays in the result.
+    out.decoderError = String(e);
+    return out;
+  }
+  out.decodedFrames = decoded.filter((d) => d).length;
+
+  // How much the source itself changes from one frame to the next, as a PSNR
+  // of the change: the hardness of the sequence for a codec that predicts.
+  out.sourceChange = [];
+  for (let i = 1; i < frames.length; i++) out.sourceChange.push(psnr(frames[i].subarray(0, width * height), frames[i - 1].subarray(0, width * height)));
+
+  // Picture quality of each decoded frame against its source.
+  const cw = width >> 1, ch = height >> 1;
+  out.psnr = [];
+  for (let i = 0; i < Math.min(decoded.length, frames.length); i++) {
+    const src = frames[i];
+    const sy = src.subarray(0, width * height);
+    const scb = src.subarray(width * height, width * height + cw * ch);
+    const scr = src.subarray(width * height + cw * ch);
+    out.psnr.push([psnr(sy, decoded[i][0]), psnr(scb, decoded[i][1]), psnr(scr, decoded[i][2])]);
+  }
+  return out;
+};
+
+window.ready = true;
+</script>

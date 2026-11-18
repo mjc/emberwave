@@ -1717,6 +1717,7 @@ The last frame's detail, always, gains everything on a still picture and loses u
 - #136 is closed. Within its objective the encoder has under 1 % left, and measured by a metric of perceived quality, the objective itself has a few percent of bytes left.
 - If game footage of more than one frame, such as #82's, shows the chroma tilt's gain, the tilt goes into `gen_encoder_weights.py` as chroma's own sensitivity, for both encoders, and D57's measure keeps upstream's weights.
 - SSIMULACRA2 stays out of the repository. In `emberwave-cli quality` it would add a dependency, and its BSD-2-Clause notice to every release, for a study that ran once.
+- **Follow-up of 2026-11-18 (#82, first stage).** Chrome's WebCodecs encoders, on synthetic pictures, say little about the tilt (BENCHMARKS.md, "Against AV1 and HEVC in Chrome"): at the same bytes emberwave's chroma PSNR sits further above its luma PSNR than that of AV1, HEVC and H.264 with predicted frames in most rows (Cb in 12 of 15 rows of the benchmark scene, 4.2 to 12.6 dB against 2.9 to 9.5, and in all 15 of its noisy copy; Cr in all 30), which is the direction the tilt would move bits, but PSNR counts every band alike, the scene's grain is in luma only, and the pictures are neither game footage nor perceptually measured. The weights stay upstream's; game footage and SSIMULACRA2 are still what would change that.
 
 ### 2026-10-31 — D68: The transforms read their rows straight from the bands
 
