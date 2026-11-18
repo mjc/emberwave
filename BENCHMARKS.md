@@ -439,3 +439,82 @@ What a frame's budget buys, on a hard picture: a 4K frame of the game Crimson De
 | 2.5 MB | 2,319,594 bytes | 1113 Mbit/s | 36.34 | 37.87 | 37.85 | 32.87 |
 
 - **How firm the numbers are.** One picture, and PSNR, which follows what the eye sees only roughly. The HEVC numbers come from a scratch program that was not kept.
+
+## Against AV1 and HEVC in Chrome (stand-in for NVENC)
+
+Issue #82 asks for the streams of a PC's NVENC, HEVC and AV1, decoded beside emberwave's. This is its first stage, made on the Mac alone with the encoders that Chrome offers through WebCodecs: it says how emberwave compares in picture quality, bytes and decoding time with HEVC and AV1 with predicted frames at the same bytes a frame, without the PC and without game footage. NVENC's own streams, and moving game footage, are still to come, and the iPhone's half.
+
+**How.** `scripts/chrome_codecs.mjs` drives headless Chrome over the DevTools protocol. A page encodes a Y4M with `VideoEncoder`, one frame at a time, in real-time mode at a constant bit rate, 60 frames a second, a key frame first and predicted frames after it, no B frames, then decodes the chunks with `VideoDecoder` (the hardware decoder where Chrome has one) and compares every decoded frame with its source in the page, plane by plane. emberwave encodes the same pictures with `emberwave-cli encode --gpu` at the bytes each Chrome stream used on average, and `emberwave-cli quality` measures it. Two bit rates a size: Moonlight's default for it (20, 40 and 80 Mbit/s for 1080p, 1440p and 4K at 60 frames a second), and the bit rate of emberwave's own budget (192, 336 and 576 Mbit/s).
+
+**Pictures: synthetic, not game footage.** Twenty frames of the benchmark scene of the other tables (colour bars, a gradient, a moving shaded disc, a fine grid and a little grain; 78 % of its pixels change from one frame to the next, 30.9 dB between frames), and a copy with fresh Gaussian noise added to every frame, 6 levels on luma and 3 on chroma (`scripts/chrome_codecs/make_grainy.py`), which a codec that predicts cannot predict. Neither is a game. The scene's motion is easy to predict, which flatters the codecs with predicted frames; the grainy copy is the hard end.
+
+**What Chrome has.** Chrome 157.0.8103.79, headless, on the Mac of the tables above. It encodes AV1 in software only (and decodes it in hardware), HEVC and H.264 in hardware, through VideoToolbox, and in software. The hardware H.264 encoder returned no frames at 336 and 576 Mbit/s, the stream of the hardware HEVC encoder at 336 Mbit/s and 1440p could not be decoded ("EncodingError: Decoding error"), and the software H.264 encoder is refused at those rates; those rows are missing. VP9 was left out: NVENC does not encode it.
+
+Measured on 2026-11-18 from 18:14 to 18:23 on the Apple M3 Max of the tables above, macOS 27.0.1, on mains power, with the load average at 5.0 to 7.7: other programs ran, and the Mac was not quiet. One run of each: repeat it before relying on a difference of a decibel.
+
+Each row is a Chrome stream and, beside it, emberwave at the same bytes a frame (the mean of all 20 frames, the key frame included, rounded to 50 bytes). **kB a frame** is that mean. **Y dB**, **Cb / Cr dB** are the PSNR of the 19 frames after the key frame, averaged. **Decode ms** is the median time from handing a chunk to `VideoDecoder` until its frame is out, one frame at a time, and **queued** is the time a frame takes when all 20 are handed over at once; the frame is not copied out in either. The run's HEVC and H.264 encoders are the hardware's, AV1's is software.
+
+### The benchmark scene
+
+| Size | Codec | asked Mbit/s | kB a frame | codec Y dB | emberwave Y dB | codec Cb / Cr dB | emberwave Cb / Cr dB | decode ms | decode, queued ms |
+|---|---|---|---|---|---|---|---|---|---|
+| 1080p | AV1 | 20 | 8.0 | 44.43 | 27.07 | 47.36 / 46.51 | 31.74 / 33.20 | 1.00 | 0.91 |
+| 1080p | HEVC | 20 | 13.7 | 45.87 | 28.18 | 53.18 / 53.89 | 34.69 / 36.37 | 1.30 | 1.01 |
+| 1080p | H.264 | 20 | 39.8 | 45.79 | 29.26 | 50.79 / 51.48 | 40.63 / 41.50 | 2.00 | 1.19 |
+| 1080p | AV1 | 192 | 9.7 | 45.08 | 27.78 | 49.03 / 47.89 | 31.96 / 33.51 | 1.00 | 1.05 |
+| 1080p | HEVC | 192 | 18.6 | 45.94 | 28.43 | 54.27 / 54.81 | 35.06 / 37.42 | 1.40 | 1.10 |
+| 1080p | H.264 | 192 | 60.4 | 46.13 | 30.67 | 51.40 / 52.94 | 41.24 / 42.61 | 2.60 | 1.46 |
+| 1440p | AV1 | 40 | 13.5 | 44.62 | 27.26 | 48.27 / 47.96 | 33.38 / 34.59 | 1.50 | 1.26 |
+| 1440p | HEVC | 40 | 23.6 | 45.90 | 28.22 | 53.76 / 54.74 | 37.05 / 38.59 | 1.70 | 1.09 |
+| 1440p | H.264 | 40 | 81.2 | 45.44 | 30.02 | 51.12 / 51.92 | 41.42 / 42.64 | 3.40 | 2.08 |
+| 1440p | AV1 | 336 | 17.4 | 45.16 | 27.95 | 49.85 / 49.61 | 34.54 / 36.27 | 1.40 | 1.43 |
+| 4k | AV1 | 80 | 29.1 | 44.50 | 27.38 | 48.14 / 48.10 | 34.07 / 35.35 | 2.40 | 2.73 |
+| 4k | HEVC | 80 | 46.9 | 45.90 | 28.27 | 54.25 / 54.96 | 37.37 / 38.85 | 2.80 | 2.67 |
+| 4k | H.264 | 80 | 160.5 | 45.57 | 29.73 | 51.71 / 52.69 | 42.33 / 43.60 | 5.90 | 3.80 |
+| 4k | AV1 | 576 | 37.5 | 45.21 | 28.07 | 50.59 / 50.04 | 35.41 / 37.29 | 2.30 | 3.32 |
+| 4k | HEVC | 576 | 65.9 | 45.97 | 28.55 | 55.51 / 56.24 | 38.06 / 39.46 | 2.90 | 2.85 |
+
+### The scene with fresh noise in every frame
+
+| Size | Codec | asked Mbit/s | kB a frame | codec Y dB | emberwave Y dB | codec Cb / Cr dB | emberwave Cb / Cr dB | decode ms | decode, queued ms |
+|---|---|---|---|---|---|---|---|---|---|
+| 1080p | AV1 | 20 | 42.2 | 32.28 | 27.64 | 37.71 / 37.77 | 36.47 / 36.91 | 1.80 | 1.39 |
+| 1080p | HEVC | 20 | 55.7 | 32.70 | 28.26 | 37.94 / 37.99 | 36.73 / 37.02 | 1.10 | 0.94 |
+| 1080p | H.264 | 20 | 56.7 | 32.43 | 28.32 | 37.71 / 37.83 | 36.73 / 37.02 | 1.60 | 1.51 |
+| 1080p | AV1 | 192 | 173.6 | 33.96 | 29.68 | 38.23 / 38.29 | 37.16 / 37.55 | 2.40 | 3.61 |
+| 1080p | HEVC | 192 | 418.0 | 37.87 | 33.86 | 39.13 / 39.14 | 38.80 / 38.70 | 4.00 | 1.68 |
+| 1080p | H.264 | 192 | 416.4 | 37.59 | 33.85 | 38.95 / 38.98 | 38.80 / 38.70 | 7.40 | 3.42 |
+| 1440p | AV1 | 40 | 85.6 | 32.41 | 28.16 | 37.97 / 38.02 | 36.81 / 37.18 | 2.60 | 2.47 |
+| 1440p | HEVC | 40 | 115.6 | 32.81 | 28.83 | 38.04 / 38.09 | 36.97 / 37.36 | 1.80 | 1.56 |
+| 1440p | H.264 | 40 | 120.0 | 32.53 | 28.93 | 37.76 / 37.90 | 36.97 / 37.36 | 2.70 | 2.49 |
+| 1440p | AV1 | 336 | 290.6 | 33.87 | 29.67 | 38.27 / 38.31 | 37.29 / 37.65 | 3.90 | 6.27 |
+| 4k | AV1 | 80 | 168.9 | 32.41 | 27.98 | 37.98 / 38.08 | 37.04 / 37.34 | 5.00 | 5.90 |
+| 4k | HEVC | 80 | 217.4 | 32.71 | 28.51 | 38.06 / 38.11 | 37.11 / 37.55 | 3.50 | 3.35 |
+| 4k | H.264 | 80 | 224.7 | 32.43 | 28.60 | 37.78 / 37.91 | 37.11 / 37.55 | 4.50 | 4.95 |
+| 4k | AV1 | 576 | 723.6 | 34.20 | 29.83 | 38.47 / 38.51 | 37.58 / 37.83 | 11.80 | 15.39 |
+| 4k | HEVC | 576 | 1259.5 | 36.37 | 33.27 | 38.68 / 38.69 | 38.22 / 38.20 | 12.60 | 5.41 |
+
+- **The encoders do not fill the rate they are asked for on the scene.** At Moonlight's rates a 1080p stream came to 3.8 Mbit/s with AV1, 6.6 with HEVC and 19.1 with H.264 against 20 asked; at 4K 14.0, 22.5 and 77.0 against 80. Real-time mode keeps to a quality ceiling, and a scene that predicts well needs few bytes. The rows are compared at the bytes they used, not the rates they were asked for.
+- **At the same bytes the codecs with predicted frames lead in PSNR.** On the scene by 15.4 to 17.7 dB of luma, on the noisy copy by 3.1 to 4.6 dB, at every size and rate that ran. The scene's motion is easy to predict: the codecs hold 44.0 to 46.1 dB of luma on it from 8 kB to 160 kB a frame, where emberwave needs 400 kB for 46.8 dB at 1080p. The noisy copy leaves the codecs only the noise to code, and they lead by about 4 dB. The earlier comparison on a single key frame of a game, [above](#picture-quality), had HEVC 1.9 to 3.5 dB ahead of emberwave on luma with 2 to 10 % fewer bytes, where nothing could be predicted: the lead here is the prediction's.
+- **That is what emberwave trades for.** Every frame of it stands alone, so a lost frame costs nothing after it, a decode needs no earlier frame, and the GPU encoder takes 0.8 to 1.9 ms a frame on this Mac ([encoding above](#results)) where Chrome's hardware encoders took 6 ms at 1080p and 22 to 24 ms at 4K and its software HEVC encoder 112 to 606 ms. The table does not say what the codecs' lead is worth to a viewer: PSNR counts every pixel alike, the pictures are synthetic, and the encoders were in real-time mode.
+- **Decoding in Chrome.** At Moonlight's rates a frame took 1.0 to 5.9 ms to come out of `VideoDecoder`, 2.4 to 2.8 ms at 4K with AV1 and HEVC and 5.9 ms with H.264; at emberwave's bytes it took up to 12.6 ms (4K, HEVC, the noisy copy). emberwave's own decode in earlier Chrome versions on this Mac, through WebGPU, took 0.70 to 1.00 ms at 1080p and 1.69 to 1.88 ms at 4K into an RGB texture, frame after frame ([In the browser](#in-the-browser-phones-included)), and 4.50 to 5.67 ms at 4K at a stream's pace. The two do different work: `VideoDecoder`'s hardware decoders run beside the GPU and hand over video frames that are not yet drawn, and the page measures the time to the frame, not to the screen.
+- **For D67's chroma weights these numbers say little.** At the same bytes emberwave's chroma PSNR sits further above its luma PSNR (4.2 to 12.6 dB on the scene, 4.9 to 9.1 on the noisy copy) than the codecs' (2.9 to 9.5, 1.3 to 5.6). That is the direction in which D67's tilt would move bits at low budgets, from chroma to luma, but PSNR counts every band alike and the pictures are synthetic, with the chroma of bars and a gradient and noise that is the same in both up to its scale. Game footage and a perceptual metric are what D67 asks for; the weights stay upstream's.
+- **Not measured.** NVENC's own streams, which differ from VideoToolbox's and libaom's; moving game footage; a second run; the iPhone; the rows listed below.
+
+Rows that did not run:
+- scene 1440p HEVC 336 Mbit/s: EncodingError: Decoding error.
+- scene 1440p H.264 336 Mbit/s: 0 chunks for 20 frames
+- scene 4k H.264 576 Mbit/s: 0 chunks for 20 frames
+- grainy 1440p HEVC 336 Mbit/s: EncodingError: Decoding error.
+- grainy 1440p H.264 336 Mbit/s: 0 chunks for 20 frames
+- grainy 4k H.264 576 Mbit/s: 0 chunks for 20 frames
+
+```sh
+scripts/gen_bench_data.sh --sources                          # the scene's pictures, once
+for s in 1080p 1440p 4k; do scripts/chrome_codecs/make_grainy.py testdata/generated/scene_${s}_420.y4m testdata/generated/grainy_${s}_420.y4m; done
+cargo build --release -p emberwave-cli
+node scripts/chrome_codecs.mjs all        # about 8 minutes; writes target/chrome-codecs/*.json
+node scripts/chrome_codecs.mjs summary    # the tables above; `report` lists every run
+```
+
+It needs Google Chrome, Node 20 or later and numpy. Chrome runs with a mock keychain and a profile of its own, and its page is served on 127.0.0.1 only.
