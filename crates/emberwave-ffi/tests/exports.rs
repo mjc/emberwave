@@ -1,4 +1,5 @@
-//! The shared library exports the functions of the C header and nothing else.
+//! The shared library exports the functions of the C header and nothing else, and
+//! names itself by the crate's major version.
 //!
 //! The header, `include/emberwave.h`, is the list: a function that it declares
 //! has to be exported, and a name that is exported without being declared there
@@ -223,4 +224,86 @@ fn the_library_exports_the_header_s_functions_and_nothing_else() {
         "exported by {} but not declared by the header: {extra:?}",
         library.display()
     );
+}
+
+/// The name the library gives itself, and on macOS its compatibility and current
+/// versions, as the platform's tools print them: `readelf -d` for the SONAME on
+/// Linux, `otool -l` for the install name and the versions on macOS.
+fn own_name(library: &PathBuf) -> (String, Option<(String, String)>) {
+    if cfg!(target_os = "macos") {
+        let output = Command::new("otool")
+            .arg("-l")
+            .arg(library)
+            .output()
+            .expect("otool runs");
+        assert!(output.status.success(), "otool failed");
+        let text = String::from_utf8(output.stdout).expect("otool prints UTF-8");
+        // The LC_ID_DYLIB command, up to the next one.
+        let block = text
+            .split("cmd LC_ID_DYLIB")
+            .nth(1)
+            .expect("the library has an install name")
+            .split("Load command")
+            .next()
+            .expect("the command ends");
+        let field = |label: &str, after: &str| {
+            block
+                .lines()
+                .map(str::trim)
+                .find_map(|line| line.strip_prefix(label))
+                .map(|rest| {
+                    rest.trim()
+                        .split(after)
+                        .next()
+                        .expect("a value")
+                        .trim()
+                        .to_string()
+                })
+                .unwrap_or_else(|| panic!("no {label} in {block}"))
+        };
+        let name = field("name ", " (offset");
+        (
+            name,
+            Some((
+                field("compatibility version ", " "),
+                field("current version ", " "),
+            )),
+        )
+    } else {
+        // readelf's labels are translated; the C locale keeps the ones parsed below.
+        let output = Command::new("readelf")
+            .env("LC_ALL", "C")
+            .arg("-d")
+            .arg(library)
+            .output()
+            .expect("readelf runs");
+        assert!(output.status.success(), "readelf failed");
+        let text = String::from_utf8(output.stdout).expect("readelf prints UTF-8");
+        let name = text
+            .lines()
+            .find_map(|line| line.split("Library soname: [").nth(1))
+            .and_then(|rest| rest.split(']').next())
+            .expect("the library has a SONAME")
+            .to_string();
+        (name, None)
+    }
+}
+
+#[test]
+fn the_library_names_itself_by_its_major_version() {
+    let major = env!("CARGO_PKG_VERSION_MAJOR");
+    let version = format!(
+        "{major}.{}.{}",
+        env!("CARGO_PKG_VERSION_MINOR"),
+        env!("CARGO_PKG_VERSION_PATCH")
+    );
+    let (name, versions) = own_name(&library());
+    if cfg!(target_os = "macos") {
+        assert_eq!(name, format!("@rpath/libemberwave_ffi.{major}.dylib"));
+        let (compatibility, current) = versions.expect("macOS libraries have versions");
+        assert_eq!(compatibility, format!("{major}.0.0"));
+        assert_eq!(current, version);
+    } else {
+        assert_eq!(name, format!("libemberwave_ffi.so.{major}"));
+    }
 }
