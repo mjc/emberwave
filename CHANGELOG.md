@@ -2,6 +2,21 @@
 
 All notable changes to emberwave. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.19.0] - 2026-11-19
+
+The shared library's name carries the major version, and the road to 1.0 is written down. **A change for programs that link the shared library**: the library now names itself `libemberwave_ffi.so.0` on Linux and `@rpath/libemberwave_ffi.0.dylib` on macOS (the 0 is emberwave's major version, 1 from 1.0.0, when it starts to mean the ABI), so a program linked from this version on records that name and needs that file at run time. The release archives hold it, with `libemberwave_ffi.so` and `.dylib` as links to it, so programs linked before still find the unversioned name. Windows, the static libraries and the XCFramework are unchanged.
+
+### Added
+- The README lists what 1.0.0 needs and where each item stands; decision D75 records the three choices made before it: the versioned library name, a later split of the GPU code into an `emberwave-wgpu` crate so that `emberwave-core` has no wgpu type in its API (designed, not done), and the notices in the crates.
+- `THIRD_PARTY_NOTICES.md` is in both crates on crates.io, next to `LICENSE`, and CI keeps the copies equal to the root's.
+- A test checks that the shared library exports the C header's functions and nothing else (macOS has four Objective-C class names of a dependency beside them, which it names), and that it names itself by the crate's version.
+- `scripts/package_ffi.sh` makes the release archives' `lib` directory and checks the library's own name; the C example job runs it on Linux, macOS and Windows.
+- Measurements, in `BENCHMARKS.md`: decoding beside a display loop on the Mac (`scripts/bench_app_on_mac.sh -display`, #81), a model that estimates other devices from the M3 Max and the iPhone 17 (`scripts/perf_model.py`), and AV1, HEVC and H.264 in Chrome as a stand-in for NVENC (`scripts/chrome_codecs.mjs`, #82's first stage): at the same bytes the codecs with predicted frames lead emberwave in PSNR, which is what emberwave's frames standing alone cost.
+
+### Changed
+- wgpu 30.0.2 (fixes of a use after free of a mapped buffer when a device is lost, and of a texture id leak).
+- Documentation corrections found by a review, and decision D74 on the crates on crates.io.
+
 ## [0.18.1] - 2026-11-04
 
 `emberwave-core` and `emberwave-cli` are on crates.io: `cargo add emberwave-core` for the library, `cargo install emberwave-cli` for the command line decoder. The code is that of 0.18.0.
