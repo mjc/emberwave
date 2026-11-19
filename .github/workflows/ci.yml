@@ -157,25 +157,13 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      # The packages of the Vulkan driver are downloaded once (LLVM is most of
-      # them) and kept between runs; installing them still takes the time dpkg
-      # needs. The key follows this file, so a change of the packages renews it.
-      - name: Cache the Vulkan driver's packages
-        if: runner.os == 'Linux'
-        uses: actions/cache@v6
-        with:
-          path: ~/apt-archives
-          key: apt-lavapipe-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
       - name: Install a software Vulkan driver (lavapipe)
         if: runner.os == 'Linux'
         run: |
-          mkdir -p "$HOME/apt-archives/partial"
           sudo apt-get update
           # The validation layer checks the Vulkan tests' use of the
           # client's device, emberwave's and wgpu's included (decision D61).
-          sudo apt-get -o Dir::Cache::archives="$HOME/apt-archives" install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-tools vulkan-validationlayers
-          # The cache is saved by the runner's user.
-          sudo chown -R "$USER" "$HOME/apt-archives"
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-tools vulkan-validationlayers
           # lavapipe alone: Vulkan loaders 1.3.284 to 1.4.344 unload the
           # drivers that find no device while other threads may be reading
           # their list, which crashes tests that create contexts in parallel
@@ -204,33 +192,9 @@ jobs:
   xcframework:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
-    # The checks are independent of each other and each takes minutes, so they
-    # run side by side, every one on a Mac of its own with the XCFramework built
-    # again from the cache (under a minute).
-    name: XCFramework, ${{ matrix.name }}
+    name: XCFramework (iOS Simulator, macOS)
     runs-on: macos-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # The C and Swift examples, linked with the XCFramework, decode the
-          # test vectors on this Mac and in an iOS Simulator; for devices they
-          # are linked only.
-          - name: examples
-            build_cli: true
-            check: scripts/check_xcframework.sh target/debug/emberwave-cli
-          # The iPhone benchmark app: built for iPhones, and run in an iOS
-          # Simulator with -autorun, where it also reads a texture of
-          # emberwave_decoder_decode_texture back through Metal.
-          - name: iPhone app
-            build_cli: false
-            check: scripts/check_ios_app.sh
-          # The app's measurements on this Mac, emberwave's and HEVC's, by its
-          # own code built against the XCFramework's library for the Mac.
-          - name: Mac measurements
-            build_cli: false
-            check: scripts/bench_app_on_mac.sh -autorun
     steps:
       - uses: actions/checkout@v7
         with:
@@ -240,12 +204,16 @@ jobs:
           rustup toolchain install stable --profile minimal --target aarch64-apple-ios --target aarch64-apple-ios-sim --no-self-update
           rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # One cache for the three: they build the same things.
-          shared-key: xcframework
       - run: scripts/build_xcframework.sh
-      - name: Build the command line tool
-        if: matrix.build_cli
-        run: cargo build -p emberwave-cli
-      - name: Check
-        run: ${{ matrix.check }}
+      - run: cargo build -p emberwave-cli
+      # The C and Swift examples, linked with the XCFramework, decode the test
+      # vectors on this Mac and in an iOS Simulator; for devices they are
+      # linked only.
+      - run: scripts/check_xcframework.sh target/debug/emberwave-cli
+      # The iPhone benchmark app: built for iPhones, and run in an iOS
+      # Simulator with -autorun, where it also reads a texture of
+      # emberwave_decoder_decode_texture back through Metal.
+      - run: scripts/check_ios_app.sh
+      # The app's measurements on this Mac, emberwave's and HEVC's, by its
+      # own code built against the XCFramework's library for the Mac.
+      - run: scripts/bench_app_on_mac.sh -autorun
