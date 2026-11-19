@@ -3,18 +3,23 @@
 # emberwave_encode (encode.c).
 #
 #     cargo build --release -p emberwave-ffi
-#     cmake -S crates/emberwave-ffi/examples/c -B target/c-example -DEMBERWAVE_LIB_DIR=target/release
+#     scripts/package_ffi.sh target/release target/c-example/lib
+#     cmake -S crates/emberwave-ffi/examples/c -B target/c-example -DEMBERWAVE_LIB_DIR=target/c-example/lib
 #     cmake --build target/c-example --config Release
 #
-# EMBERWAVE_LIB_DIR is the cargo output directory (target/debug or
-# target/release), relative to the repository root or absolute.
+# EMBERWAVE_LIB_DIR is a directory with the library under the name it gives
+# itself, which a program linked against it looks for (decision D75): cargo makes
+# libemberwave_ffi.so or .dylib without the major version, and
+# `scripts/package_ffi.sh target/release target/c-example/lib` makes the directory
+# from it, with the versioned file and the unversioned link. Relative to the
+# repository root or absolute. On Windows the cargo output directory does as it is.
 cmake_minimum_required(VERSION 3.16)
 project(emberwave_example C)
 
 set(EMBERWAVE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../..")
 # A STRING, not a PATH: CMake would resolve a relative PATH against the
 # current directory before this file sees it.
-set(EMBERWAVE_LIB_DIR "target/release" CACHE STRING "Where cargo put the emberwave-ffi library")
+set(EMBERWAVE_LIB_DIR "target/c-example/lib" CACHE STRING "A directory with the emberwave-ffi library under its own name")
 get_filename_component(EMBERWAVE_LIB_DIR_ABSOLUTE "${EMBERWAVE_LIB_DIR}" ABSOLUTE BASE_DIR "${EMBERWAVE_ROOT}")
 
 add_library(emberwave SHARED IMPORTED)

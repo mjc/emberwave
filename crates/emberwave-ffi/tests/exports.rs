@@ -270,7 +270,9 @@ fn own_name(library: &PathBuf) -> (String, Option<(String, String)>) {
             )),
         )
     } else {
+        // readelf's labels are translated; the C locale keeps the ones parsed below.
         let output = Command::new("readelf")
+            .env("LC_ALL", "C")
             .arg("-d")
             .arg(library)
             .output()

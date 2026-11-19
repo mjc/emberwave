@@ -17,44 +17,57 @@
 #   --with-static also copy the static library (`libemberwave_ffi.a`, or
 #                 `emberwave_ffi.lib` on Windows), which a release builds apart
 #
-# Needs readelf on Linux and otool on macOS for the check.
+# A relative SRC or DEST is relative to the root of the repository, wherever
+# the script is run from. The library's own name is checked before anything is
+# copied, so a library built before a change of version fails the script
+# without leaving a misnamed file behind. Needs readelf on Linux and otool on
+# macOS for the check.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 SRC=${1:?usage: scripts/package_ffi.sh SRC DEST [--with-static]}
 DEST=${2:?usage: scripts/package_ffi.sh SRC DEST [--with-static]}
-WITH_STATIC=${3:-}
+WITH_STATIC=
+case "${3:-}" in
+    "") ;;
+    --with-static) WITH_STATIC=1 ;;
+    *) echo "usage: scripts/package_ffi.sh SRC DEST [--with-static]" >&2; exit 2 ;;
+esac
+[ $# -le 3 ] || { echo "usage: scripts/package_ffi.sh SRC DEST [--with-static]" >&2; exit 2; }
 
 # The workspace's version, which the crates take: its first number is the major.
 version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\([0-9]*\)\..*/\1/p;}' Cargo.toml)
 major=${version:?no version in Cargo.toml}
 
-mkdir -p "$DEST"
 case "$(uname -s)" in
     Linux)
         versioned=libemberwave_ffi.so.$major
+        # readelf's labels are translated: the C locale keeps them as parsed here.
+        soname=$(LC_ALL=C readelf -d "$SRC/libemberwave_ffi.so" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')
+        [ "$soname" = "$versioned" ] || {
+            echo "the library's SONAME is '$soname', not $versioned: build it again" >&2
+            exit 1
+        }
+        mkdir -p "$DEST"
         cp "$SRC/libemberwave_ffi.so" "$DEST/$versioned"
         ln -sf "$versioned" "$DEST/libemberwave_ffi.so"
         [ -z "$WITH_STATIC" ] || cp "$SRC/libemberwave_ffi.a" "$DEST/"
-        soname=$(readelf -d "$DEST/$versioned" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')
-        [ "$soname" = "$versioned" ] || {
-            echo "the library's SONAME is '$soname', not $versioned" >&2
-            exit 1
-        }
         ;;
     Darwin)
         versioned=libemberwave_ffi.$major.dylib
+        name=$(otool -D "$SRC/libemberwave_ffi.dylib" | tail -n 1)
+        [ "$name" = "@rpath/$versioned" ] || {
+            echo "the library's install name is '$name', not @rpath/$versioned: build it again" >&2
+            exit 1
+        }
+        mkdir -p "$DEST"
         cp "$SRC/libemberwave_ffi.dylib" "$DEST/$versioned"
         ln -sf "$versioned" "$DEST/libemberwave_ffi.dylib"
         [ -z "$WITH_STATIC" ] || cp "$SRC/libemberwave_ffi.a" "$DEST/"
-        name=$(otool -D "$DEST/$versioned" | tail -n 1)
-        [ "$name" = "@rpath/$versioned" ] || {
-            echo "the library's install name is '$name', not @rpath/$versioned" >&2
-            exit 1
-        }
         ;;
     *)
         # Windows (Git Bash): the names do not change.
+        mkdir -p "$DEST"
         cp "$SRC/emberwave_ffi.dll" "$SRC/emberwave_ffi.dll.lib" "$DEST/"
         [ -z "$WITH_STATIC" ] || cp "$SRC/emberwave_ffi.lib" "$DEST/"
         ;;

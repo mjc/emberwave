@@ -19,7 +19,7 @@ To build it yourself, with Rust 1.87 or newer:
 
 ```sh
 cargo build --release -p emberwave-ffi        # target/release: the shared library, as libemberwave_ffi.so or .dylib
-scripts/package_ffi.sh target/release lib     # gives it its versioned name, with the unversioned one as a link
+scripts/package_ffi.sh target/release target/release/lib   # its versioned name, with the unversioned one as a link
 cargo rustc --release -p emberwave-ffi --lib --crate-type staticlib \
     -- --print native-static-libs              # the static library, and what it needs
 ```
@@ -30,7 +30,7 @@ The commands below assume an archive unpacked into `emberwave/` and a program `a
 
 The shared library exports the functions of `emberwave.h` and nothing else: checked by `tests/exports.rs` on Linux, and on macOS apart from four more names beside them that belong to an Objective-C class of a dependency (`___CLASS_RawWindowMetalLayer` and three like it) and are not part of the API (decision D73). On Windows rustc's own export table is used, and the test does not run.
 
-The shared library names itself `@rpath/libemberwave_ffi.0.dylib` on macOS and `libemberwave_ffi.so.0` on Linux, so a program looks for it on its run path. The number is emberwave's major version, 0 now and 1 from 1.0.0: from 1.0 it means the ABI (decision D69), and a program linked against one major version never loads another. The unversioned names in `lib` are links, which a linker is given (`-lemberwave_ffi`); the program records the versioned one, so that is the file to ship. These commands set the run path to a `lib` directory next to the program and put the library there:
+The shared library names itself `@rpath/libemberwave_ffi.0.dylib` on macOS and `libemberwave_ffi.so.0` on Linux, so a program looks for it on its run path. The number is emberwave's major version, 0 now and 1 from 1.0.0: from 1.0 it means the ABI (decision D69), and a program linked against it from this change on, on Linux and macOS, never loads another major version (Windows keeps `emberwave_ffi.dll`, and a program linked before asks for the unversioned name, which the archives keep as a link). The unversioned names in `lib` are links, which a linker is given (`-lemberwave_ffi`); the program records the versioned one, so that is the file to ship (the static library `.a` that the copy below also takes is not needed to run). These commands set the run path to a `lib` directory next to the program and put the library there:
 
 ```sh
 # macOS
@@ -152,7 +152,8 @@ emberwave_encoder_destroy(encoder);
 
 ```sh
 cargo build -p emberwave-ffi
-cmake -S crates/emberwave-ffi/examples/c -B target/c-example -DEMBERWAVE_LIB_DIR=target/debug
+scripts/package_ffi.sh target/debug target/c-example/lib   # the library under its versioned name
+cmake -S crates/emberwave-ffi/examples/c -B target/c-example -DEMBERWAVE_LIB_DIR=target/c-example/lib
 cmake --build target/c-example
 target/c-example/emberwave_decode testdata/noise_192x136_420.pwv1 out.y4m
 target/c-example/emberwave_encode testdata/encoder/scene_200x120_420.source.y4m 20000
