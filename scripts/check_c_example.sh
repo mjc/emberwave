@@ -22,8 +22,13 @@ cd "$(dirname "$0")/.."
 CARGO_OUT=${1:-target/debug}
 BUILD=target/c-example
 
+# The library as a release archive has it, under its versioned name, which is
+# the one a program linked against it looks for (decision D75); the script also
+# checks that the library's own name is that one.
+scripts/package_ffi.sh "$CARGO_OUT" "$BUILD/lib"
+
 cmake -S crates/emberwave-ffi/examples/c -B "$BUILD" \
-    -DEMBERWAVE_LIB_DIR="$CARGO_OUT" -DCMAKE_BUILD_TYPE=Debug
+    -DEMBERWAVE_LIB_DIR="$BUILD/lib" -DCMAKE_BUILD_TYPE=Debug
 cmake --build "$BUILD" --config Debug
 
 # Single-configuration generators put the programs in the build directory,

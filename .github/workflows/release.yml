@@ -106,12 +106,9 @@ jobs:
           name="emberwave-ffi-${ref}-${{ matrix.target }}"
           mkdir -p "$name/include" "$name/lib"
           cp crates/emberwave-ffi/include/emberwave.h "$name/include/"
-          case "$RUNNER_OS" in
-            Linux) libs="libemberwave_ffi.so libemberwave_ffi.a" ;;
-            macOS) libs="libemberwave_ffi.dylib libemberwave_ffi.a" ;;
-            Windows) libs="emberwave_ffi.dll emberwave_ffi.dll.lib emberwave_ffi.lib" ;;
-          esac
-          for lib in $libs; do cp "target/release/$lib" "$name/lib/"; done
+          # The shared library under the versioned name it gives itself and the
+          # unversioned name as a link, and the static library (decision D75).
+          scripts/package_ffi.sh target/release "$name/lib" --with-static
           cp native-static-libs.txt "$name/lib/"
           cp crates/emberwave-ffi/README.md LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md "$name/"
           pack "$name"
