@@ -31,6 +31,8 @@ jobs:
           rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
+      # The crates carry copies of LICENSE and THIRD_PARTY_NOTICES.md (decision D75).
+      - run: scripts/check_license_copies.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # The parser and the CPU decoder alone, which emberwave-core is without
       # its default `gpu` feature.
