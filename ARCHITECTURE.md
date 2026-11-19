@@ -1898,6 +1898,8 @@ The last frame's detail, always, gains everything on a still picture and loses u
 
 **Not done.** `THIRD_PARTY_NOTICES.md` was not in the packages: `cargo package --list` showed `LICENSE` and no notices file, where the release archives carry both (D51). D75 copies it into both crates; it reaches crates.io with the next publish. Trusted Publishing is not set up.
 
+**Since then.** 0.19.0 of both crates was published on 2026-11-19 from the tag, with the maintainer's approval given for that version ("ㅇㅇ 둘다해"), and the packages carry `THIRD_PARTY_NOTICES.md` (D75). The approval is per version.
+
 **Consequence.** A published version cannot be taken back, only yanked, so a release that publishes is a step to confirm. The workspace version, `EMBERWAVE_VERSION` and the crates' dependency on `emberwave-core` move together (D69).
 
 ### 2026-11-19 — D75: Before 1.0: the library's name, wgpu in the Rust API, the notices in the crates
