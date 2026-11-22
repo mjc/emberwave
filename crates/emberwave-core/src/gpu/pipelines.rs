@@ -485,13 +485,21 @@ fn create_stages<const N: usize>(
     })
 }
 
-/// Runs `body` and turns validation and out-of-memory errors raised inside it
-/// into an error value instead of letting the default handler panic.
+/// Error captured by [`with_error_scope_kind`], separating wgpu validation
+/// errors from device errors such as internal or out-of-memory failures.
+pub(crate) enum ScopedError {
+    Validation(String),
+    Device(GpuError),
+}
+
+/// Runs `body` and turns validation, internal and out-of-memory errors raised
+/// inside it into a [`ScopedError`] instead of letting the default handler
+/// panic.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn with_error_scope<T>(
+pub(crate) fn with_error_scope_kind<T>(
     device: &wgpu::Device,
     body: impl FnOnce() -> T,
-) -> Result<T, GpuError> {
+) -> Result<T, ScopedError> {
     let memory_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     // Internal errors are what a driver's failure to compile a shader or to
     // build a pipeline becomes.
@@ -503,10 +511,36 @@ pub(crate) fn with_error_scope<T>(
     let internal = pollster::block_on(internal_scope.pop());
     let memory = pollster::block_on(memory_scope.pop());
 
-    match validation.or(internal).or(memory) {
-        Some(error) => Err(GpuError::Device(error.to_string())),
-        None => Ok(value),
+    if let Some(error) = validation {
+        Err(ScopedError::Validation(error.to_string()))
+    } else if let Some(error) = internal.or(memory) {
+        Err(ScopedError::Device(GpuError::Device(error.to_string())))
+    } else {
+        Ok(value)
     }
+}
+
+/// Runs `body` and turns validation and out-of-memory errors raised inside it
+/// into an error value instead of letting the default handler panic.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn with_error_scope<T>(
+    device: &wgpu::Device,
+    body: impl FnOnce() -> T,
+) -> Result<T, GpuError> {
+    with_error_scope_kind(device, body).map_err(|error| match error {
+        ScopedError::Validation(message) => GpuError::Device(message),
+        ScopedError::Device(error) => error,
+    })
+}
+
+/// In a browser nothing may block, so the scopes cannot be waited for. The
+/// work runs as it is; WebGPU reports its errors to the browser's console.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn with_error_scope_kind<T>(
+    _device: &wgpu::Device,
+    body: impl FnOnce() -> T,
+) -> Result<T, ScopedError> {
+    Ok(body())
 }
 
 /// In a browser nothing may block, so the scopes cannot be waited for. The

@@ -79,10 +79,13 @@ pub enum EmberwaveStatus {
     /// A bug in emberwave. Destroy the object the call was made on.
     Internal = 7,
     /// The system lacks the graphics API of the call, which makes a context
-    /// on it or wraps one of its objects: Metal's off Apple's systems,
+    /// on it or wraps one of its objects (Metal's off Apple's systems,
     /// Vulkan's off Linux, Android and 64-bit Windows, Direct3D's off
-    /// Windows. The calls that take what such a context made give
-    /// `EMBERWAVE_STATUS_INVALID_ARGUMENT` for a context of another kind.
+    /// Windows), or the device lacks an optional GPU capability required by
+    /// the call, such as `EMBERWAVE_PLANE_FORMAT_R16`
+    /// (`EMBERWAVE_CONTEXT_FEATURE_PLANE_R16`). The calls that take what a
+    /// platform context made give `EMBERWAVE_STATUS_INVALID_ARGUMENT` for a
+    /// context of another kind.
     Unsupported = 8,
     /// An output array or buffer of the caller's, or an encode's budget, is
     /// too small. Where the call can tell how much it needs, it stores that
@@ -500,8 +503,9 @@ pub struct EmberwaveDecoder {
 /// `emberwave_decoder_submit_plane_textures_metal`, and their `_vulkan` and
 /// `_d3d12` forms, for the caller's graphics API to read on the GPU.
 /// emberwave makes it (`emberwave_texture_create`,
-/// `emberwave_texture_create_plane`), wraps a Metal texture or a Vulkan
-/// image of the caller's (`emberwave_texture_from_metal`,
+/// `emberwave_texture_create_plane`,
+/// `emberwave_texture_create_plane_with_format`), wraps a Metal texture or a
+/// Vulkan image of the caller's (`emberwave_texture_from_metal`,
 /// `emberwave_texture_from_metal_plane`, `emberwave_texture_from_vulkan`,
 /// `emberwave_texture_from_vulkan_plane`), or opens a Direct3D texture the
 /// caller shares (`emberwave_texture_from_d3d12`,
@@ -511,10 +515,11 @@ pub struct EmberwaveDecoder {
 /// for `emberwave_encoder_encode_textures` and its `_vulkan` and `_d3d12`
 /// forms to read (`emberwave_texture_from_metal_source`,
 /// `emberwave_texture_from_vulkan_source`,
-/// `emberwave_texture_from_d3d12_source`, decision D62). A texture of a
-/// plane serves the decoders and encoders of its context whose pictures
-/// have planes of its size, so planes a decode put into textures can be
-/// encoded again.
+/// `emberwave_texture_from_d3d12_source`, decision D62). An 8-bit plane
+/// texture (`EMBERWAVE_PLANE_FORMAT_R8`) serves the decoders and encoders of
+/// its context whose pictures have planes of its size, so 8-bit planes a
+/// decode put into textures can be encoded again; 16-bit
+/// (`EMBERWAVE_PLANE_FORMAT_R16`) plane textures are for decode output only.
 ///
 /// How the decodes and the caller's reads of a texture are ordered:
 /// - On a context of `emberwave_context_create`, emberwave works on a queue
@@ -588,6 +593,11 @@ pub struct EmberwaveTexture {
     /// Direct3D 11 device: only the `_d3d12` calls take it, which leave it in
     /// `D3D12_RESOURCE_STATE_COMMON` (decision D63).
     d3d12: bool,
+    /// Duplicated NT handle for a shared Direct3D 12 resource, retained so
+    /// `CompareObjectHandles` detects duplicate shared resources after the
+    /// caller closes its input handles.
+    #[cfg(windows)]
+    d3d12_handle: Option<d3d12::SharedHandle>,
 }
 
 impl EmberwaveTexture {
@@ -612,6 +622,8 @@ impl EmberwaveTexture {
             tracked,
             vulkan: wrapping.vulkan,
             d3d12: false,
+            #[cfg(windows)]
+            d3d12_handle: None,
         }
     }
 }
@@ -1785,8 +1797,9 @@ pub struct EmberwaveVulkanImage {
     /// The `VkImage`.
     pub image: u64,
     /// Its `VkFormat`: `VK_FORMAT_B8G8R8A8_UNORM` or
-    /// `VK_FORMAT_R8G8B8A8_UNORM` for the picture, `VK_FORMAT_R8_UNORM` for a
-    /// plane, `VK_FORMAT_R8G8_UNORM` for Cb and Cr interleaved.
+    /// `VK_FORMAT_R8G8B8A8_UNORM` for the picture, `VK_FORMAT_R8_UNORM` or
+    /// `VK_FORMAT_R16_UNORM` for a decoded plane, `VK_FORMAT_R8_UNORM` for an
+    /// encoded plane, `VK_FORMAT_R8G8_UNORM` for Cb and Cr interleaved.
     pub format: u32,
     /// The `VkImageUsageFlags` it was made with.
     pub usage: u32,
@@ -2640,7 +2653,12 @@ pub unsafe extern "C" fn emberwave_texture_from_d3d12(
 /// which a decode stores the 16-bit normalised plane into; requires
 /// `EMBERWAVE_CONTEXT_FEATURE_PLANE_R16`, else
 /// `EMBERWAVE_STATUS_UNSUPPORTED`). Only
-/// `emberwave_decoder_submit_plane_textures_d3d12` takes it.
+/// `emberwave_decoder_submit_plane_textures_d3d12` takes it. Pass handles to
+/// three distinct underlying Direct3D resources: reusing a handle or passing a
+/// `DuplicateHandle` copy for two planes is rejected with
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, whereas separate `CreateSharedHandle`
+/// calls on one resource or placed-memory aliases cannot be distinguished by the
+/// API and are the caller's responsibility to keep distinct.
 ///
 /// # Safety
 ///
@@ -2772,7 +2790,11 @@ pub unsafe extern "C" fn emberwave_decoder_submit_texture_d3d12(
 /// Decodes the frame received so far into the plane textures `y`, `cb` and
 /// `cr`, as `emberwave_decoder_decode_plane_textures` does, but returns once
 /// the work is submitted, with the fences of `sync`, as
-/// `emberwave_decoder_submit_texture_d3d12` does.
+/// `emberwave_decoder_submit_texture_d3d12` does. `y`, `cb` and `cr` must
+/// refer to three distinct underlying Direct3D resources: reused or duplicated
+/// shared NT handles are rejected with `EMBERWAVE_STATUS_INVALID_ARGUMENT`
+/// (separate `CreateSharedHandle` handles or placed-memory aliases cannot be
+/// distinguished by the API).
 ///
 /// # Safety
 ///
@@ -2883,6 +2905,10 @@ pub unsafe extern "C" fn emberwave_encoder_encode_textures_d3d12(
 /// Whether two textures are the same, or wrap the same texture of the
 /// caller's.
 fn same_texture(a: &EmberwaveTexture, b: &EmberwaveTexture) -> bool {
+    #[cfg(windows)]
+    if d3d12::same_resource(a, b) {
+        return true;
+    }
     a.texture == b.texture
 }
 
@@ -3856,7 +3882,9 @@ mod d3d12 {
         GpuContext, GpuOptions, PLANE_FORMAT, PLANE_FORMAT_R16, QueueTurns, SubmissionHooks,
     };
     use wgpu::hal::api::Dx12;
-    use windows::Win32::Foundation::{HANDLE, LUID};
+    use windows::Win32::Foundation::{
+        CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, LUID,
+    };
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
@@ -3871,6 +3899,45 @@ mod d3d12 {
         EmberwaveD3D12Fence, EmberwaveStatus, EmberwaveTexture, Failure, Holds, Wrapping,
         creation_failure,
     };
+
+    /// A duplicated NT handle to a shared Direct3D 12 resource, retained so
+    /// `CompareObjectHandles` recognises wrappers of the same kernel object
+    /// even after the caller closes its input handles.
+    pub(super) struct SharedHandle(HANDLE);
+
+    // SAFETY: kernel handles in this process are not thread-affine.
+    unsafe impl Send for SharedHandle {}
+    // SAFETY: read-only handle comparisons and drop-time closing are safe across threads.
+    unsafe impl Sync for SharedHandle {}
+
+    impl Drop for SharedHandle {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` was obtained from `DuplicateHandle` in this process.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Whether `a` and `b` refer to the same underlying Direct3D 12 resource.
+    pub(super) fn same_resource(a: &EmberwaveTexture, b: &EmberwaveTexture) -> bool {
+        if let (Some(ah), Some(bh)) = (&a.d3d12_handle, &b.d3d12_handle) {
+            // SAFETY: both handles are live duplicated handles owned by `SharedHandle`.
+            if unsafe { CompareObjectHandles(ah.0, bh.0) }.as_bool() {
+                return true;
+            }
+        }
+        // SAFETY: only reads the HAL texture resources while both textures remain alive.
+        if let (Some(a_hal), Some(b_hal)) =
+            unsafe { (a.texture.as_hal::<Dx12>(), b.texture.as_hal::<Dx12>()) }
+        {
+            // SAFETY: `a_hal` and `b_hal` are live HAL textures whose raw resources stay valid.
+            let (a_raw, b_raw) = unsafe { (a_hal.raw_resource(), b_hal.raw_resource()) };
+            return windows::core::Interface::as_raw(a_raw)
+                == windows::core::Interface::as_raw(b_raw);
+        }
+        false
+    }
 
     fn no_gpu(message: impl Into<String>) -> Failure {
         Failure(EmberwaveStatus::NoGpu, message.into())
@@ -4097,6 +4164,28 @@ mod d3d12 {
             }
         }
 
+        let current_process = HANDLE(-1isize as *mut c_void);
+        let mut dup = HANDLE::default();
+        // SAFETY: `handle` opened a live resource in this process above, and `dup`
+        // receives a duplicated handle owned by `SharedHandle`.
+        unsafe {
+            DuplicateHandle(
+                current_process,
+                HANDLE(handle),
+                current_process,
+                &mut dup,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        }
+        .map_err(|error| {
+            Failure::argument(format!(
+                "failed to duplicate the shared texture handle: {error}"
+            ))
+        })?;
+        let shared_handle = SharedHandle(dup);
+
         let size = wgpu::Extent3d {
             width,
             height,
@@ -4137,6 +4226,7 @@ mod d3d12 {
         };
         let mut wrapped = EmberwaveTexture::wrap(wrapping, texture, true);
         wrapped.d3d12 = true;
+        wrapped.d3d12_handle = Some(shared_handle);
         Ok(wrapped)
     }
 
@@ -5206,11 +5296,12 @@ unsafe fn metal_import(
 /// # Safety
 ///
 /// `texture` is `NULL`, or a texture from `emberwave_texture_create`,
-/// `emberwave_texture_create_plane`, or one of the functions that wrap a
-/// texture or an image of the caller's (`emberwave_texture_from_*`) that has
-/// not been destroyed and that no other thread is using. A Metal texture of one emberwave made goes with
-/// it unless the caller retained it; of one that wraps a texture of the
-/// caller's, only emberwave's reference goes.
+/// `emberwave_texture_create_plane`,
+/// `emberwave_texture_create_plane_with_format`, or one of the functions that
+/// wrap a texture or an image of the caller's (`emberwave_texture_from_*`) that
+/// has not been destroyed and that no other thread is using. A Metal texture of
+/// one emberwave made goes with it unless the caller retained it; of one that
+/// wraps a texture of the caller's, only emberwave's reference goes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_texture_destroy(texture: *mut EmberwaveTexture) {
     if !texture.is_null() {
@@ -5449,22 +5540,28 @@ fn require_shared_queue(decoder: &EmberwaveDecoder) -> Result<(), Failure> {
 /// Decodes the frame received so far into its Y, Cb and Cr planes in `y`,
 /// `cb` and `cr` on the GPU, then waits for the GPU: when this returns,
 /// the textures hold the planes, for the caller's graphics API to read on any
-/// queue of the device. They hold the samples of the stream, as
-/// `emberwave_decoder_decode_yuv` writes them, which the caller converts to
-/// colours itself, with the matrix, range and chroma siting the stream
-/// signals (`emberwave_probe_packet`) or that it knows better. In 4:2:0 a
-/// chroma sample sits vertically halfway between two rows of luma, and
-/// horizontally halfway between two luma samples with
-/// `EMBERWAVE_SITING_CENTER`, on the left one with `EMBERWAVE_SITING_LEFT`.
-/// The planes never go through CPU memory: on Metal the decode stores them
-/// into the textures from its shaders when all three allow it, and copies
-/// them in otherwise (decision D52). Blocks that did not arrive decode as
-/// zeros, or are concealed (`emberwave_decoder_set_concealment`).
+/// queue of the device. With `EMBERWAVE_PLANE_FORMAT_R8`, the textures hold
+/// the 8-bit samples of the stream as `emberwave_decoder_decode_yuv` writes
+/// them; with `EMBERWAVE_PLANE_FORMAT_R16`, the shader stores `[0, 1]` sample
+/// values rounded ties-to-even over 65535 directly into the textures on all
+/// supported backends. The caller converts the planes to colours itself, with
+/// the matrix, range and chroma siting the stream signals
+/// (`emberwave_probe_packet`) or that it knows better. In 4:2:0 a chroma sample
+/// sits vertically halfway between two rows of luma, and horizontally halfway
+/// between two luma samples with `EMBERWAVE_SITING_CENTER`, on the left one
+/// with `EMBERWAVE_SITING_LEFT`. The planes never go through CPU memory: on
+/// Metal 8-bit decodes store them into the textures from their shaders when all
+/// three allow it, and copy them in otherwise (decision D52), while 16-bit
+/// decodes always store directly from the shader. Blocks that did not arrive
+/// decode as zeros, or are concealed (`emberwave_decoder_set_concealment`).
 ///
 /// Each texture is one for that plane, from `emberwave_texture_create_plane`,
+/// `emberwave_texture_create_plane_with_format`,
 /// `emberwave_texture_from_metal_plane` or
 /// `emberwave_texture_from_vulkan_plane`, on a decoder of the same context,
-/// picture size and chroma format, and no Metal texture serves two planes.
+/// picture size and chroma format. All three textures must share one plane
+/// format (`EMBERWAVE_PLANE_FORMAT_R8` or `EMBERWAVE_PLANE_FORMAT_R16`), and
+/// no Vulkan image, Metal texture or Direct3D resource may serve two planes.
 /// Another, a texture of the RGB picture included, gives
 /// `EMBERWAVE_STATUS_INVALID_ARGUMENT` and leaves the frame to decode, as
 /// does a texture shared from Direct3D, which takes
@@ -5503,6 +5600,7 @@ pub unsafe extern "C" fn emberwave_decoder_decode_plane_textures(
                 ]
             };
             distinct_metal(&textures)?;
+            distinct_images(&textures)?;
             refuse_d3d12(&textures)?;
             let targets = textures.map(|texture| &texture.view);
             decoder
@@ -5875,10 +5973,12 @@ fn rgb_order(format: u32) -> Result<RgbOrder, Failure> {
 /// picture in CPU memory and into the same bytes (decision D65). The
 /// textures are on the encoder's context, with the sizes of what they hold:
 /// the caller's, from `emberwave_texture_from_metal_source` or
-/// `emberwave_texture_from_vulkan_source`, or textures that decodes put
-/// planes or pictures into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT`
-/// before any work on the GPU, textures shared from Direct3D included, which
-/// take `emberwave_encoder_encode_textures_d3d12`. A budget too small gives
+/// `emberwave_texture_from_vulkan_source`, or 8-bit (`EMBERWAVE_PLANE_FORMAT_R8`
+/// / `R8Unorm`) textures that decodes put planes or pictures into (16-bit
+/// `EMBERWAVE_PLANE_FORMAT_R16` plane textures are not accepted). Others give
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT` before any work on the GPU, textures
+/// shared from Direct3D included, which take
+/// `emberwave_encoder_encode_textures_d3d12`. A budget too small gives
 /// `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`, as for `emberwave_encoder_encode`,
 /// once the GPU has encoded the picture: no frame then, and the sequence
 /// number does not move.
@@ -6365,6 +6465,87 @@ mod tests {
                 }
                 emberwave_decoder_destroy(decoder);
             }
+            emberwave_context_destroy(context);
+        }
+    }
+
+    #[test]
+    fn strict_webgpu_context_reports_r16_unsupported_while_r8_succeeds() {
+        let mut options = GpuOptions::from_env().unwrap_or_default();
+        options.strict_webgpu = true;
+        let gpu_context = match GpuContext::new(&options) {
+            Ok(context) => context,
+            Err(_) => {
+                assert!(
+                    std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
+                    "no GPU"
+                );
+                return;
+            }
+        };
+        let context = EmberwaveContext::boxed(gpu_context, false, false, false);
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/noise_192x136_420.pwv1");
+        let bytes = std::fs::read(&path).expect("testdata");
+        let file = emberwave_core::bitstream::Pwv1File::parse(&bytes).expect("pwv1");
+        let frame = file.frames().next().expect("frame").expect("valid frame");
+
+        // SAFETY: `context` is a live boxed context and all pointers are valid.
+        unsafe {
+            let mut info = EmberwaveContextInfo::default();
+            assert_eq!(
+                emberwave_context_info(context, &mut info),
+                EmberwaveStatus::Ok
+            );
+            assert_eq!(info.features & EMBERWAVE_CONTEXT_FEATURE_PLANE_R16, 0);
+
+            let mut decoder = std::ptr::null_mut();
+            assert_eq!(
+                emberwave_decoder_create(context, 192, 136, EMBERWAVE_CHROMA_420, &mut decoder),
+                EmberwaveStatus::Ok
+            );
+
+            let mut marker = 0u8;
+            let mut r16_tex = std::ptr::from_mut(&mut marker).cast::<EmberwaveTexture>();
+            assert_eq!(
+                emberwave_texture_create_plane_with_format(
+                    decoder,
+                    EMBERWAVE_PLANE_Y,
+                    EMBERWAVE_PLANE_FORMAT_R16,
+                    &mut r16_tex
+                ),
+                EmberwaveStatus::Unsupported
+            );
+            assert!(r16_tex.is_null());
+
+            let r8 = [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR].map(|plane| {
+                let mut tex = std::ptr::null_mut();
+                assert_eq!(
+                    emberwave_texture_create_plane_with_format(
+                        decoder,
+                        plane,
+                        EMBERWAVE_PLANE_FORMAT_R8,
+                        &mut tex
+                    ),
+                    EmberwaveStatus::Ok
+                );
+                tex
+            });
+
+            assert_eq!(
+                emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                EmberwaveStatus::Ok
+            );
+            assert_eq!(
+                emberwave_decoder_decode_plane_textures(decoder, r8[0], r8[1], r8[2]),
+                EmberwaveStatus::Ok
+            );
+
+            for tex in r8 {
+                emberwave_texture_destroy(tex);
+            }
+            emberwave_decoder_destroy(decoder);
             emberwave_context_destroy(context);
         }
     }

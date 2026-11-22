@@ -1143,6 +1143,96 @@ impl Client {
         }
     }
 
+    /// Whether the physical device supports optimal-tiling `features` on `format`.
+    fn format_supports_usage(&self, format: vk::Format, features: vk::FormatFeatureFlags) -> bool {
+        // SAFETY: a live instance and physical device of it.
+        let props = unsafe {
+            self.instance
+                .get_physical_device_format_properties(self.physical, format)
+        };
+        props.optimal_tiling_features.contains(features)
+    }
+
+    /// Whether the physical device exposes all six 16-bit normalised format
+    /// feature sets required by wgpu's `TEXTURE_FORMAT_16BIT_NORM` capability.
+    fn supports_r16_norm(&self) -> bool {
+        let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::STORAGE_IMAGE
+            | vk::FormatFeatureFlags::TRANSFER_SRC
+            | vk::FormatFeatureFlags::TRANSFER_DST;
+        [
+            vk::Format::R16_UNORM,
+            vk::Format::R16_SNORM,
+            vk::Format::R16G16_UNORM,
+            vk::Format::R16G16_SNORM,
+            vk::Format::R16G16B16A16_UNORM,
+            vk::Format::R16G16B16A16_SNORM,
+        ]
+        .into_iter()
+        .all(|format| self.format_supports_usage(format, required))
+    }
+
+    /// Transitions `image` from `UNDEFINED` to `SHADER_READ_ONLY_OPTIMAL`.
+    fn transition_to_shader_read_only(&self, device: &ash::Device, image: vk::Image) {
+        // SAFETY: valid command pool, command buffer, barrier, and fence on `device`.
+        unsafe {
+            let pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(self.family),
+                    None,
+                )
+                .expect("a command pool");
+            let commands = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .command_buffer_count(1),
+                )
+                .expect("a command buffer")[0];
+            device
+                .begin_command_buffer(commands, &vk::CommandBufferBeginInfo::default())
+                .expect("begun");
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            device.cmd_pipeline_barrier(
+                commands,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+            device.end_command_buffer(commands).expect("ended");
+            let fence = device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .expect("a fence");
+            let buffers = [commands];
+            let submit = vk::SubmitInfo::default().command_buffers(&buffers);
+            let queue = device.get_device_queue(self.family, 0);
+            device
+                .queue_submit(queue, &[submit], fence)
+                .expect("submitted");
+            device
+                .wait_for_fences(&[fence], true, TEN_SECONDS)
+                .expect("done");
+            device.destroy_fence(fence, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
     /// A timeline semaphore at 0.
     fn timeline(&self, device: &ash::Device) -> vk::Semaphore {
         let mut kind =
@@ -2745,11 +2835,40 @@ fn owned_r16_plane_textures_decode_on_vulkan() {
     // SAFETY: a live context and a struct as large as its size says.
     let status = unsafe { emberwave_context_info(context, &mut ctx_info) };
     assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
-    assert_ne!(
-        ctx_info.features & EMBERWAVE_CONTEXT_FEATURE_PLANE_R16,
-        0,
-        "Vulkan context should report R16 plane support"
+    let supports_r16 = (ctx_info.features & EMBERWAVE_CONTEXT_FEATURE_PLANE_R16) != 0;
+    assert_eq!(
+        supports_r16,
+        client.supports_r16_norm(),
+        "EMBERWAVE_CONTEXT_FEATURE_PLANE_R16 must match physical device R16 norm format support"
     );
+    if !supports_r16 {
+        // SAFETY: live context and decoder; out-pointer starts non-null to test nulling on failure.
+        unsafe {
+            let mut decoder = ptr::null_mut();
+            assert_eq!(
+                emberwave_decoder_create(context, 192, 136, EMBERWAVE_CHROMA_420, &mut decoder),
+                EmberwaveStatus::Ok,
+                "{}",
+                last_error()
+            );
+            let mut marker = 0u8;
+            let mut texture = ptr::from_mut(&mut marker).cast::<EmberwaveTexture>();
+            assert_eq!(
+                emberwave_texture_create_plane_with_format(
+                    decoder,
+                    EMBERWAVE_PLANE_Y,
+                    EMBERWAVE_PLANE_FORMAT_R16,
+                    &mut texture
+                ),
+                EmberwaveStatus::Unsupported
+            );
+            assert!(texture.is_null());
+            emberwave_decoder_destroy(decoder);
+            emberwave_context_destroy(context);
+            device.destroy_device(None);
+        }
+        return;
+    }
 
     for name in ["noise_192x136_420.pwv1", "noise_131x67_444.pwv1"] {
         let bytes = testdata(name);
@@ -2862,10 +2981,57 @@ fn wrapped_r16_images_decode_without_a_wait_and_release() {
     let semaphore = client.timeline(&device);
     let mut timeline_value = 0u64;
 
+    let mut ctx_info = EmberwaveContextInfo::default();
+    assert_eq!(
+        // SAFETY: a live context and a struct as large as its size says.
+        unsafe { emberwave_context_info(context, &mut ctx_info) },
+        EmberwaveStatus::Ok,
+        "{}",
+        last_error()
+    );
+
     // STORAGE | SAMPLED | TRANSFER_SRC — notably without TRANSFER_DST_BIT.
     let r16_usage = vk::ImageUsageFlags::STORAGE
         | vk::ImageUsageFlags::SAMPLED
         | vk::ImageUsageFlags::TRANSFER_SRC;
+    if (ctx_info.features & EMBERWAVE_CONTEXT_FEATURE_PLANE_R16) == 0 {
+        let can_create_r16 = client.format_supports_usage(
+            vk::Format::R16_UNORM,
+            vk::FormatFeatureFlags::STORAGE_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::TRANSFER_SRC,
+        );
+        // SAFETY: live objects destroyed cleanly before returning.
+        unsafe {
+            if can_create_r16 {
+                let mut decoder = ptr::null_mut();
+                assert_eq!(
+                    emberwave_decoder_create(context, 192, 136, EMBERWAVE_CHROMA_420, &mut decoder),
+                    EmberwaveStatus::Ok,
+                    "{}",
+                    last_error()
+                );
+                let y_r16 = client.image(&device, vk::Format::R16_UNORM, (192, 136), r16_usage);
+                let (status, _) = wrapped(
+                    decoder,
+                    &y_r16,
+                    vk::Format::R16_UNORM,
+                    r16_usage,
+                    Some(EMBERWAVE_PLANE_Y),
+                )
+                .unwrap_err();
+                assert_eq!(status, EmberwaveStatus::Unsupported);
+                emberwave_decoder_destroy(decoder);
+                device.destroy_image(y_r16.image, None);
+                device.free_memory(y_r16.memory, None);
+            }
+            emberwave_context_destroy(context);
+            device.destroy_semaphore(semaphore, None);
+            device.destroy_device(None);
+        }
+        return;
+    }
+
     let mut all_images = Vec::new();
     R16_RELEASED.store(0, Ordering::SeqCst);
 
@@ -3037,6 +3203,16 @@ fn r16_vulkan_images_with_wrong_usage_format_or_mixed_planes_are_refused() {
     };
     let (names, device) = client.device();
     let context = client.context(&device, &names, 0, None);
+    let mut ctx_info = EmberwaveContextInfo::default();
+    assert_eq!(
+        // SAFETY: a live context and a struct as large as its size says.
+        unsafe { emberwave_context_info(context, &mut ctx_info) },
+        EmberwaveStatus::Ok,
+        "{}",
+        last_error()
+    );
+    let supports_r16 = (ctx_info.features & EMBERWAVE_CONTEXT_FEATURE_PLANE_R16) != 0;
+
     let mut decoder = ptr::null_mut();
     // SAFETY: a live context and a pointer to store the decoder in.
     let status =
@@ -3054,115 +3230,291 @@ fn r16_vulkan_images_with_wrong_usage_format_or_mixed_planes_are_refused() {
     let r8_usage = vk::ImageUsageFlags::SAMPLED
         | vk::ImageUsageFlags::TRANSFER_DST
         | vk::ImageUsageFlags::TRANSFER_SRC;
+    let r16_src_usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
 
-    let y_r16 = client.image(&device, vk::Format::R16_UNORM, (192, 136), r16_full_usage);
-    let y_r16_no_storage = client.image(&device, vk::Format::R16_UNORM, (192, 136), r16_no_storage);
-    let y_r16_no_sampled = client.image(&device, vk::Format::R16_UNORM, (192, 136), r16_no_sampled);
-    let cb_r8 = client.image(&device, vk::Format::R8_UNORM, (96, 68), r8_usage);
-    let cr_r8 = client.image(&device, vk::Format::R8_UNORM, (96, 68), r8_usage);
+    let mut extra_images = Vec::new();
 
-    // 1. VK_FORMAT_R16_UNORM without VK_IMAGE_USAGE_STORAGE_BIT is rejected.
-    let (status, err) = wrapped(
-        decoder,
-        &y_r16_no_storage,
-        vk::Format::R16_UNORM,
-        r16_no_storage,
-        Some(EMBERWAVE_PLANE_Y),
-    )
-    .unwrap_err();
-    assert_eq!(status, EmberwaveStatus::InvalidArgument);
-    assert!(err.contains("VK_IMAGE_USAGE_STORAGE_BIT"), "{err}");
+    if supports_r16 {
+        let y_r16 = client.image(&device, vk::Format::R16_UNORM, (192, 136), r16_full_usage);
+        let y_r16_no_storage =
+            client.image(&device, vk::Format::R16_UNORM, (192, 136), r16_no_storage);
+        let y_r16_no_sampled =
+            client.image(&device, vk::Format::R16_UNORM, (192, 136), r16_no_sampled);
+        let cb_r8 = client.image(&device, vk::Format::R8_UNORM, (96, 68), r8_usage);
+        let cr_r8 = client.image(&device, vk::Format::R8_UNORM, (96, 68), r8_usage);
 
-    // 2. VK_FORMAT_R16_UNORM without VK_IMAGE_USAGE_SAMPLED_BIT is rejected.
-    let (status, err) = wrapped(
-        decoder,
-        &y_r16_no_sampled,
-        vk::Format::R16_UNORM,
-        r16_no_sampled,
-        Some(EMBERWAVE_PLANE_Y),
-    )
-    .unwrap_err();
-    assert_eq!(status, EmberwaveStatus::InvalidArgument);
-    assert!(err.contains("SAMPLED"), "{err}");
-
-    // 3. Wrong format (VK_FORMAT_R16_UINT, VK_FORMAT_R8G8_UNORM) for plane is rejected.
-    for wrong in [vk::Format::R16_UINT, vk::Format::R8G8_UNORM] {
+        // 1. VK_FORMAT_R16_UNORM without VK_IMAGE_USAGE_STORAGE_BIT is rejected.
         let (status, err) = wrapped(
             decoder,
-            &y_r16,
-            wrong,
-            r16_full_usage,
+            &y_r16_no_storage,
+            vk::Format::R16_UNORM,
+            r16_no_storage,
             Some(EMBERWAVE_PLANE_Y),
         )
         .unwrap_err();
         assert_eq!(status, EmberwaveStatus::InvalidArgument);
-        assert!(err.contains("format"), "{err}");
+        assert!(err.contains("VK_IMAGE_USAGE_STORAGE_BIT"), "{err}");
+
+        // 2. VK_FORMAT_R16_UNORM without VK_IMAGE_USAGE_SAMPLED_BIT is rejected.
+        let (status, err) = wrapped(
+            decoder,
+            &y_r16_no_sampled,
+            vk::Format::R16_UNORM,
+            r16_no_sampled,
+            Some(EMBERWAVE_PLANE_Y),
+        )
+        .unwrap_err();
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert!(err.contains("SAMPLED"), "{err}");
+
+        // 5. Mixed R8 + R16 plane textures in emberwave_decoder_submit_plane_textures_vulkan are rejected.
+        let tex_y_r16 = wrapped(
+            decoder,
+            &y_r16,
+            vk::Format::R16_UNORM,
+            r16_full_usage,
+            Some(EMBERWAVE_PLANE_Y),
+        )
+        .unwrap();
+        let tex_cb_r8 = wrapped(
+            decoder,
+            &cb_r8,
+            vk::Format::R8_UNORM,
+            r8_usage,
+            Some(EMBERWAVE_PLANE_CB),
+        )
+        .unwrap();
+        let tex_cr_r8 = wrapped(
+            decoder,
+            &cr_r8,
+            vk::Format::R8_UNORM,
+            r8_usage,
+            Some(EMBERWAVE_PLANE_CR),
+        )
+        .unwrap();
+        let frame = &frames()[0];
+        // SAFETY: live objects and valid frame bytes.
+        unsafe {
+            assert_eq!(
+                emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                EmberwaveStatus::Ok
+            );
+            assert_eq!(
+                emberwave_decoder_submit_plane_textures_vulkan(
+                    decoder,
+                    tex_y_r16,
+                    tex_cb_r8,
+                    tex_cr_r8,
+                    ptr::null()
+                ),
+                EmberwaveStatus::InvalidArgument
+            );
+            assert!(emberwave_decoder_is_ready(decoder, 0));
+
+            for texture in [tex_y_r16, tex_cb_r8, tex_cr_r8] {
+                emberwave_texture_destroy(texture);
+            }
+        }
+        extra_images.extend([y_r16, y_r16_no_storage, y_r16_no_sampled, cb_r8, cr_r8]);
+    } else if client.format_supports_usage(
+        vk::Format::R16_UNORM,
+        vk::FormatFeatureFlags::STORAGE_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::TRANSFER_SRC,
+    ) {
+        let y_r16 = client.image(&device, vk::Format::R16_UNORM, (192, 136), r16_full_usage);
+        let (status, _) = wrapped(
+            decoder,
+            &y_r16,
+            vk::Format::R16_UNORM,
+            r16_full_usage,
+            Some(EMBERWAVE_PLANE_Y),
+        )
+        .unwrap_err();
+        assert_eq!(status, EmberwaveStatus::Unsupported);
+        extra_images.push(y_r16);
     }
 
-    // 4. VK_FORMAT_R16_UNORM for emberwave_texture_from_vulkan_source (encoder) is rejected.
-    let (status, err) = source(
-        encoder,
-        &y_r16,
-        vk::Format::R16_UNORM,
-        r16_full_usage,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        EMBERWAVE_PLANE_Y,
-    )
-    .unwrap_err();
-    assert_eq!(status, EmberwaveStatus::InvalidArgument);
-    assert!(err.contains("not VK_FORMAT_R8_UNORM"), "{err}");
+    // 3. Wrong format (VK_FORMAT_R16_UINT, VK_FORMAT_R8G8_UNORM) for plane is rejected.
+    let wrong_usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+    let y_r16_uint = client.image(&device, vk::Format::R16_UINT, (192, 136), wrong_usage);
+    let y_rg8 = client.image(&device, vk::Format::R8G8_UNORM, (192, 136), wrong_usage);
+    for (image, wrong) in [
+        (&y_r16_uint, vk::Format::R16_UINT),
+        (&y_rg8, vk::Format::R8G8_UNORM),
+    ] {
+        let (status, err) =
+            wrapped(decoder, image, wrong, wrong_usage, Some(EMBERWAVE_PLANE_Y)).unwrap_err();
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert!(err.contains("format"), "{err}");
+    }
+    extra_images.extend([y_r16_uint, y_rg8]);
 
-    // 5. Mixed R8 + R16 plane textures in emberwave_decoder_submit_plane_textures_vulkan are rejected.
-    let tex_y_r16 = wrapped(
-        decoder,
-        &y_r16,
+    // 4. VK_FORMAT_R16_UNORM for emberwave_texture_from_vulkan_source (encoder) is rejected.
+    if client.format_supports_usage(
         vk::Format::R16_UNORM,
-        r16_full_usage,
-        Some(EMBERWAVE_PLANE_Y),
-    )
-    .unwrap();
-    let tex_cb_r8 = wrapped(
-        decoder,
-        &cb_r8,
-        vk::Format::R8_UNORM,
-        r8_usage,
-        Some(EMBERWAVE_PLANE_CB),
-    )
-    .unwrap();
-    let tex_cr_r8 = wrapped(
-        decoder,
-        &cr_r8,
-        vk::Format::R8_UNORM,
-        r8_usage,
-        Some(EMBERWAVE_PLANE_CR),
-    )
-    .unwrap();
+        vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::TRANSFER_SRC,
+    ) {
+        let y_r16_src = client.image(&device, vk::Format::R16_UNORM, (192, 136), r16_src_usage);
+        client.transition_to_shader_read_only(&device, y_r16_src.image);
+        let (status, err) = source(
+            encoder,
+            &y_r16_src,
+            vk::Format::R16_UNORM,
+            r16_src_usage,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            EMBERWAVE_PLANE_Y,
+        )
+        .unwrap_err();
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert!(err.contains("not VK_FORMAT_R8_UNORM"), "{err}");
+        extra_images.push(y_r16_src);
+    }
+
+    // SAFETY: live objects, destroyed once each.
+    unsafe {
+        emberwave_encoder_destroy(encoder);
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+        for image in extra_images {
+            device.destroy_image(image.image, None);
+            device.free_memory(image.memory, None);
+        }
+        device.destroy_device(None);
+    }
+}
+
+#[test]
+fn duplicate_vulkan_plane_images_are_refused() {
+    let Some(client) = Client::new() else {
+        return;
+    };
+    let (names, device) = client.device();
+    let context = client.context(&device, &names, 0, None);
+    let mut ctx_info = EmberwaveContextInfo::default();
+    assert_eq!(
+        // SAFETY: a live context and a struct as large as its size says.
+        unsafe { emberwave_context_info(context, &mut ctx_info) },
+        EmberwaveStatus::Ok,
+        "{}",
+        last_error()
+    );
+    let supports_r16 = (ctx_info.features & EMBERWAVE_CONTEXT_FEATURE_PLANE_R16) != 0;
+
+    let mut decoder = ptr::null_mut();
+    // SAFETY: a live context and a pointer to store the decoder in.
+    let status =
+        unsafe { emberwave_decoder_create(context, 192, 136, EMBERWAVE_CHROMA_420, &mut decoder) };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+
     let frame = &frames()[0];
-    // SAFETY: live objects and valid frame bytes.
+    // SAFETY: live decoder and valid frame bytes.
     unsafe {
         assert_eq!(
             emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
             EmberwaveStatus::Ok
         );
+    }
+
+    let r8_usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+    let y_r8 = client.image(&device, vk::Format::R8_UNORM, (192, 136), r8_usage);
+    let chroma_r8 = client.image(&device, vk::Format::R8_UNORM, (96, 68), r8_usage);
+    let y_tex_r8 = wrapped(
+        decoder,
+        &y_r8,
+        vk::Format::R8_UNORM,
+        r8_usage,
+        Some(EMBERWAVE_PLANE_Y),
+    )
+    .unwrap();
+    let cb_tex_r8 = wrapped(
+        decoder,
+        &chroma_r8,
+        vk::Format::R8_UNORM,
+        r8_usage,
+        Some(EMBERWAVE_PLANE_CB),
+    )
+    .unwrap();
+    let cr_tex_r8 = wrapped(
+        decoder,
+        &chroma_r8,
+        vk::Format::R8_UNORM,
+        r8_usage,
+        Some(EMBERWAVE_PLANE_CR),
+    )
+    .unwrap();
+
+    // SAFETY: live decoder and wrapped textures.
+    unsafe {
         assert_eq!(
-            emberwave_decoder_submit_plane_textures_vulkan(
-                decoder,
-                tex_y_r16,
-                tex_cb_r8,
-                tex_cr_r8,
-                ptr::null()
-            ),
+            emberwave_decoder_decode_plane_textures(decoder, y_tex_r8, cb_tex_r8, cr_tex_r8),
             EmberwaveStatus::InvalidArgument
         );
+        assert!(
+            last_error().contains("same Vulkan image"),
+            "{}",
+            last_error()
+        );
         assert!(emberwave_decoder_is_ready(decoder, 0));
-
-        for texture in [tex_y_r16, tex_cb_r8, tex_cr_r8] {
+        for texture in [y_tex_r8, cb_tex_r8, cr_tex_r8] {
             emberwave_texture_destroy(texture);
         }
-        emberwave_encoder_destroy(encoder);
+    }
+    let mut images = vec![y_r8, chroma_r8];
+
+    if supports_r16 {
+        let r16_usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+        let y_r16 = client.image(&device, vk::Format::R16_UNORM, (192, 136), r16_usage);
+        let chroma_r16 = client.image(&device, vk::Format::R16_UNORM, (96, 68), r16_usage);
+        let y_tex_r16 = wrapped(
+            decoder,
+            &y_r16,
+            vk::Format::R16_UNORM,
+            r16_usage,
+            Some(EMBERWAVE_PLANE_Y),
+        )
+        .unwrap();
+        let cb_tex_r16 = wrapped(
+            decoder,
+            &chroma_r16,
+            vk::Format::R16_UNORM,
+            r16_usage,
+            Some(EMBERWAVE_PLANE_CB),
+        )
+        .unwrap();
+        let cr_tex_r16 = wrapped(
+            decoder,
+            &chroma_r16,
+            vk::Format::R16_UNORM,
+            r16_usage,
+            Some(EMBERWAVE_PLANE_CR),
+        )
+        .unwrap();
+
+        // SAFETY: live decoder and wrapped textures.
+        unsafe {
+            assert_eq!(
+                emberwave_decoder_decode_plane_textures(decoder, y_tex_r16, cb_tex_r16, cr_tex_r16),
+                EmberwaveStatus::InvalidArgument
+            );
+            assert!(
+                last_error().contains("same Vulkan image"),
+                "{}",
+                last_error()
+            );
+            assert!(emberwave_decoder_is_ready(decoder, 0));
+            for texture in [y_tex_r16, cb_tex_r16, cr_tex_r16] {
+                emberwave_texture_destroy(texture);
+            }
+        }
+        images.extend([y_r16, chroma_r16]);
+    }
+
+    // SAFETY: live objects, destroyed once each.
+    unsafe {
         emberwave_decoder_destroy(decoder);
         emberwave_context_destroy(context);
-        for image in [y_r16, y_r16_no_storage, y_r16_no_sampled, cb_r8, cr_r8] {
+        for image in images {
             device.destroy_image(image.image, None);
             device.free_memory(image.memory, None);
         }

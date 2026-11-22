@@ -22,7 +22,9 @@ use super::context::{
 };
 use super::error::GpuError;
 use super::layout::{BufferLayout, ConcealParams, DequantParams, TransformLevel, YuvParams};
-use super::pipelines::{DrawPipeline, Pipelines, Stage, with_error_scope};
+use super::pipelines::{
+    DrawPipeline, Pipelines, ScopedError, Stage, with_error_scope, with_error_scope_kind,
+};
 use super::resources::{
     StageQueries, buffer, buffer_limit, check_size, entry, map_for_writing, read_back,
     read_back_with, texture, uniform_buffer,
@@ -514,7 +516,14 @@ impl Decoder {
             TimedOutput::Yuv => None,
             TimedOutput::Rgb(color) => Some(color),
         };
-        self.run_gpu(color.as_ref(), Read::Nothing, true, assembled, &mut |_| {})
+        self.run_gpu(
+            color.as_ref(),
+            Read::Nothing,
+            None,
+            true,
+            assembled,
+            &mut |_| {},
+        )
     }
 
     /// Records the decode of one complete frame, and its conversion to RGB,
@@ -534,7 +543,7 @@ impl Decoder {
     ) -> Result<(), GpuError> {
         self.check_device()?;
         self.assemble_complete(frame)?;
-        self.record_assembled(Some(color), Read::Nothing, encoder)?;
+        self.record_assembled(Some(color), Read::Nothing, None, encoder)?;
         self.assembler.mark_frame_decoded();
         Ok(())
     }
@@ -580,7 +589,7 @@ impl Decoder {
         self.check_device()?;
         self.check_target(target)?;
         self.assemble_complete(frame)?;
-        self.record_assembled(Some(color), Read::Texture(target), encoder)?;
+        self.record_assembled(Some(color), Read::Texture(target), None, encoder)?;
         self.assembler.mark_frame_decoded();
         Ok(())
     }
@@ -602,6 +611,7 @@ impl Decoder {
         self.run_gpu(
             Some(color),
             Read::Texture(target),
+            None,
             false,
             Duration::ZERO,
             &mut |_| {},
@@ -625,7 +635,7 @@ impl Decoder {
         target: &wgpu::TextureView,
     ) -> Result<(), GpuError> {
         self.check_target(target)?;
-        self.submit_assembled(Some(color), Read::Texture(target), None)
+        self.submit_assembled(Some(color), Read::Texture(target), None, None)
     }
 
     /// As [`submit_assembled_to_texture`](Self::submit_assembled_to_texture),
@@ -639,7 +649,7 @@ impl Decoder {
         hooks: &mut dyn SubmissionHooks,
     ) -> Result<(), GpuError> {
         self.check_target(target)?;
-        self.submit_assembled(Some(color), Read::Texture(target), Some(hooks))
+        self.submit_assembled(Some(color), Read::Texture(target), None, Some(hooks))
     }
 
     /// A texture that [`record_rgb_to_texture`](Self::record_rgb_to_texture)
@@ -695,10 +705,9 @@ impl Decoder {
         targets: [&wgpu::TextureView; 3],
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<(), GpuError> {
-        self.check_device()?;
-        self.check_plane_targets(targets)?;
+        let fill = self.prepare_plane_targets(targets)?;
         self.assemble_complete(frame)?;
-        self.record_assembled(None, Read::Planes(targets), encoder)?;
+        self.record_assembled(None, Read::Planes(targets), Some(fill), encoder)?;
         self.assembler.mark_frame_decoded();
         Ok(())
     }
@@ -715,10 +724,11 @@ impl Decoder {
         &mut self,
         targets: [&wgpu::TextureView; 3],
     ) -> Result<(), GpuError> {
-        self.check_plane_targets(targets)?;
+        let fill = self.prepare_plane_targets(targets)?;
         self.run_gpu(
             None,
             Read::Planes(targets),
+            Some(fill),
             false,
             Duration::ZERO,
             &mut |_| {},
@@ -736,8 +746,8 @@ impl Decoder {
         &mut self,
         targets: [&wgpu::TextureView; 3],
     ) -> Result<(), GpuError> {
-        self.check_plane_targets(targets)?;
-        self.submit_assembled(None, Read::Planes(targets), None)
+        let fill = self.prepare_plane_targets(targets)?;
+        self.submit_assembled(None, Read::Planes(targets), Some(fill), None)
     }
 
     /// As
@@ -749,8 +759,8 @@ impl Decoder {
         targets: [&wgpu::TextureView; 3],
         hooks: &mut dyn SubmissionHooks,
     ) -> Result<(), GpuError> {
-        self.check_plane_targets(targets)?;
-        self.submit_assembled(None, Read::Planes(targets), Some(hooks))
+        let fill = self.prepare_plane_targets(targets)?;
+        self.submit_assembled(None, Read::Planes(targets), Some(fill), Some(hooks))
     }
 
     /// A texture that [`record_to_plane_textures`](Self::record_to_plane_textures)
@@ -952,15 +962,21 @@ impl Decoder {
         Ok(())
     }
 
-    /// Compiles the 16-bit plane pipeline if `read` targets [`PLANE_FORMAT_R16`],
-    /// before taking a turn at the queue (decision D60).
-    fn compile_plane_pipeline(&self, read: Read<'_>) -> Result<(), GpuError> {
-        if let Read::Planes(targets) = read {
-            if targets[0].texture().format() == PLANE_FORMAT_R16 {
-                self.r16_plane_pipeline.get(&self.device)?;
-            }
+    /// Validates plane `targets` and prepares how planes are filled (compiling
+    /// any optional pipeline and building store bind groups) before assembling a
+    /// new frame or taking a turn at the queue (decision D60).
+    fn prepare_plane_targets(
+        &self,
+        targets: [&wgpu::TextureView; 3],
+    ) -> Result<PlaneFill, GpuError> {
+        self.check_device()?;
+        self.check_plane_targets(targets)?;
+        let outcome = self.plane_fill(targets);
+        if outcome.is_err() {
+            notice_loss(&self.device, &self.lost);
+            self.check_device()?;
         }
-        Ok(())
+        outcome
     }
 
     /// Whether the decode of the assembled frame conceals, and the
@@ -1094,9 +1110,16 @@ impl Decoder {
     pub fn decode_assembled_rgb(&mut self, color: &ColorParams) -> Result<RgbFrame, GpuError> {
         let (width, height) = (self.layout().width(), self.layout().height());
         let mut data = vec![0; width as usize * height as usize * 3];
-        self.run_gpu(Some(color), Read::Rgb, false, Duration::ZERO, &mut |rgba| {
-            rgba_to_rgb(rgba, &mut data);
-        })?;
+        self.run_gpu(
+            Some(color),
+            Read::Rgb,
+            None,
+            false,
+            Duration::ZERO,
+            &mut |rgba| {
+                rgba_to_rgb(rgba, &mut data);
+            },
+        )?;
         Ok(RgbFrame {
             width,
             height,
@@ -1118,13 +1141,20 @@ impl Decoder {
         mut row: impl FnMut(Component, u32, &[u8]),
     ) -> Result<(), GpuError> {
         let planes = self.packed_planes();
-        self.run_gpu(None, Read::Yuv, false, Duration::ZERO, &mut |packed| {
-            for (component, plane) in Component::ALL.into_iter().zip(&planes) {
-                for (index, samples) in plane.rows(packed).enumerate() {
-                    row(component, index as u32, samples);
+        self.run_gpu(
+            None,
+            Read::Yuv,
+            None,
+            false,
+            Duration::ZERO,
+            &mut |packed| {
+                for (component, plane) in Component::ALL.into_iter().zip(&planes) {
+                    for (index, samples) in plane.rows(packed).enumerate() {
+                        row(component, index as u32, samples);
+                    }
                 }
-            }
-        })?;
+            },
+        )?;
         Ok(())
     }
 
@@ -1139,12 +1169,19 @@ impl Decoder {
     ) -> Result<(), GpuError> {
         let width = self.layout().width() as usize;
         let mut line = vec![0; width * 3];
-        self.run_gpu(Some(color), Read::Rgb, false, Duration::ZERO, &mut |rgba| {
-            for (index, pixels) in rgba.chunks_exact(width * 4).enumerate() {
-                rgba_to_rgb(pixels, &mut line);
-                row(index as u32, &line);
-            }
-        })?;
+        self.run_gpu(
+            Some(color),
+            Read::Rgb,
+            None,
+            false,
+            Duration::ZERO,
+            &mut |rgba| {
+                for (index, pixels) in rgba.chunks_exact(width * 4).enumerate() {
+                    rgba_to_rgb(pixels, &mut line);
+                    row(index as u32, &line);
+                }
+            },
+        )?;
         Ok(())
     }
 
@@ -1173,12 +1210,14 @@ impl Decoder {
         &mut self,
         color: Option<&ColorParams>,
         read: Read<'_>,
+        prepared_planes: Option<PlaneFill>,
         timed: bool,
         assembled_in: Duration,
         consume: &mut dyn FnMut(&[u8]),
     ) -> Result<Timings, GpuError> {
         self.check_device()?;
-        let outcome = self.run_gpu_on_device(color, read, timed, assembled_in, consume);
+        let outcome =
+            self.run_gpu_on_device(color, read, prepared_planes, timed, assembled_in, consume);
         // The device can be lost while the frame is on it, and wgpu tells
         // during the wait, or for a destroyed device when it is next polled.
         // Whatever failed then is the loss, and whatever came back is not to
@@ -1196,6 +1235,7 @@ impl Decoder {
         &mut self,
         color: Option<&ColorParams>,
         read: Read<'_>,
+        prepared_planes: Option<PlaneFill>,
         timed: bool,
         assembled_in: Duration,
         consume: &mut dyn FnMut(&[u8]),
@@ -1203,14 +1243,13 @@ impl Decoder {
         let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
         self.compile_concealment()?;
-        self.compile_plane_pipeline(read)?;
         let (table_bytes, payload_bytes) = self.upload_mapped()?;
         // The decode makes command buffers from here to its submission, and
         // takes its turn at them (decision D60); the upload above waits for
         // the GPU to map its buffer, so it comes first.
         let turns = self.turns.clone();
         let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
-        let output = self.prepare_output(color, read)?;
+        let output = self.prepare_output(color, read, prepared_planes)?;
         let conceal = self.prepare_concealment()?;
         let prepare = assembled_in + prepare_start.elapsed();
 
@@ -1306,10 +1345,14 @@ impl Decoder {
         &mut self,
         color: Option<&ColorParams>,
         read: Read<'_>,
+        prepared_planes: Option<PlaneFill>,
     ) -> Result<Output, GpuError> {
         let output = match read {
             Read::Texture(target) => Output::Picture(Fill::of(target.texture())),
-            Read::Planes(targets) => Output::Planes(self.plane_fill(targets)?),
+            Read::Planes(targets) => Output::Planes(match prepared_planes {
+                Some(fill) => fill,
+                None => self.plane_fill(targets)?,
+            }),
             Read::Nothing | Read::Yuv | Read::Rgb => Output::None,
         };
         if let Some(color) = color {
@@ -1331,7 +1374,7 @@ impl Decoder {
         let format = targets[0].texture().format();
         let [y, cb, cr] = targets;
         let build_bind_groups = |stage: &Stage, label: &str| {
-            with_error_scope(&self.device, || {
+            with_error_scope_kind(&self.device, || {
                 let bind_groups = self
                     .idwt_stages
                     .iter()
@@ -1361,10 +1404,10 @@ impl Decoder {
         if format == PLANE_FORMAT_R16 {
             let stage = self.r16_plane_pipeline.get(&self.device)?;
             return build_bind_groups(&stage, "idwt planes r16").map_err(|error| match error {
-                GpuError::Device(message) => GpuError::Texture(format!(
-                    "a target view does not allow STORAGE_BINDING for 16-bit plane stores: {message}"
+                ScopedError::Validation(message) => GpuError::Texture(format!(
+                    "a target view is unsuitable for 16-bit plane stores: {message}"
                 )),
-                other => other,
+                ScopedError::Device(error) => error,
             });
         }
 
@@ -1428,11 +1471,12 @@ impl Decoder {
         &mut self,
         color: Option<&ColorParams>,
         read: Read<'_>,
+        prepared_planes: Option<PlaneFill>,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<(), GpuError> {
         self.ensure_payload_capacity()?;
         with_error_scope(&self.device, || self.upload())?;
-        let output = self.prepare_output(color, read)?;
+        let output = self.prepare_output(color, read, prepared_planes)?;
         let conceal = self.prepare_concealment()?;
         self.encode_passes(encoder, color.is_some(), conceal, None, &output);
         self.encode_output(encoder, read, &output);
@@ -1448,11 +1492,11 @@ impl Decoder {
         &mut self,
         color: Option<&ColorParams>,
         read: Read<'_>,
+        prepared_planes: Option<PlaneFill>,
         hooks: Option<&mut dyn SubmissionHooks>,
     ) -> Result<(), GpuError> {
         self.check_device()?;
         self.compile_concealment()?;
-        self.compile_plane_pipeline(read)?;
         let turns = self.turns.clone();
         let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
         let mut encoder = self
@@ -1469,7 +1513,7 @@ impl Decoder {
             submitted: false,
         };
         let outcome = self
-            .record_assembled(color, read, &mut encoder)
+            .record_assembled(color, read, prepared_planes, &mut encoder)
             .and_then(|()| {
                 with_error_scope(&self.device, || {
                     if let Some(hooks) = after.hooks.as_deref_mut() {
@@ -2540,7 +2584,7 @@ mod tests {
                 .unwrap();
             let mut packed = Vec::new();
             decoder
-                .run_gpu(None, Read::Yuv, false, Duration::ZERO, &mut |bytes| {
+                .run_gpu(None, Read::Yuv, None, false, Duration::ZERO, &mut |bytes| {
                     packed = bytes.to_vec();
                 })
                 .unwrap();
@@ -2595,9 +2639,16 @@ mod tests {
         for read in [Read::Yuv, Read::Rgb] {
             let color = (read == Read::Rgb).then(ColorParams::default);
             decoder
-                .run_gpu_on_device(color.as_ref(), read, false, Duration::ZERO, &mut |_| {
-                    handed_out += 1;
-                })
+                .run_gpu_on_device(
+                    color.as_ref(),
+                    read,
+                    None,
+                    false,
+                    Duration::ZERO,
+                    &mut |_| {
+                        handed_out += 1;
+                    },
+                )
                 .expect("the work itself succeeds");
         }
         assert_eq!(handed_out, 0);
@@ -2781,5 +2832,60 @@ mod tests {
             .map(|texture| texture.create_view(&sampled));
         let outcome = decoder.plane_fill(sampled_views.each_ref());
         assert!(matches!(outcome, Err(GpuError::Texture(_))));
+    }
+
+    #[test]
+    fn r16_record_error_preserves_previously_assembled_frame() {
+        let Some(context) = test_context() else {
+            return;
+        };
+        if !context.supports_plane_format(PLANE_FORMAT_R16) {
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/noise_192x136_420.pwv1");
+        let bytes = std::fs::read(&path).expect("testdata");
+        let file = crate::bitstream::Pwv1File::parse(&bytes).expect("pwv1");
+        let frame_a = file.frames().next().expect("frame").expect("valid frame");
+        let frame_b = empty_frame(192, 136, ChromaSubsampling::Yuv420);
+
+        let mut reference_decoder =
+            Decoder::new(context, 192, 136, ChromaSubsampling::Yuv420).expect("decoder");
+        let reference_a = reference_decoder.decode(frame_a).expect("decode Frame A");
+        let reference_b = reference_decoder.decode(&frame_b).expect("decode Frame B");
+        assert_ne!(reference_a.planes[0].data, reference_b.planes[0].data);
+
+        let mut decoder =
+            Decoder::new(context, 192, 136, ChromaSubsampling::Yuv420).expect("decoder");
+        decoder.push_packet(frame_a).expect("push Frame A");
+        assert!(decoder.is_ready(false));
+
+        let textures = Component::ALL.map(|component| {
+            decoder
+                .create_plane_texture_with_format(component, PLANE_FORMAT_R16)
+                .expect("r16 plane texture")
+        });
+        let sampled = wgpu::TextureViewDescriptor {
+            usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+            ..Default::default()
+        };
+        let sampled_views = textures
+            .each_ref()
+            .map(|texture| texture.create_view(&sampled));
+
+        let mut encoder = context
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let outcome =
+            decoder.record_to_plane_textures(&frame_b, sampled_views.each_ref(), &mut encoder);
+        assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
+
+        let decoded = decoder
+            .decode_assembled()
+            .expect("decode preserved Frame A");
+        for component in Component::ALL {
+            let i = component.index();
+            assert_eq!(decoded.planes[i].data, reference_a.planes[i].data);
+        }
     }
 }

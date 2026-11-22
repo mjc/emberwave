@@ -12,7 +12,9 @@ use std::ptr;
 
 use emberwave_core::bitstream::Pwv1File;
 use emberwave_ffi::*;
-use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE, HMODULE};
+use windows::Win32::Foundation::{
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, GENERIC_ALL, HANDLE, HMODULE,
+};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_1};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_FLAG, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
@@ -909,4 +911,60 @@ fn contexts_need_a_direct3d_12_adapter_and_fences_of_their_own() {
     unsafe { CloseHandle(handle) }.expect("closed");
     assert_eq!(status, EmberwaveStatus::InvalidArgument, "{}", last_error());
     assert!(fence.is_null());
+}
+
+#[test]
+fn duplicate_d3d12_plane_handles_are_refused() {
+    let host = Host::new();
+    let (frames, size) = stream("noise_192x136_420.pwv1");
+    let chroma = (size.0 / 2, size.1 / 2);
+    let decoder = decoder_of(host.context, size);
+
+    let (_y_tex, y_handle) = host.texture(DXGI_FORMAT_R8_UNORM, size, D3D11_BIND_SHADER_RESOURCE);
+    let (_chroma_tex, cb_handle) =
+        host.texture(DXGI_FORMAT_R8_UNORM, chroma, D3D11_BIND_SHADER_RESOURCE);
+    let current_process = HANDLE(-1isize as *mut std::ffi::c_void);
+    let mut cr_handle = HANDLE::default();
+    // SAFETY: `cb_handle` is a live shared handle in this process.
+    unsafe {
+        DuplicateHandle(
+            current_process,
+            cb_handle,
+            current_process,
+            &mut cr_handle,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+        .expect("duplicated handle");
+    }
+
+    // SAFETY: live decoder and shared handles of this process.
+    let y = wrapped(y_handle, |handle, texture| unsafe {
+        emberwave_texture_from_d3d12_plane(decoder, EMBERWAVE_PLANE_Y, handle, texture)
+    })
+    .unwrap();
+    // SAFETY: as above.
+    let cb = wrapped(cb_handle, |handle, texture| unsafe {
+        emberwave_texture_from_d3d12_plane(decoder, EMBERWAVE_PLANE_CB, handle, texture)
+    })
+    .unwrap();
+    // SAFETY: as above.
+    let cr = wrapped(cr_handle, |handle, texture| unsafe {
+        emberwave_texture_from_d3d12_plane(decoder, EMBERWAVE_PLANE_CR, handle, texture)
+    })
+    .unwrap();
+
+    push(decoder, &frames[0]);
+    // SAFETY: live decoder and wrapped plane textures.
+    unsafe {
+        assert!(emberwave_decoder_is_ready(decoder, 0));
+        let status = emberwave_decoder_submit_plane_textures_d3d12(decoder, y, cb, cr, ptr::null());
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert!(emberwave_decoder_is_ready(decoder, 0));
+        for texture in [y, cb, cr] {
+            emberwave_texture_destroy(texture);
+        }
+        emberwave_decoder_destroy(decoder);
+    }
 }
