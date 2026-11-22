@@ -21,7 +21,7 @@ use emberwave_core::bitstream::{
 use emberwave_core::color::{ColorError, RgbOrder, rgb_to_ycbcr8, yuv_to_rgb8};
 use emberwave_core::cpu::decode_frame;
 use emberwave_core::encode::{self, EncodeError, Signalling};
-use emberwave_core::gpu::{Decoder, Encoder, GpuContext, GpuError, TexturePicture};
+use emberwave_core::gpu::{Decoder, EncodeTimings, Encoder, GpuContext, GpuError, TexturePicture};
 
 /// Skips the current test when there is no GPU.
 macro_rules! gpu_or_return {
@@ -402,6 +402,30 @@ fn a_lost_device_is_an_error_rather_than_a_stale_result() {
     assert!(encoder.lost().is_some());
 }
 
+fn assert_encode_timings(context: &GpuContext, timings: &EncodeTimings) {
+    assert!(timings.gpu_wall > std::time::Duration::ZERO);
+    assert!(timings.prepare > std::time::Duration::ZERO);
+    match timings.stages {
+        Some(stages) => {
+            assert!(context.supports_timestamps());
+            // A short stage can be below the timer's resolution and read
+            // as zero, but the whole encode cannot, nor the stages of
+            // several dispatches: quantisation runs a workgroup per block
+            // and rate control four passes and two prefix sums.
+            assert!(stages.total() > std::time::Duration::ZERO);
+            assert!(stages.quantisation > std::time::Duration::ZERO);
+            assert!(stages.rate_control > std::time::Duration::ZERO);
+            // The GPU cannot take longer than the wall clock around it.
+            assert!(stages.total() <= timings.gpu_wall + timings.prepare);
+        }
+        // A device that offers timestamps has to deliver them.
+        None => assert!(
+            !context.supports_timestamps(),
+            "the device supports timestamp queries but returned no stage times"
+        ),
+    }
+}
+
 #[test]
 fn timing_an_encode_reports_where_the_time_goes() {
     // Timestamp queries are optional, so ask for them and accept their absence.
@@ -423,27 +447,7 @@ fn timing_an_encode_reports_where_the_time_goes() {
         let (frame, timings) = timed.encode_timed(planes(source), vector.budget).unwrap();
         // Timing changes nothing in the frame.
         assert!(frame == plain.encode(planes(source), vector.budget).unwrap());
-        assert!(timings.gpu_wall > std::time::Duration::ZERO);
-        assert!(timings.prepare > std::time::Duration::ZERO);
-        match timings.stages {
-            Some(stages) => {
-                assert!(context.supports_timestamps());
-                // A short stage can be below the timer's resolution and read
-                // as zero, but the whole encode cannot, nor the stages of
-                // several dispatches: quantisation runs a workgroup per block
-                // and rate control four passes and two prefix sums.
-                assert!(stages.total() > std::time::Duration::ZERO);
-                assert!(stages.quantisation > std::time::Duration::ZERO);
-                assert!(stages.rate_control > std::time::Duration::ZERO);
-                // The GPU cannot take longer than the wall clock around it.
-                assert!(stages.total() <= timings.gpu_wall + timings.prepare);
-            }
-            // A device that offers timestamps has to deliver them.
-            None => assert!(
-                !context.supports_timestamps(),
-                "the device supports timestamp queries but returned no stage times"
-            ),
-        }
+        assert_encode_timings(&context, &timings);
     }
 }
 
@@ -1394,10 +1398,7 @@ fn u16_planes_strided_and_textures_including_p010_encode_identically() {
                 .encode_u16_timed([&src[0], &src[1], &src[2]], 30_000)
                 .unwrap();
             assert_eq!(got_timed, expected);
-            assert!(
-                timings.gpu_wall > std::time::Duration::ZERO
-                    || timings.prepare >= std::time::Duration::ZERO
-            );
+            assert_encode_timings(context, &timings);
 
             if has_r16 {
                 let textures = Textures16::new(context, &layout, &src);
