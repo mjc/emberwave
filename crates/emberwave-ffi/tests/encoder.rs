@@ -1231,3 +1231,168 @@ fn source_planes_shorter_than_their_rows_are_refused() {
         emberwave_context_destroy(context);
     }
 }
+
+fn picture_u16(layout: &FrameLayout, seed: u32) -> [Vec<u16>; 3] {
+    let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+    std::array::from_fn(|plane| {
+        let (width, height) = layout.plane_size(Component::ALL[plane]);
+        (0..width * height)
+            .map(|i| {
+                let (x, y) = (i % width, i / width);
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let code = ((64 + x * 4 + y * 3 + plane as u32 * 90 + (state >> 26)) % 940) as u16;
+                if seed.is_multiple_of(2) {
+                    emberwave_core::cpu::unorm16(f32::from(code) / 1023.0)
+                } else {
+                    code << 6
+                }
+            })
+            .collect()
+    })
+}
+
+fn source_planes_u16(
+    layout: &FrameLayout,
+    picture: &[Vec<u16>; 3],
+    padding_bytes: usize,
+    storage: &mut Vec<Vec<u8>>,
+) -> [EmberwaveSourcePlane; 3] {
+    storage.clear();
+    for (plane, samples) in picture.iter().enumerate() {
+        let width = layout.plane_size(Component::ALL[plane]).0 as usize;
+        storage.push(
+            samples
+                .chunks_exact(width)
+                .flat_map(|row| {
+                    row.iter()
+                        .flat_map(|s| s.to_le_bytes())
+                        .chain(std::iter::repeat_n(0xEE, padding_bytes))
+                })
+                .collect(),
+        );
+    }
+    std::array::from_fn(|plane| {
+        let width = layout.plane_size(Component::ALL[plane]).0 as usize;
+        EmberwaveSourcePlane {
+            data: storage[plane].as_ptr(),
+            stride: width * 2 + padding_bytes,
+            size: storage[plane].len(),
+        }
+    })
+}
+
+fn encode_u16_c(
+    encoder: *mut EmberwaveEncoder,
+    planes: [EmberwaveSourcePlane; 3],
+    budget: usize,
+) -> (EmberwaveStatus, Vec<u8>, usize) {
+    let mut frame = vec![0u8; budget];
+    let mut size = usize::MAX;
+    // SAFETY: a live encoder, planes of its sizes, and a frame of `budget` bytes.
+    let status = unsafe {
+        emberwave_encoder_encode_u16(
+            encoder,
+            planes[0],
+            planes[1],
+            planes[2],
+            frame.as_mut_ptr(),
+            budget,
+            &mut size,
+        )
+    };
+    if status == EmberwaveStatus::Ok {
+        frame.truncate(size);
+    } else {
+        frame.clear();
+    }
+    (status, frame, size)
+}
+
+#[test]
+fn frames_u16_through_the_c_api_equal_the_rust_encoder_and_reject_bad_inputs() {
+    let Some(context) = context() else {
+        return;
+    };
+    let rust_context = GpuContext::new(&GpuOptions::from_env().unwrap_or_default())
+        .expect("a GPU, as the C API's");
+    for (width, height, chroma) in SHAPES {
+        let layout = FrameLayout::new(width, height, chroma).unwrap();
+        let tight = encoder_for(context, &layout, None);
+        let padded = encoder_for(context, &layout, None);
+        let mut rust =
+            Encoder::new(&rust_context, width, height, chroma, Signalling::default()).unwrap();
+        let mut storage = Vec::new();
+        for seed in 0..3 {
+            let source = picture_u16(&layout, seed);
+            let expected = rust
+                .encode_u16([&source[0], &source[1], &source[2]], 18_000)
+                .unwrap();
+            let planes = source_planes_u16(&layout, &source, 0, &mut storage);
+            let (status, frame, _) = encode_u16_c(tight, planes, 18_000);
+            assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+            assert_eq!(
+                frame, expected,
+                "{width}x{height} {chroma:?} u16 frame {seed}"
+            );
+            // Odd byte padding between rows exercises arbitrary byte strides.
+            let planes = source_planes_u16(&layout, &source, 5 + seed as usize, &mut storage);
+            let (status, frame, _) = encode_u16_c(padded, planes, 18_000);
+            assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+            assert_eq!(
+                frame, expected,
+                "{width}x{height} {chroma:?} padded u16 frame {seed}"
+            );
+        }
+        // SAFETY: live, destroyed once.
+        unsafe {
+            emberwave_encoder_destroy(tight);
+            emberwave_encoder_destroy(padded);
+        }
+    }
+
+    // Error handling: bad stride (< 2 * width), short size, NULL data, and budget too small.
+    let layout = FrameLayout::new(64, 32, ChromaSubsampling::Yuv420).unwrap();
+    let encoder = encoder_for(context, &layout, None);
+    let source = picture_u16(&layout, 0);
+    let mut storage = Vec::new();
+    let good = source_planes_u16(&layout, &source, 0, &mut storage);
+
+    let mut bad_stride = good;
+    bad_stride[0].stride = 127;
+    let (status, _, size) = encode_u16_c(encoder, bad_stride, 10_000);
+    assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    assert_eq!(size, 0);
+    assert!(last_error().contains("y.stride"), "{}", last_error());
+
+    let mut short = good;
+    short[1].size -= 1;
+    let (status, _, _) = encode_u16_c(encoder, short, 10_000);
+    assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    assert!(last_error().contains("cb.size"), "{}", last_error());
+
+    let mut null_plane = good;
+    null_plane[2].data = ptr::null();
+    let (status, _, _) = encode_u16_c(encoder, null_plane, 10_000);
+    assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    assert!(last_error().contains("cr.data is NULL"), "{}", last_error());
+
+    let (status, _, minimum) = encode_u16_c(encoder, good, 7);
+    assert_eq!(status, EmberwaveStatus::BufferTooSmall);
+    assert!(minimum >= 8 + 12 * 12, "{minimum}");
+
+    // None of the failures advanced the sequence number.
+    let (status, frame, _) = encode_u16_c(encoder, good, minimum);
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    match Header::parse(&frame).unwrap() {
+        Header::StartOfFrame(header) => assert_eq!(header.sequence, 1),
+        other => panic!("{other:?}"),
+    }
+
+    // SAFETY: live, destroyed once each.
+    unsafe {
+        emberwave_encoder_destroy(encoder);
+        emberwave_context_destroy(context);
+    }
+}

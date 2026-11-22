@@ -26,7 +26,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM,
-    DXGI_FORMAT_R8G8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE, IDXGIAdapter,
@@ -966,5 +966,266 @@ fn duplicate_d3d12_plane_handles_are_refused() {
             emberwave_texture_destroy(texture);
         }
         emberwave_decoder_destroy(decoder);
+    }
+}
+
+#[test]
+fn direct3d_16bit_and_p010_source_textures_encode_as_u16_memory() {
+    let mut host = Host::new();
+    let mut info = EmberwaveContextInfo::default();
+    // SAFETY: live context and valid struct.
+    let status = unsafe { emberwave_context_info(host.context, &mut info) };
+    assert_eq!(status, EmberwaveStatus::Ok);
+    if info.features & EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16 == 0 {
+        return;
+    }
+
+    let size = (192usize, 136usize);
+    let chroma = (96usize, 68usize);
+    let mut encoders = [ptr::null_mut(); 3];
+    for encoder in &mut encoders {
+        // SAFETY: live context and pointer to store encoder.
+        let status = unsafe {
+            emberwave_encoder_create(
+                host.context,
+                size.0 as u32,
+                size.1 as u32,
+                EMBERWAVE_CHROMA_420,
+                ptr::null(),
+                encoder,
+            )
+        };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    }
+    let [memory, as_planes, as_p010] = encoders;
+
+    let (y_tex, y_handle) = host.texture(DXGI_FORMAT_R16_UNORM, size, D3D11_BIND_SHADER_RESOURCE);
+    let (cb_tex, cb_handle) =
+        host.texture(DXGI_FORMAT_R16_UNORM, chroma, D3D11_BIND_SHADER_RESOURCE);
+    let (cr_tex, cr_handle) =
+        host.texture(DXGI_FORMAT_R16_UNORM, chroma, D3D11_BIND_SHADER_RESOURCE);
+    let (cbcr_tex, cbcr_handle) =
+        host.texture(DXGI_FORMAT_R16G16_UNORM, chroma, D3D11_BIND_SHADER_RESOURCE);
+
+    // SAFETY: live encoders and valid shared handles of this process.
+    let y = wrapped(y_handle, |h, t| unsafe {
+        emberwave_texture_from_d3d12_source(as_planes, EMBERWAVE_PLANE_Y, h, t)
+    })
+    .unwrap();
+    // SAFETY: as above.
+    let cb = wrapped(cb_handle, |h, t| unsafe {
+        emberwave_texture_from_d3d12_source(as_planes, EMBERWAVE_PLANE_CB, h, t)
+    })
+    .unwrap();
+    // SAFETY: as above.
+    let cr = wrapped(cr_handle, |h, t| unsafe {
+        emberwave_texture_from_d3d12_source(as_planes, EMBERWAVE_PLANE_CR, h, t)
+    })
+    .unwrap();
+    // SAFETY: as above.
+    let cbcr = wrapped(cbcr_handle, |h, t| unsafe {
+        emberwave_texture_from_d3d12_source(as_p010, EMBERWAVE_PLANE_CBCR, h, t)
+    })
+    .unwrap();
+
+    let picture_u16: [Vec<u16>; 3] = [0, 1, 2].map(|plane| {
+        let (w, h) = if plane == 0 { size } else { chroma };
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                (((64 + x * 4 + y * 3 + plane * 80) % 940) as u16) << 6
+            })
+            .collect()
+    });
+    let bytes: [Vec<u8>; 3] = [0, 1, 2].map(|i| {
+        picture_u16[i]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect()
+    });
+    let interleaved: Vec<u8> = picture_u16[1]
+        .iter()
+        .zip(&picture_u16[2])
+        .flat_map(|(&b, &r)| {
+            let [b0, b1] = b.to_le_bytes();
+            let [r0, r1] = r.to_le_bytes();
+            [b0, b1, r0, r1]
+        })
+        .collect();
+
+    host.write(&y_tex, &bytes[0], size.0 * 2);
+    host.write(&cb_tex, &bytes[1], chroma.0 * 2);
+    host.write(&cr_tex, &bytes[2], chroma.0 * 2);
+    let written = host.write(&cbcr_tex, &interleaved, chroma.0 * 4);
+
+    let widths = [size.0, chroma.0, chroma.0];
+    let mut expected = vec![0u8; 18_000];
+    let mut length = 0;
+    let [sy, scb, scr] = [0, 1, 2].map(|i| EmberwaveSourcePlane {
+        data: bytes[i].as_ptr(),
+        stride: widths[i] * 2,
+        size: bytes[i].len(),
+    });
+    // SAFETY: live encoder, valid planes, and output buffer.
+    let status = unsafe {
+        emberwave_encoder_encode_u16(
+            memory,
+            sy,
+            scb,
+            scr,
+            expected.as_mut_ptr(),
+            expected.len(),
+            &mut length,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    expected.truncate(length);
+
+    let sync1 = EmberwaveD3D12Sync {
+        wait_fence: host.shared_fence,
+        wait_value: written,
+        signal_fence: host.shared_fence,
+        signal_value: written + 1,
+        ..Default::default()
+    };
+    let mut frame_planes = vec![0u8; 18_000];
+    // SAFETY: live encoder, textures, sync, and output buffer.
+    let status = unsafe {
+        emberwave_encoder_encode_textures_d3d12(
+            as_planes,
+            y,
+            cb,
+            cr,
+            &sync1,
+            frame_planes.as_mut_ptr(),
+            frame_planes.len(),
+            &mut length,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    frame_planes.truncate(length);
+    assert_eq!(frame_planes, expected);
+
+    let sync2 = EmberwaveD3D12Sync {
+        wait_fence: host.shared_fence,
+        wait_value: written + 1,
+        signal_fence: host.shared_fence,
+        signal_value: written + 2,
+        ..Default::default()
+    };
+    host.value = written + 2;
+    let mut frame_p010 = vec![0u8; 18_000];
+    // SAFETY: live encoder, textures, sync, and output buffer.
+    let status = unsafe {
+        emberwave_encoder_encode_textures_d3d12(
+            as_p010,
+            y,
+            cbcr,
+            ptr::null(),
+            &sync2,
+            frame_p010.as_mut_ptr(),
+            frame_p010.len(),
+            &mut length,
+        )
+    };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    frame_p010.truncate(length);
+    assert_eq!(frame_p010, expected);
+
+    // SAFETY: live objects destroyed once each.
+    unsafe {
+        for texture in [y, cb, cr, cbcr] {
+            emberwave_texture_destroy(texture);
+        }
+        for encoder in encoders {
+            emberwave_encoder_destroy(encoder);
+        }
+    }
+}
+
+#[test]
+fn duplicate_d3d12_source_handles_are_refused() {
+    let host = Host::new();
+    let mut info = EmberwaveContextInfo::default();
+    // SAFETY: live context and valid struct.
+    let status = unsafe { emberwave_context_info(host.context, &mut info) };
+    assert_eq!(status, EmberwaveStatus::Ok);
+
+    let size = (192usize, 136usize);
+    let chroma = (size.0 / 2, size.1 / 2);
+    let mut formats = vec![DXGI_FORMAT_R8_UNORM];
+    if info.features & EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16 != 0 {
+        formats.push(DXGI_FORMAT_R16_UNORM);
+    }
+
+    for format in formats {
+        let mut encoder = ptr::null_mut();
+        // SAFETY: live context and pointer to store encoder.
+        let status = unsafe {
+            emberwave_encoder_create(
+                host.context,
+                size.0 as u32,
+                size.1 as u32,
+                EMBERWAVE_CHROMA_420,
+                ptr::null(),
+                &mut encoder,
+            )
+        };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+
+        let (_y_tex, y_handle) = host.texture(format, size, D3D11_BIND_SHADER_RESOURCE);
+        let (_chroma_tex, cb_handle) = host.texture(format, chroma, D3D11_BIND_SHADER_RESOURCE);
+        let current_process = HANDLE(-1isize as *mut std::ffi::c_void);
+        let mut cr_handle = HANDLE::default();
+        // SAFETY: `cb_handle` is a live shared handle in this process.
+        unsafe {
+            DuplicateHandle(
+                current_process,
+                cb_handle,
+                current_process,
+                &mut cr_handle,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+            .expect("duplicated handle");
+        }
+
+        // SAFETY: live encoder and shared handles of this process.
+        let y = wrapped(y_handle, |handle, texture| unsafe {
+            emberwave_texture_from_d3d12_source(encoder, EMBERWAVE_PLANE_Y, handle, texture)
+        })
+        .unwrap();
+        // SAFETY: as above.
+        let cb = wrapped(cb_handle, |handle, texture| unsafe {
+            emberwave_texture_from_d3d12_source(encoder, EMBERWAVE_PLANE_CB, handle, texture)
+        })
+        .unwrap();
+        // SAFETY: as above.
+        let cr = wrapped(cr_handle, |handle, texture| unsafe {
+            emberwave_texture_from_d3d12_source(encoder, EMBERWAVE_PLANE_CR, handle, texture)
+        })
+        .unwrap();
+
+        let mut frame = vec![0u8; 18_000];
+        let mut length = 0;
+        // SAFETY: live encoder, wrapped source textures, and output buffer.
+        unsafe {
+            let status = emberwave_encoder_encode_textures_d3d12(
+                encoder,
+                y,
+                cb,
+                cr,
+                ptr::null(),
+                frame.as_mut_ptr(),
+                frame.len(),
+                &mut length,
+            );
+            assert_eq!(status, EmberwaveStatus::InvalidArgument);
+            for texture in [y, cb, cr] {
+                emberwave_texture_destroy(texture);
+            }
+            emberwave_encoder_destroy(encoder);
+        }
     }
 }
