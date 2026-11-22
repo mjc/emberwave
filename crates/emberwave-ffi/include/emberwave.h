@@ -1944,8 +1944,9 @@ enum EmberwaveStatus emberwave_encoder_encode_rgb(struct EmberwaveEncoder *encod
 // picture in CPU memory and into the same bytes (decision D65). The
 // textures are on the encoder's context, with the sizes of what they hold:
 // the caller's, from `emberwave_texture_from_metal_source` or
-// `emberwave_texture_from_vulkan_source`, or 8-bit (`EMBERWAVE_PLANE_FORMAT_R8`
-// / `R8Unorm`) textures that decodes put planes or pictures into (16-bit
+// `emberwave_texture_from_vulkan_source`, textures of pictures from
+// `emberwave_decoder_decode_texture`, or 8-bit (`EMBERWAVE_PLANE_FORMAT_R8`
+// / `R8Unorm`) plane textures from decodes (16-bit
 // `EMBERWAVE_PLANE_FORMAT_R16` plane textures are not accepted). Others give
 // `EMBERWAVE_STATUS_INVALID_ARGUMENT` before any work on the GPU, textures
 // shared from Direct3D included, which take

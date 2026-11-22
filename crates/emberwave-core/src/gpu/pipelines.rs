@@ -487,6 +487,7 @@ fn create_stages<const N: usize>(
 
 /// Error captured by [`with_error_scope_kind`], separating wgpu validation
 /// errors from device errors such as internal or out-of-memory failures.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) enum ScopedError {
     Validation(String),
     Device(GpuError),

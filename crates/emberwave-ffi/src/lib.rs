@@ -3919,6 +3919,14 @@ mod d3d12 {
         }
     }
 
+    fn raw_resource_ptr(texture: &wgpu::Texture) -> Option<*mut c_void> {
+        // SAFETY: only reads the HAL texture resource while the guard is held.
+        let hal = unsafe { texture.as_hal::<Dx12>() }?;
+        // SAFETY: `hal` is a live HAL texture whose raw resource stays valid for the guard's lifetime.
+        let raw = unsafe { hal.raw_resource() };
+        Some(windows::core::Interface::as_raw(raw))
+    }
+
     /// Whether `a` and `b` refer to the same underlying Direct3D 12 resource.
     pub(super) fn same_resource(a: &EmberwaveTexture, b: &EmberwaveTexture) -> bool {
         if let (Some(ah), Some(bh)) = (&a.d3d12_handle, &b.d3d12_handle) {
@@ -3927,14 +3935,10 @@ mod d3d12 {
                 return true;
             }
         }
-        // SAFETY: only reads the HAL texture resources while both textures remain alive.
-        if let (Some(a_hal), Some(b_hal)) =
-            unsafe { (a.texture.as_hal::<Dx12>(), b.texture.as_hal::<Dx12>()) }
+        if let (Some(a_raw), Some(b_raw)) =
+            (raw_resource_ptr(&a.texture), raw_resource_ptr(&b.texture))
         {
-            // SAFETY: `a_hal` and `b_hal` are live HAL textures whose raw resources stay valid.
-            let (a_raw, b_raw) = unsafe { (a_hal.raw_resource(), b_hal.raw_resource()) };
-            return windows::core::Interface::as_raw(a_raw)
-                == windows::core::Interface::as_raw(b_raw);
+            return a_raw == b_raw;
         }
         false
     }
@@ -5973,8 +5977,9 @@ fn rgb_order(format: u32) -> Result<RgbOrder, Failure> {
 /// picture in CPU memory and into the same bytes (decision D65). The
 /// textures are on the encoder's context, with the sizes of what they hold:
 /// the caller's, from `emberwave_texture_from_metal_source` or
-/// `emberwave_texture_from_vulkan_source`, or 8-bit (`EMBERWAVE_PLANE_FORMAT_R8`
-/// / `R8Unorm`) textures that decodes put planes or pictures into (16-bit
+/// `emberwave_texture_from_vulkan_source`, textures of pictures from
+/// `emberwave_decoder_decode_texture`, or 8-bit (`EMBERWAVE_PLANE_FORMAT_R8`
+/// / `R8Unorm`) plane textures from decodes (16-bit
 /// `EMBERWAVE_PLANE_FORMAT_R16` plane textures are not accepted). Others give
 /// `EMBERWAVE_STATUS_INVALID_ARGUMENT` before any work on the GPU, textures
 /// shared from Direct3D included, which take
