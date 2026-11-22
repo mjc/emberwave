@@ -449,6 +449,13 @@ fn timing_an_encode_reports_where_the_time_goes() {
         assert!(frame == plain.encode(planes(source), vector.budget).unwrap());
         assert_encode_timings(&context, &timings);
     }
+
+    let u16_source: [Vec<u16>; 3] =
+        planes(&vector.source.frames[0]).map(|p| p.iter().map(|&b| u16::from(b) * 257).collect());
+    let u16_planes = u16_source.each_ref().map(Vec::as_slice);
+    let (frame_u16, timings_u16) = timed.encode_u16_timed(u16_planes, vector.budget).unwrap();
+    assert!(frame_u16 == plain.encode_u16(u16_planes, vector.budget).unwrap());
+    assert_encode_timings(&context, &timings_u16);
 }
 
 #[test]

@@ -200,7 +200,7 @@ impl Encoder {
     pub fn encode(&mut self, planes: [&[u8]; 3], budget: usize) -> Result<Vec<u8>, EncodeError> {
         check_planes(&self.layout, planes)?;
         let bands = self.transform(planes);
-        self.encode_bands(&bands, budget)
+        self.encode_bands(bands, budget)
     }
 
     /// Encodes one 16-bit UNORM picture into a frame of at most `budget` bytes,
@@ -218,12 +218,14 @@ impl Encoder {
     ) -> Result<Vec<u8>, EncodeError> {
         check_planes_u16(&self.layout, planes)?;
         let bands = self.transform_u16(planes);
-        self.encode_bands(&bands, budget)
+        self.encode_bands(bands, budget)
     }
 
     /// Quantises, rate-controls and packs transformed `bands` within `budget` bytes.
-    fn encode_bands(&mut self, bands: &Bands, budget: usize) -> Result<Vec<u8>, EncodeError> {
-        let blocks = self.quantise(bands);
+    fn encode_bands(&mut self, bands: Bands, budget: usize) -> Result<Vec<u8>, EncodeError> {
+        let blocks = self.quantise(&bands);
+        // Free the float wavelet bands before rate control and frame packing.
+        drop(bands);
         let costs: Vec<BlockCost> = blocks.iter().map(|block| block.cost.clone()).collect();
         let budget_words = (budget.saturating_sub(HEADER_BYTES) / 4) as u64;
         let drops = (budget >= HEADER_BYTES)
