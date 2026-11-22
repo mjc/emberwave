@@ -986,7 +986,7 @@ impl Client {
                 height,
                 texel: match format {
                     vk::Format::R8_UNORM => 1,
-                    vk::Format::R8G8_UNORM => 2,
+                    vk::Format::R8G8_UNORM | vk::Format::R16_UNORM => 2,
                     _ => 4,
                 },
             }
@@ -2680,4 +2680,492 @@ fn images_an_encode_cannot_read_are_refused() {
     images.destroy(&device);
     // SAFETY: a device that nothing uses any more.
     unsafe { device.destroy_device(None) };
+}
+
+fn cpu_unorm16_planes(bytes: &[u8], frame: &[u8]) -> [Vec<u16>; 3] {
+    let header = *Pwv1File::parse(bytes).unwrap().header();
+    let layout = emberwave_core::bitstream::FrameLayout::new(
+        header.stream.width,
+        header.stream.height,
+        header.stream.chroma,
+    )
+    .unwrap();
+    let mut assembler = emberwave_core::bitstream::FrameAssembler::new(layout);
+    assembler.push_packet(frame).unwrap();
+    let decoded = emberwave_core::cpu::decode_frame(&assembler.frame()).unwrap();
+    decoded.planes.map(|plane| plane.to_unorm16())
+}
+
+fn bytes_to_u16(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect()
+}
+
+fn assert_u16_matches_cpu(actual: &[u16], expected: &[u16], label: &str) {
+    assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
+    let mut max_diff = 0u16;
+    let mut squared_error = 0.0f64;
+    for (&a, &b) in actual.iter().zip(expected) {
+        let diff = a.abs_diff(b);
+        max_diff = max_diff.max(diff);
+        let d = f64::from(a) - f64::from(b);
+        squared_error += d * d;
+    }
+    let psnr = if squared_error == 0.0 {
+        f64::INFINITY
+    } else {
+        let mse = squared_error / expected.len() as f64;
+        10.0 * (65535.0f64 * 65535.0 / mse).log10()
+    };
+    // GPU FMA may shift float DWT samples by ~1e-5 (< 2 LSBs at 16-bit).
+    assert!(
+        max_diff <= 2 && psnr >= 100.0,
+        "{label}: max_diff={max_diff}, psnr={psnr:.2}"
+    );
+}
+
+/// Calls of the release callback for `wrapped_r16_images_decode_without_a_wait_and_release`.
+static R16_RELEASED: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn count_r16_release(_user: *mut c_void) {
+    R16_RELEASED.fetch_add(1, Ordering::SeqCst);
+}
+
+#[test]
+fn owned_r16_plane_textures_decode_on_vulkan() {
+    let Some(client) = Client::new() else {
+        return;
+    };
+    let (names, device) = client.device();
+    let context = client.context(&device, &names, 0, None);
+
+    let mut ctx_info = EmberwaveContextInfo::default();
+    // SAFETY: a live context and a struct as large as its size says.
+    let status = unsafe { emberwave_context_info(context, &mut ctx_info) };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    assert_ne!(
+        ctx_info.features & EMBERWAVE_CONTEXT_FEATURE_PLANE_R16,
+        0,
+        "Vulkan context should report R16 plane support"
+    );
+
+    for name in ["noise_192x136_420.pwv1", "noise_131x67_444.pwv1"] {
+        let bytes = testdata(name);
+        let mut stream = EmberwaveStreamInfo::default();
+        // SAFETY: valid buffers, live context, and pointers to store results in.
+        unsafe {
+            assert_eq!(
+                emberwave_probe_pwv1(bytes.as_ptr(), bytes.len(), &mut stream),
+                EmberwaveStatus::Ok
+            );
+            let mut decoder = ptr::null_mut();
+            assert_eq!(
+                emberwave_decoder_create(
+                    context,
+                    stream.width,
+                    stream.height,
+                    stream.chroma,
+                    &mut decoder
+                ),
+                EmberwaveStatus::Ok,
+                "{}",
+                last_error()
+            );
+            let mut info = EmberwaveFrameInfo::default();
+            assert_eq!(
+                emberwave_decoder_info(decoder, &mut info),
+                EmberwaveStatus::Ok
+            );
+            let sizes = [
+                (info.width, info.height),
+                (info.chroma_width, info.chroma_height),
+                (info.chroma_width, info.chroma_height),
+            ];
+            let textures =
+                [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR].map(|plane| {
+                    let mut texture = ptr::null_mut();
+                    assert_eq!(
+                        emberwave_texture_create_plane_with_format(
+                            decoder,
+                            plane,
+                            EMBERWAVE_PLANE_FORMAT_R16,
+                            &mut texture
+                        ),
+                        EmberwaveStatus::Ok,
+                        "{name} plane {plane}: {}",
+                        last_error()
+                    );
+                    texture
+                });
+            let images = textures.map(|texture| {
+                let raw = emberwave_texture_vulkan(texture);
+                assert_ne!(raw, 0);
+                vk::Image::from_raw(raw)
+            });
+
+            let file_frames: Vec<Vec<u8>> = Pwv1File::parse(&bytes)
+                .unwrap()
+                .frames()
+                .map(|frame| frame.unwrap().to_vec())
+                .collect();
+            for (index, frame) in file_frames.iter().enumerate() {
+                emberwave_decoder_clear(decoder);
+                assert_eq!(
+                    emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                    EmberwaveStatus::Ok
+                );
+                assert_eq!(
+                    emberwave_decoder_decode_plane_textures(
+                        decoder,
+                        textures[0],
+                        textures[1],
+                        textures[2]
+                    ),
+                    EmberwaveStatus::Ok,
+                    "{name} frame {index}: {}",
+                    last_error()
+                );
+                let expected = cpu_unorm16_planes(&bytes, frame);
+                for (plane, (&image, (w, h))) in images.iter().zip(sizes).enumerate() {
+                    let read = bytes_to_u16(&client.read(&device, image, (w, h, 2), None));
+                    assert_u16_matches_cpu(
+                        &read,
+                        &expected[plane],
+                        &format!("{name} frame {index} plane {plane}"),
+                    );
+                }
+            }
+
+            for texture in textures {
+                emberwave_texture_destroy(texture);
+            }
+            emberwave_decoder_destroy(decoder);
+        }
+    }
+
+    // SAFETY: a live context and device, which nothing uses any more.
+    unsafe {
+        emberwave_context_destroy(context);
+        device.destroy_device(None);
+    }
+}
+
+#[test]
+fn wrapped_r16_images_decode_without_a_wait_and_release() {
+    let Some(client) = Client::new() else {
+        return;
+    };
+    let (names, device) = client.device();
+    let context = client.context(&device, &names, 0, None);
+    let semaphore = client.timeline(&device);
+    let mut timeline_value = 0u64;
+
+    // STORAGE | SAMPLED | TRANSFER_SRC — notably without TRANSFER_DST_BIT.
+    let r16_usage = vk::ImageUsageFlags::STORAGE
+        | vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::TRANSFER_SRC;
+    let mut all_images = Vec::new();
+    R16_RELEASED.store(0, Ordering::SeqCst);
+
+    for name in ["noise_192x136_420.pwv1", "noise_131x67_444.pwv1"] {
+        let bytes = testdata(name);
+        let mut stream = EmberwaveStreamInfo::default();
+        // SAFETY: valid buffers, live context, and pointers to store results in.
+        unsafe {
+            assert_eq!(
+                emberwave_probe_pwv1(bytes.as_ptr(), bytes.len(), &mut stream),
+                EmberwaveStatus::Ok
+            );
+            let mut decoder = ptr::null_mut();
+            assert_eq!(
+                emberwave_decoder_create(
+                    context,
+                    stream.width,
+                    stream.height,
+                    stream.chroma,
+                    &mut decoder
+                ),
+                EmberwaveStatus::Ok,
+                "{}",
+                last_error()
+            );
+            let mut info = EmberwaveFrameInfo::default();
+            assert_eq!(
+                emberwave_decoder_info(decoder, &mut info),
+                EmberwaveStatus::Ok
+            );
+            let sizes = [
+                (info.width, info.height),
+                (info.chroma_width, info.chroma_height),
+                (info.chroma_width, info.chroma_height),
+            ];
+            let owned = [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR].map(|plane| {
+                let mut texture = ptr::null_mut();
+                assert_eq!(
+                    emberwave_texture_create_plane_with_format(
+                        decoder,
+                        plane,
+                        EMBERWAVE_PLANE_FORMAT_R16,
+                        &mut texture
+                    ),
+                    EmberwaveStatus::Ok
+                );
+                texture
+            });
+            let images =
+                sizes.map(|size| client.image(&device, vk::Format::R16_UNORM, size, r16_usage));
+            let textures = [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR]
+                .into_iter()
+                .zip(&images)
+                .map(|(plane, image)| {
+                    wrap(
+                        decoder,
+                        &EmberwaveVulkanImage {
+                            image: image.image.as_raw(),
+                            format: vk::Format::R16_UNORM.as_raw() as u32,
+                            usage: r16_usage.as_raw(),
+                            layout: vk::ImageLayout::UNDEFINED.as_raw() as u32,
+                            release: Some(count_r16_release),
+                            user: ptr::null_mut(),
+                            ..Default::default()
+                        },
+                        Some(plane),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+
+            let file_frames: Vec<Vec<u8>> = Pwv1File::parse(&bytes)
+                .unwrap()
+                .frames()
+                .map(|frame| frame.unwrap().to_vec())
+                .collect();
+            for (index, frame) in file_frames.iter().enumerate() {
+                emberwave_decoder_clear(decoder);
+                assert_eq!(
+                    emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                    EmberwaveStatus::Ok
+                );
+                assert_eq!(
+                    emberwave_decoder_decode_plane_textures(decoder, owned[0], owned[1], owned[2]),
+                    EmberwaveStatus::Ok,
+                    "{name} frame {index}: {}",
+                    last_error()
+                );
+
+                timeline_value += 1;
+                let sync = EmberwaveVulkanSync {
+                    signal_semaphore: semaphore.as_raw(),
+                    signal_value: timeline_value,
+                    flags: EMBERWAVE_SYNC_SIGNAL_TIMELINE,
+                    ..Default::default()
+                };
+                emberwave_decoder_clear(decoder);
+                assert_eq!(
+                    emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                    EmberwaveStatus::Ok
+                );
+                assert_eq!(
+                    emberwave_decoder_submit_plane_textures_vulkan(
+                        decoder,
+                        textures[0],
+                        textures[1],
+                        textures[2],
+                        &sync
+                    ),
+                    EmberwaveStatus::Ok,
+                    "{name} frame {index}: {}",
+                    last_error()
+                );
+                let expected = cpu_unorm16_planes(&bytes, frame);
+                for (plane, (image, owned_tex)) in images.iter().zip(owned).enumerate() {
+                    let read = bytes_to_u16(&client.read(
+                        &device,
+                        image.image,
+                        (image.width, image.height, image.texel),
+                        Some((semaphore, timeline_value)),
+                    ));
+                    let owned_image = vk::Image::from_raw(emberwave_texture_vulkan(owned_tex));
+                    let owned_read = bytes_to_u16(&client.read(
+                        &device,
+                        owned_image,
+                        (image.width, image.height, image.texel),
+                        None,
+                    ));
+                    assert_eq!(read, owned_read, "{name} frame {index} plane {plane}");
+                    assert_u16_matches_cpu(
+                        &read,
+                        &expected[plane],
+                        &format!("{name} frame {index} plane {plane}"),
+                    );
+                }
+            }
+
+            for texture in owned.into_iter().chain(textures) {
+                emberwave_texture_destroy(texture);
+            }
+            emberwave_decoder_destroy(decoder);
+            all_images.extend(images);
+        }
+    }
+
+    // The images are released once emberwave and the GPU are done with them:
+    // by the time the context is gone at the latest.
+    // SAFETY: live objects, which nothing uses any more.
+    unsafe {
+        emberwave_context_destroy(context);
+        assert_eq!(
+            R16_RELEASED.load(Ordering::SeqCst),
+            6,
+            "expected 6 release callbacks"
+        );
+        for image in all_images {
+            device.destroy_image(image.image, None);
+            device.free_memory(image.memory, None);
+        }
+        device.destroy_semaphore(semaphore, None);
+        device.destroy_device(None);
+    }
+}
+
+#[test]
+fn r16_vulkan_images_with_wrong_usage_format_or_mixed_planes_are_refused() {
+    let Some(client) = Client::new() else {
+        return;
+    };
+    let (names, device) = client.device();
+    let context = client.context(&device, &names, 0, None);
+    let mut decoder = ptr::null_mut();
+    // SAFETY: a live context and a pointer to store the decoder in.
+    let status =
+        unsafe { emberwave_decoder_create(context, 192, 136, EMBERWAVE_CHROMA_420, &mut decoder) };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+    let encoder = encoder_of(context, (192, 136), EMBERWAVE_CHROMA_420);
+
+    let r16_full_usage = vk::ImageUsageFlags::STORAGE
+        | vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::TRANSFER_SRC;
+    let r16_no_storage = vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::TRANSFER_DST
+        | vk::ImageUsageFlags::TRANSFER_SRC;
+    let r16_no_sampled = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
+    let r8_usage = vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::TRANSFER_DST
+        | vk::ImageUsageFlags::TRANSFER_SRC;
+
+    let y_r16 = client.image(&device, vk::Format::R16_UNORM, (192, 136), r16_full_usage);
+    let y_r16_no_storage = client.image(&device, vk::Format::R16_UNORM, (192, 136), r16_no_storage);
+    let y_r16_no_sampled = client.image(&device, vk::Format::R16_UNORM, (192, 136), r16_no_sampled);
+    let cb_r8 = client.image(&device, vk::Format::R8_UNORM, (96, 68), r8_usage);
+    let cr_r8 = client.image(&device, vk::Format::R8_UNORM, (96, 68), r8_usage);
+
+    // 1. VK_FORMAT_R16_UNORM without VK_IMAGE_USAGE_STORAGE_BIT is rejected.
+    let (status, err) = wrapped(
+        decoder,
+        &y_r16_no_storage,
+        vk::Format::R16_UNORM,
+        r16_no_storage,
+        Some(EMBERWAVE_PLANE_Y),
+    )
+    .unwrap_err();
+    assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    assert!(err.contains("VK_IMAGE_USAGE_STORAGE_BIT"), "{err}");
+
+    // 2. VK_FORMAT_R16_UNORM without VK_IMAGE_USAGE_SAMPLED_BIT is rejected.
+    let (status, err) = wrapped(
+        decoder,
+        &y_r16_no_sampled,
+        vk::Format::R16_UNORM,
+        r16_no_sampled,
+        Some(EMBERWAVE_PLANE_Y),
+    )
+    .unwrap_err();
+    assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    assert!(err.contains("SAMPLED"), "{err}");
+
+    // 3. Wrong format (VK_FORMAT_R16_UINT, VK_FORMAT_R8G8_UNORM) for plane is rejected.
+    for wrong in [vk::Format::R16_UINT, vk::Format::R8G8_UNORM] {
+        let (status, err) = wrapped(
+            decoder,
+            &y_r16,
+            wrong,
+            r16_full_usage,
+            Some(EMBERWAVE_PLANE_Y),
+        )
+        .unwrap_err();
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert!(err.contains("format"), "{err}");
+    }
+
+    // 4. VK_FORMAT_R16_UNORM for emberwave_texture_from_vulkan_source (encoder) is rejected.
+    let (status, err) = source(
+        encoder,
+        &y_r16,
+        vk::Format::R16_UNORM,
+        r16_full_usage,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        EMBERWAVE_PLANE_Y,
+    )
+    .unwrap_err();
+    assert_eq!(status, EmberwaveStatus::InvalidArgument);
+    assert!(err.contains("not VK_FORMAT_R8_UNORM"), "{err}");
+
+    // 5. Mixed R8 + R16 plane textures in emberwave_decoder_submit_plane_textures_vulkan are rejected.
+    let tex_y_r16 = wrapped(
+        decoder,
+        &y_r16,
+        vk::Format::R16_UNORM,
+        r16_full_usage,
+        Some(EMBERWAVE_PLANE_Y),
+    )
+    .unwrap();
+    let tex_cb_r8 = wrapped(
+        decoder,
+        &cb_r8,
+        vk::Format::R8_UNORM,
+        r8_usage,
+        Some(EMBERWAVE_PLANE_CB),
+    )
+    .unwrap();
+    let tex_cr_r8 = wrapped(
+        decoder,
+        &cr_r8,
+        vk::Format::R8_UNORM,
+        r8_usage,
+        Some(EMBERWAVE_PLANE_CR),
+    )
+    .unwrap();
+    let frame = &frames()[0];
+    // SAFETY: live objects and valid frame bytes.
+    unsafe {
+        assert_eq!(
+            emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+            EmberwaveStatus::Ok
+        );
+        assert_eq!(
+            emberwave_decoder_submit_plane_textures_vulkan(
+                decoder,
+                tex_y_r16,
+                tex_cb_r8,
+                tex_cr_r8,
+                ptr::null()
+            ),
+            EmberwaveStatus::InvalidArgument
+        );
+        assert!(emberwave_decoder_is_ready(decoder, 0));
+
+        for texture in [tex_y_r16, tex_cb_r8, tex_cr_r8] {
+            emberwave_texture_destroy(texture);
+        }
+        emberwave_encoder_destroy(encoder);
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+        for image in [y_r16, y_r16_no_storage, y_r16_no_sampled, cb_r8, cr_r8] {
+            device.destroy_image(image.image, None);
+            device.free_memory(image.memory, None);
+        }
+        device.destroy_device(None);
+    }
 }

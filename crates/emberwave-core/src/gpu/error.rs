@@ -67,4 +67,9 @@ pub enum GpuError {
     /// its plane: its format, size, dimension, samples or usage.
     #[error("unsuitable texture: {0}")]
     Texture(String),
+
+    /// The GPU device lacks an optional feature that the requested operation
+    /// requires.
+    #[error("{0}")]
+    Unsupported(String),
 }

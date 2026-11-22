@@ -14,6 +14,22 @@ use crate::bitstream::consts::{BLOCK_SIZE, DC_SHIFT, DECOMPOSITION_LEVELS, NUM_C
 use crate::bitstream::{Band, Component, Error, FrameLayout, FrameView};
 use dequant::Bands;
 
+/// Converts one normalised sample in `[0, 1]` to 16-bit UNORM (`0..=65535`),
+/// clamping outside `[0, 1]` and rounding to nearest, ties to even.
+///
+/// Inverse DWT reconstruction adds [`DC_SHIFT`] (`0.5`) and clamps to
+/// `[0.0, 1.0]`. Mapping `v` to `round_ties_even(clamp(v, 0.0, 1.0) * 65535.0)`
+/// matches WGSL `round(clamp(v, 0.0, 1.0) * 65535.0)` and `r16unorm` storage
+/// writes:
+/// - `0.0 -> 0`, `1.0 -> 65535`
+/// - exact midpoint `0.5 -> 32768` (ties to even from `32767.5`)
+/// - 10-bit code levels `c` in `0..=1023` (`c / 1023.0`) map to distinct
+///   values (`0 -> 0`, `1/1023 -> 64`, `512/1023 -> 32800`, `1.0 -> 65535`) and
+///   round-trip via `round_ties_even((u16 as f32 / 65535.0) * 1023.0) == c`.
+pub fn unorm16(sample: f32) -> u16 {
+    (sample.clamp(0.0, 1.0) * 65535.0).round_ties_even() as u16
+}
+
 /// One decoded colour plane with samples in `[0, 1]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plane {
@@ -35,12 +51,10 @@ impl Plane {
             .collect()
     }
 
-    /// Converts to 16-bit UNORM, rounding to nearest, ties to even.
+    /// Converts to 16-bit UNORM, clamping to `[0, 1]` and rounding to nearest,
+    /// ties to even, via [`unorm16`].
     pub fn to_unorm16(&self) -> Vec<u16> {
-        self.samples
-            .iter()
-            .map(|v| (v * 65535.0).round_ties_even() as u16)
-            .collect()
+        self.samples.iter().copied().map(unorm16).collect()
     }
 }
 
@@ -297,6 +311,72 @@ mod tests {
         // 0.5 * 255 = 127.5 -> 128 (even); 2.5 -> 2 (even).
         assert_eq!(plane.to_unorm8(), [0, 255, 128, 2]);
         assert_eq!(plane.to_unorm16()[..2], [0, 65535]);
+    }
+
+    #[test]
+    fn unorm16_preserves_10bit_levels_clamps_and_rounds_ties_to_even() {
+        assert_eq!(unorm16(0.0), 0);
+        assert_eq!(unorm16(1.0 / 1023.0), 64);
+        assert_eq!(unorm16(0.5), 32768);
+        assert_eq!(unorm16(511.0 / 1023.0), 32735);
+        assert_eq!(unorm16(512.0 / 1023.0), 32800);
+        assert_eq!(unorm16(1.0), 65535);
+
+        // Out-of-range values clamp to [0, 65535], including via Plane::to_unorm16.
+        let clamped_inputs = [-10.0, -0.25, -f32::MIN_POSITIVE, 1.0 + 1e-6, 1.5, 10.0];
+        let clamped_expected = [0, 0, 0, 65535, 65535, 65535];
+        for (&sample, &expected) in clamped_inputs.iter().zip(&clamped_expected) {
+            assert_eq!(unorm16(sample), expected, "sample {sample}");
+        }
+        let plane = Plane {
+            width: clamped_inputs.len() as u32,
+            height: 1,
+            samples: clamped_inputs.to_vec(),
+        };
+        assert_eq!(plane.to_unorm16(), clamped_expected);
+
+        // Every 10-bit code level maps to a distinct u16 and round-trips exactly.
+        let mut mapped = Vec::with_capacity(1024);
+        for code in 0u16..=1023 {
+            let quantized = unorm16(f32::from(code) / 1023.0);
+            let round_trip = ((f32::from(quantized) / 65535.0) * 1023.0).round_ties_even() as u16;
+            assert_eq!(round_trip, code, "10-bit code {code} -> {quantized}");
+            if let Some(&prev) = mapped.last() {
+                assert!(
+                    quantized > prev,
+                    "10-bit code {code} collided with previous level: {prev} vs {quantized}"
+                );
+            }
+            mapped.push(quantized);
+        }
+
+        // Exact ties (k + 0.5) / 65535.0 round ties to even, and adjacent ULPs
+        // below and above the boundary round to k and k + 1.
+        let mut even_ties = 0usize;
+        let mut odd_ties = 0usize;
+        for k in 0u16..65535 {
+            let boundary = (f32::from(k) + 0.5) / 65535.0;
+            if boundary * 65535.0 == f32::from(k) + 0.5 {
+                let expected = if k.is_multiple_of(2) {
+                    even_ties += 1;
+                    k
+                } else {
+                    odd_ties += 1;
+                    k + 1
+                };
+                assert_eq!(unorm16(boundary), expected, "tie at k={k}");
+                if boundary.next_down() * 65535.0 < f32::from(k) + 0.5 {
+                    assert_eq!(unorm16(boundary.next_down()), k, "below tie at k={k}");
+                }
+                if boundary.next_up() * 65535.0 > f32::from(k) + 0.5 {
+                    assert_eq!(unorm16(boundary.next_up()), k + 1, "above tie at k={k}");
+                }
+                assert_eq!(unorm16(boundary - 1e-6), k, "-1e-6 at k={k}");
+                assert_eq!(unorm16(boundary + 1e-6), k + 1, "+1e-6 at k={k}");
+            }
+        }
+        assert!(even_ties > 100, "too few even ties: {even_ties}");
+        assert!(odd_ties > 100, "too few odd ties: {odd_ties}");
     }
 
     use crate::bitstream::header::Header;

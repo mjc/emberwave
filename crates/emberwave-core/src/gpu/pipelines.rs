@@ -7,7 +7,7 @@
 
 use crate::bitstream::ChromaSubsampling;
 
-use super::decoder::PLANE_FORMAT;
+use super::decoder::{PLANE_FORMAT, PLANE_FORMAT_R16};
 use super::error::GpuError;
 use super::shader_sources;
 
@@ -78,9 +78,9 @@ impl Pipelines {
                     &[
                         storage_entry(0, false),
                         uniform_entry(2),
-                        plane_entry(3),
-                        plane_entry(4),
-                        plane_entry(5),
+                        plane_entry(3, PLANE_FORMAT),
+                        plane_entry(4, PLANE_FORMAT),
+                        plane_entry(5, PLANE_FORMAT),
                     ],
                 )
             })
@@ -88,6 +88,25 @@ impl Pipelines {
         }
         Ok(pipelines)
     }
+}
+
+/// The inverse transform stage that stores decoded planes into `r16unorm`
+/// storage textures. Built lazily on first 16-bit plane decode.
+pub(crate) fn idwt_planes_r16_stage(device: &wgpu::Device) -> Result<Stage, GpuError> {
+    with_error_scope(device, || {
+        create_stage(
+            device,
+            "idwt planes r16",
+            shader_sources::IDWT_PLANES_R16,
+            &[
+                storage_entry(0, false),
+                uniform_entry(2),
+                plane_entry(3, PLANE_FORMAT_R16),
+                plane_entry(4, PLANE_FORMAT_R16),
+                plane_entry(5, PLANE_FORMAT_R16),
+            ],
+        )
+    })
 }
 
 /// The stage of `conceal.wgsl`, the concealment of the blocks a frame drawn
@@ -291,14 +310,14 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-/// A plane's texture that `idwt_planes.wgsl` stores into.
-fn plane_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+/// A plane's texture that `idwt_planes.wgsl` or `idwt_planes_r16.wgsl` stores into.
+fn plane_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::StorageTexture {
             access: wgpu::StorageTextureAccess::WriteOnly,
-            format: PLANE_FORMAT,
+            format,
             view_dimension: wgpu::TextureViewDimension::D2,
         },
         count: None,

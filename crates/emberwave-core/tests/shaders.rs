@@ -224,6 +224,75 @@ fn the_inverse_transform_that_stores_planes_differs_only_in_its_store() {
 }
 
 #[test]
+fn the_r16_plane_shader_requires_only_16bit_norm_storage_textures() {
+    let module =
+        naga::front::wgsl::parse_str(shader_sources::IDWT_PLANES_R16).unwrap_or_else(|e| {
+            panic!(
+                "idwt planes r16 does not parse:\n{}",
+                e.emit_to_string(shader_sources::IDWT_PLANES_R16)
+            )
+        });
+
+    // Must fail validation without STORAGE_TEXTURE_16BIT_NORM_FORMATS.
+    assert!(
+        Validator::new(ValidationFlags::all(), Capabilities::empty())
+            .validate(&module)
+            .is_err(),
+        "r16unorm storage shader unexpectedly validated with empty capabilities"
+    );
+
+    // Must pass with only STORAGE_TEXTURE_16BIT_NORM_FORMATS.
+    Validator::new(
+        ValidationFlags::all(),
+        Capabilities::STORAGE_TEXTURE_16BIT_NORM_FORMATS,
+    )
+    .validate(&module)
+    .unwrap_or_else(|error| panic!("idwt planes r16 does not validate: {error:?}"));
+
+    let entry_points: Vec<&str> = module
+        .entry_points
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(entry_points, ["main"]);
+    assert_eq!(module.entry_points[0].stage, naga::ShaderStage::Compute);
+    let [x, y, z] = module.entry_points[0].workgroup_size;
+    assert!(x * y * z <= 256, "{x}x{y}x{z}");
+
+    let mut layouter = naga::proc::Layouter::default();
+    layouter.update(module.to_ctx()).expect("layout");
+    let workgroup: Vec<(String, u32)> = module
+        .global_variables
+        .iter()
+        .filter(|(_, variable)| variable.space == naga::AddressSpace::WorkGroup)
+        .map(|(_, variable)| {
+            let name = variable.name.clone().unwrap_or_default();
+            (name, layouter[variable.ty].size)
+        })
+        .collect();
+    assert_eq!(
+        workgroup,
+        [("horizontal".to_owned(), 5120), ("levels".to_owned(), 4096)]
+    );
+
+    let store = naga::StorageAccess::STORE;
+    assert_eq!(
+        storage_textures(&module),
+        ["plane_y", "plane_cb", "plane_cr"].map(|name| (
+            name.to_owned(),
+            naga::StorageFormat::R16Unorm,
+            store
+        ))
+    );
+    let names: Vec<String> = module
+        .global_variables
+        .iter()
+        .filter_map(|(_, variable)| variable.name.clone())
+        .collect();
+    assert!(!names.contains(&"packed".to_owned()), "{names:?}");
+}
+
+#[test]
 fn the_draw_shader_validates_without_optional_capabilities() {
     let module = validate("draw", shader_sources::DRAW);
     let stages: Vec<(&str, naga::ShaderStage)> = module

@@ -9,6 +9,10 @@
 
 @group(0) @binding(1) var<storage, read_write> packed: array<u32>;
 
+fn to_level(v: f32) -> f32 {
+    return to_unorm8(v);
+}
+
 // The 8-bit level of tile sample `at` collected in the levels array, or 0 for
 // a padding sample past the right edge of the plane. `select` evaluates both
 // arms, so the array is read for padding samples too: the vertical pass has

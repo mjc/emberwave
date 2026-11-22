@@ -11,6 +11,10 @@
 @group(0) @binding(4) var plane_cb: texture_storage_2d<r8unorm, write>;
 @group(0) @binding(5) var plane_cr: texture_storage_2d<r8unorm, write>;
 
+fn to_level(v: f32) -> f32 {
+    return to_unorm8(v);
+}
+
 // Stores an 8-bit level into the texture of `component`. The level is a whole
 // number from 0 to 255, and Metal turns a float into a UNORM texel by rounding
 // to the nearest level, so level / 255 comes back as the level exactly; the

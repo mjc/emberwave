@@ -108,6 +108,10 @@
 // the adapter the caller named, for textures it shares.
 #define EMBERWAVE_CONTEXT_KIND_D3D12 3
 
+// Bit flag in `EmberwaveContextInfo.features` indicating that the context
+// supports `EMBERWAVE_PLANE_FORMAT_R16` decoded plane textures.
+#define EMBERWAVE_CONTEXT_FEATURE_PLANE_R16 (1 << 0)
+
 // The ITU-R BT.601 matrix.
 #define EMBERWAVE_MATRIX_BT601 0
 
@@ -149,6 +153,15 @@
 // 255: `MTLPixelFormatBGRA8Unorm` in Metal, the format of most display
 // surfaces, onto which a copy needs the same order.
 #define EMBERWAVE_TEXTURE_BGRA8 1
+
+// 8-bit unsigned normalised plane format (`R8Unorm`: `VK_FORMAT_R8_UNORM`,
+// `MTLPixelFormatR8Unorm`, `DXGI_FORMAT_R8_UNORM`), the default.
+#define EMBERWAVE_PLANE_FORMAT_R8 0
+
+// 16-bit unsigned normalised plane format (`R16Unorm`: `VK_FORMAT_R16_UNORM`,
+// `MTLPixelFormatR16Unorm`, `DXGI_FORMAT_R16_UNORM`), for 10-bit and
+// higher-precision decoded planes.
+#define EMBERWAVE_PLANE_FORMAT_R16 1
 
 // The luma plane, for `emberwave_texture_create_plane`, the functions that
 // wrap a plane of the caller's for decodes
@@ -537,6 +550,9 @@ typedef struct EmberwaveContextInfo {
   uint32_t device_id;
   // An `EMBERWAVE_CONTEXT_KIND_*` value: which call made the context.
   uint32_t kind;
+  // Optional features supported by the context: `EMBERWAVE_CONTEXT_FEATURE_*`
+  // flags combined with `|`, or 0.
+  uint32_t features;
 } EmberwaveContextInfo;
 
 // The sizes of the planes a decoder writes or an encoder reads.
@@ -865,7 +881,9 @@ enum EmberwaveStatus emberwave_context_create_vulkan(const struct EmberwaveVulka
 // on: a decode leaves it so, and the caller gives it back so before the next
 // call that uses it. It belongs to the context's queue family, and its
 // usage is `VK_IMAGE_USAGE_SAMPLED_BIT`, `VK_IMAGE_USAGE_TRANSFER_SRC_BIT`
-// and what the decodes need.
+// and what the decodes need (for `emberwave_texture_create_plane_with_format`
+// with `EMBERWAVE_PLANE_FORMAT_R16`, `VK_FORMAT_R16_UNORM` and
+// `VK_IMAGE_USAGE_STORAGE_BIT`).
 //
 // # Safety
 //
@@ -907,11 +925,15 @@ enum EmberwaveStatus emberwave_texture_from_vulkan(const struct EmberwaveDecoder
                                                    struct EmberwaveTexture **texture);
 
 // Wraps the caller's own Vulkan image for the Y, Cb or Cr plane of the
-// pictures of `decoder`, as `emberwave_texture_create_plane` makes one:
-// `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
-// `EMBERWAVE_PLANE_CR`. As for `emberwave_texture_from_vulkan`, but the
-// image is `VK_FORMAT_R8_UNORM` of the plane's size, and a decode copies
-// the plane into it, which needs `VK_IMAGE_USAGE_TRANSFER_DST_BIT`.
+// pictures of `decoder`, as `emberwave_texture_create_plane` or
+// `emberwave_texture_create_plane_with_format` makes one: `plane` is
+// `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR`. As for
+// `emberwave_texture_from_vulkan`, of the plane's size, in
+// `VK_FORMAT_R8_UNORM` with `VK_IMAGE_USAGE_TRANSFER_DST_BIT` (the decode
+// copies the plane into it), or in `VK_FORMAT_R16_UNORM` with
+// `VK_IMAGE_USAGE_STORAGE_BIT` (the decode stores the 16-bit normalised
+// plane into it; requires `EMBERWAVE_CONTEXT_FEATURE_PLANE_R16`, else
+// `EMBERWAVE_STATUS_UNSUPPORTED`).
 //
 // # Safety
 //
@@ -1126,10 +1148,16 @@ enum EmberwaveStatus emberwave_texture_from_d3d12(const struct EmberwaveDecoder 
 // Wraps a texture of the caller's Direct3D 12 or Direct3D 11 device for the
 // Y, Cb or Cr plane of the pictures of `decoder`, as
 // `emberwave_texture_from_d3d12` does for the picture: `plane` is
-// `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR`, and the
-// texture is `DXGI_FORMAT_R8_UNORM` of the plane's size, which a decode
-// copies the plane into. Only `emberwave_decoder_submit_plane_textures_d3d12`
-// takes it.
+// `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR`. As
+// `emberwave_texture_create_plane` or
+// `emberwave_texture_create_plane_with_format` makes one, the texture is of
+// the plane's size, in `DXGI_FORMAT_R8_UNORM` (which a decode copies the
+// plane into) or `DXGI_FORMAT_R16_UNORM` with
+// `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS` (`D3D11_BIND_UNORDERED_ACCESS`,
+// which a decode stores the 16-bit normalised plane into; requires
+// `EMBERWAVE_CONTEXT_FEATURE_PLANE_R16`, else
+// `EMBERWAVE_STATUS_UNSUPPORTED`). Only
+// `emberwave_decoder_submit_plane_textures_d3d12` takes it.
 //
 // # Safety
 //
@@ -1484,6 +1512,30 @@ enum EmberwaveStatus emberwave_texture_create_plane(const struct EmberwaveDecode
                                                     uint32_t plane,
                                                     struct EmberwaveTexture **texture);
 
+// Creates a texture that `emberwave_decoder_decode_plane_textures` puts one
+// plane of the pictures of `decoder` into, on the decoder's GPU device, in
+// `format`: `EMBERWAVE_PLANE_FORMAT_R8` (as `emberwave_texture_create_plane`
+// makes) or `EMBERWAVE_PLANE_FORMAT_R16` (for 10-bit and higher-precision
+// decoded planes).
+//
+// `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
+// `EMBERWAVE_PLANE_CR`, and the texture is of its size as
+// `emberwave_decoder_info` gives it, which the GPU can sample and copy from
+// but the CPU cannot read. `EMBERWAVE_PLANE_FORMAT_R16` requires the context
+// to report `EMBERWAVE_CONTEXT_FEATURE_PLANE_R16`, and fails with
+// `EMBERWAVE_STATUS_UNSUPPORTED` otherwise. All three textures passed to a
+// plane-texture decode must share the same format.
+//
+// # Safety
+//
+// `decoder` is a live decoder that no other thread is using. `texture`
+// points to where the new texture is stored; it is set to `NULL` when the
+// call fails.
+enum EmberwaveStatus emberwave_texture_create_plane_with_format(const struct EmberwaveDecoder *decoder,
+                                                                uint32_t plane,
+                                                                uint32_t format,
+                                                                struct EmberwaveTexture **texture);
+
 // Wraps the caller's own Metal texture, `metal`, an `id<MTLTexture>`, for
 // the decodes of `decoder` to put the picture into, as into one of
 // `emberwave_texture_create`'s: a texture of a `CVPixelBuffer` from a
@@ -1523,15 +1575,18 @@ enum EmberwaveStatus emberwave_texture_from_metal(const struct EmberwaveDecoder 
                                                   struct EmberwaveTexture **texture);
 
 // Wraps the caller's own Metal texture, `metal`, for the Y, Cb or Cr plane
-// of the pictures of `decoder`, as `emberwave_texture_create_plane` makes
-// one: `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
-// `EMBERWAVE_PLANE_CR`. As for `emberwave_texture_from_metal`, but the
-// texture is `MTLPixelFormatR8Unorm` of the plane's size, and as a decode
-// copies a plane, not framebuffer-only. When all three textures of a decode
-// have `MTLTextureUsageShaderWrite`, the decode stores the planes into them
-// from its shaders instead, which takes less time (decision D52). A Metal
-// texture can be wrapped for more than one plane, but a decode refuses it in
-// two of them.
+// of the pictures of `decoder`, as `emberwave_texture_create_plane` or
+// `emberwave_texture_create_plane_with_format` makes one: `plane` is
+// `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR`. As for
+// `emberwave_texture_from_metal`, of the plane's size, in
+// `MTLPixelFormatR8Unorm` (not framebuffer-only; when all three textures of
+// a decode have `MTLTextureUsageShaderWrite`, the decode stores the planes
+// into them from its shaders instead, decision D52) or
+// `MTLPixelFormatR16Unorm` with `MTLTextureUsageShaderWrite` (the decode
+// stores the 16-bit normalised plane into it; requires
+// `EMBERWAVE_CONTEXT_FEATURE_PLANE_R16`, else
+// `EMBERWAVE_STATUS_UNSUPPORTED`). A Metal texture can be wrapped for more
+// than one plane, but a decode refuses it in two of them.
 //
 // # Safety
 //

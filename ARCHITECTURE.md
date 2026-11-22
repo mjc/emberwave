@@ -15,6 +15,7 @@ bytes ──► [CPU] packet parser ──► block table + payload words
                                        ▼
                          [GPU] inverse DWT, level by level (5 levels);
                                the last level writes 8-bit Y / Cb / Cr planes
+                               (or R16Unorm directly into plane textures)
                                        │
                                        ▼
                          [GPU] YUV → RGB (optional)
@@ -310,10 +311,10 @@ A frame takes six dispatches in two compute passes, whatever its size, a seventh
 |---|---|---|---|---|
 | Dequantisation | `dequant.wgsl` | 1: one workgroup of 128 invocations per block index | payload, block offsets | the pyramid |
 | Concealment (optional) | `conceal.wgsl` | 1, in the same pass: one workgroup of 128 invocations per block index, which return at once but for a block of detail the frame lacks | block offsets, the pyramid's coarsest level, its copy from the last decode | the pyramid: zeros for the blocks where the picture moved (D66) |
-| Inverse DWT | `idwt.wgsl` with `idwt_packed.wgsl`, or with `idwt_planes.wgsl` | 5: one per level, coarsest first; a workgroup per 32x32 output tile and component | the pyramid | the pyramid (next LL band) or, at the last level of a component, the packed 8-bit planes, or on Metal the caller's plane textures (D52) |
+| Inverse DWT | `idwt.wgsl` with `idwt_packed.wgsl`, `idwt_planes.wgsl` or `idwt_planes_r16.wgsl` | 5: one per level, coarsest first; a workgroup per 32x32 output tile and component | the pyramid | the pyramid (next LL band) or, at the last level of a component, the packed 8-bit planes, or the caller's `R8Unorm` (Metal, D52) or `R16Unorm` (D76) plane textures |
 | Colour conversion (optional) | `yuv2rgb.wgsl` | 1: one invocation per pixel | packed planes | RGBA words |
 
-The packed planes are copied to a mappable buffer and returned as a `Frame`. When the frame is converted to RGB, the RGBA words are copied instead, as an `RgbFrame`, and the packed planes stay in GPU memory. A decode into the caller's plane textures copies the packed planes into them, or on Metal has the last levels store the planes there instead (D41, D52).
+The packed planes are copied to a mappable buffer and returned as a `Frame`. When the frame is converted to RGB, the RGBA words are copied instead, as an `RgbFrame`, and the packed planes stay in GPU memory. A decode into the caller's plane textures copies the packed 8-bit planes into them, on Metal has the last levels store `R8Unorm` planes there instead (D41, D52), or stores `R16Unorm` planes directly on devices with `TEXTURE_FORMAT_16BIT_NORM` (D76).
 
 ### Memory
 
@@ -350,7 +351,7 @@ Without subgroup operations the prefix sum costs two barriers and about 20 workg
 A workgroup of 256 invocations produces a 32x32 tile of one level's output from the tile's 40x40 neighbourhood in the interleaved image. Each coordinate of the neighbourhood is mirrored about the level's true size, using whole-sample symmetry, which preserves the parity of the coordinate; the parity picks the band (LL, HL, LH or HH) and the mirrored coordinate halved picks the sample. Mirroring keeps the parity up to the level's width less two past an edge, and the stored samples read no further than four, so the horizontal pass can take a row's even samples from one band and its odd ones from another while a level is at least six samples wide. Every level is at least eight, by the minimum image size of 128. Four samples of extension on each side are what four lifting steps need.
 
 1. Horizontal pass: 160 invocations each read 16 samples of a row of the neighbourhood straight from the bands, apply the gain and the four lifting steps in registers and keep the 8 valid results (workgroup memory, 5120 bytes). A row's even samples come from one band and its odd ones from another. The apron of a segment is read and recomputed rather than shared.
-2. Vertical pass: 128 invocations do the same down a column of those results and store the 8 results into the LL band of the next level. At the last level of a component they are 8-bit samples instead, collected in workgroup memory (4096 bytes) and packed as described next.
+2. Vertical pass: 128 invocations do the same down a column of those results and store the 8 results into the LL band of the next level. At the last level of a component they are quantised UNORM levels instead, collected in workgroup memory (4096 bytes) and written as described next.
 
 The lifting, and the loads and stores around it, are written out with constant indices, which keeps the samples in registers (D24). Total workgroup memory is 9216 bytes, and it is not zeroed first: the two passes write every element before it is read (D25). Tiles that stick out of the image (the coarsest levels can be 8x8) are computed in full and stored with bounds checks, and mirroring always uses the true level size, never the picture size. The component is the z index of the dispatch; at level 0 a 4:2:0 frame has luma only. Until D68 a first phase loaded the neighbourhood into workgroup memory, and the horizontal pass read it from there.
 
@@ -360,7 +361,7 @@ The last level of each component writes the decoded plane as 8-bit samples, whic
 
 WGSL's `round` rounds ties to even on every backend (naga emits `rint`, `round` and `RoundEven` for Metal, HLSL and SPIR-V), which is what a UNORM storage write does. Four pixels share a word, first pixel in the low byte, and rows are padded to whole words with zero samples. A decoder's rows are then padded with words it never writes to a multiple of 256 bytes, the rows a copy into a texture takes, and its planes start at multiples of 512 bytes (D41). The CPU side cuts the padding off.
 
-The writing is the end of the shader, `store_plane`, in a file of its own behind `idwt.wgsl`: `idwt_packed.wgsl` packs the words as described, and `idwt_planes.wgsl` stores the tile's samples into three `r8unorm` storage textures, one per plane, as upstream's last level does. Each invocation stores four samples of a row, those inside the plane, as `level / 255`, which the store turns back into the same level exactly. WebGPU does not guarantee such textures, so the decoder builds the second shader only on Metal, whose GPUs write them, and uses it for a decode into the caller's plane textures when all three have the `STORAGE_BINDING` usage (D52). The levels at which no plane ends, and every decode that does not go into such textures, run the first.
+The writing is the end of the shader, `store_plane`, in a file of its own behind `idwt.wgsl`: `idwt_packed.wgsl` packs the words as described, and `idwt_planes.wgsl` stores the tile's samples into three `r8unorm` storage textures, one per plane, as upstream's last level does. Each invocation stores four samples of a row, those inside the plane, as `level / 255`, which the store turns back into the same level exactly. WebGPU does not guarantee such textures, so the decoder builds the second shader only on Metal, whose GPUs write them, and uses it for a decode into the caller's plane textures when all three have the `STORAGE_BINDING` usage (D52). The levels at which no plane ends, and every decode that does not go into such textures, run the first. A third tail, `idwt_planes_r16.wgsl`, quantises samples with `to_unorm16(v) = round(clamp(v, 0.0, 1.0) * 65535.0)` and stores `level / 65535.0` directly into three `r16unorm` storage textures (`PLANE_FORMAT_R16`) when decoding into `R16Unorm` plane views (D76). Unlike `idwt_planes.wgsl`, it has no packed copy fallback and compiles lazily per `GpuContext` on first R16 decode.
 
 ### Colour conversion
 
@@ -420,11 +421,11 @@ The wall-clock time exceeds the sum of the stages, because submitting work and n
 
 ### Portability
 
-The shaders, the decoder's and the encoder's, use only what WebGPU guarantees: no subgroup operations, no 8-bit or 16-bit storage, no `f16`, no immediates (push constants), no storage textures. One shader is the exception, on a path of its own: on Metal, where the adapter offers it, `idwt_planes.wgsl` stores the planes into `r8unorm` storage textures (D52), and the portable copies stay the fallback; likewise the frames written where the shaders read them on Apple silicon need `MAPPABLE_PRIMARY_BUFFERS` (D53). Neither is asked for under strict WebGPU. All buffers are plain storage or uniform buffers and every workgroup stays within 256 invocations and 16 KiB. The encoder reads pictures in textures as sampled `r8unorm` and `rg8unorm` textures with `textureGather` and a non-filtering sampler, and pictures in RGB as sampled `rgba8unorm` and `bgra8unorm` textures with `textureLoad` (D65), which WebGPU has without any feature. The encoder's rate control adds with 32-bit integer atomics, which WGSL has without any feature. Two tests hold this to account, and a unit test checks one rule on the real backend:
+The shaders, the decoder's and the encoder's, use only what WebGPU guarantees: no subgroup operations, no 8-bit or 16-bit storage, no `f16`, no immediates (push constants), no storage textures. Two shaders are exceptions, each on a path of its own: on Metal, where the adapter offers it, `idwt_planes.wgsl` stores the planes into `r8unorm` storage textures (D52), and the portable copies stay the fallback; on adapters with `Features::TEXTURE_FORMAT_16BIT_NORM` and `R16Unorm` write-only storage support, `idwt_planes_r16.wgsl` stores 16-bit normalised planes directly into `r16unorm` storage textures (D76); likewise the frames written where the shaders read them on Apple silicon need `MAPPABLE_PRIMARY_BUFFERS` (D53). None of them is asked for under strict WebGPU. All buffers are plain storage or uniform buffers and every workgroup stays within 256 invocations and 16 KiB. The encoder reads pictures in textures as sampled `r8unorm` and `rg8unorm` textures with `textureGather` and a non-filtering sampler, and pictures in RGB as sampled `rgba8unorm` and `bgra8unorm` textures with `textureLoad` (D65), which WebGPU has without any feature. The encoder's rate control adds with 32-bit integer atomics, which WGSL has without any feature. Two tests hold this to account, and unit tests check the rounding rules on the real backend:
 
-- `tests/shaders.rs` validates the WGSL of every shader with naga using an empty capability set, without a GPU, and checks the entry points, the workgroup sizes and memory.
+- `tests/shaders.rs` validates the WGSL of every portable shader in `shader_sources::ALL` with naga using an empty capability set, without a GPU, and checks the entry points, the workgroup sizes and memory; it excludes `IDWT_PLANES_R16` from `ALL`, verifies that it fails validation with an empty capability set, and validates it with `naga::valid::Capabilities::STORAGE_TEXTURE_16BIT_NORM_FORMATS`.
 - `tests/gpu.rs` and `tests/gpu_encoder.rs` create a device with `InstanceFlags::STRICT_WEBGPU_COMPLIANCE` and the default limits and decode a vector on it, and encode pictures on it.
-- The rounding rule of the last level is checked on the real backend against the CPU's, on inputs that are exact ties: a unit test of `gpu::decoder` cuts `to_unorm8` out of `idwt.wgsl` and runs it.
+- The rounding rules of the last level are checked on the real backend against the CPU's, on inputs that are exact ties: unit tests of `gpu::decoder` cut `to_unorm8` out of `idwt.wgsl` and `to_unorm16` out of `idwt_planes_r16.wgsl` and run them.
 
 Outside those tests a context asks for the default limits with two exceptions. Buffers and textures may be as large as the adapter allows. No limit goes beyond the adapter's, since some adapters fall short of a default the shaders do not need. Metal gives the iOS Simulator, and Apple GPUs before the A11, 15 inter-stage variables, one fewer than WebGPU's default, and the shaders use none (D36).
 
@@ -519,12 +520,12 @@ A decoder or an encoder holds the device it was made on, so it may outlive its c
 | Function | What it does |
 |---|---|
 | `emberwave_probe_pwv1`, `emberwave_probe_packet` | Picture size, chroma format and colour signalling from a PWV1 file header or from a packet that starts with a start of frame header |
-| `emberwave_context_create`, `_destroy`, `_adapter`, `_info` | Choose a GPU (backends, software only), name it, and describe it: backend, kind of device, PCI vendor and device, and which call made the context |
+| `emberwave_context_create`, `_destroy`, `_adapter`, `_info` | Choose a GPU (backends, software only), name it, and describe it: backend, kind of device, PCI vendor and device, which call made the context, and capability flags such as `EMBERWAVE_CONTEXT_FEATURE_PLANE_R16` |
 | `emberwave_decoder_create`, `_destroy`, `_info` | One decoder per picture size and chroma format; the sizes of its planes |
 | `emberwave_decoder_push_packet`, `_is_ready`, `_reception`, `_clear`, `_set_partial_share` | Feed packets as they arrive; ask whether the frame, or enough of it, is there; set the share of its blocks a frame decoded in part needs (D59); how many blocks of the frame arrived, of how many |
 | `emberwave_decoder_decode_yuv`, `_decode_rgb` | Decode and copy the planes, or RGB, into the caller's memory, row by row with the caller's strides |
 | `emberwave_texture_create`, `_destroy`, `emberwave_decoder_decode_texture` | A texture of the picture's size, RGBA or BGRA, on the decoder's device, and a decode that draws the RGB picture into it and waits |
-| `emberwave_texture_create_plane`, `emberwave_decoder_decode_plane_textures` | A one-channel texture for the Y, the Cb or the Cr plane, and a decode that puts the planes into three and waits: on Metal it stores them there, elsewhere it copies them in (D52) |
+| `emberwave_texture_create_plane`, `_with_format`, `emberwave_decoder_decode_plane_textures` | A one-channel texture for the Y, the Cb or the Cr plane (`EMBERWAVE_PLANE_FORMAT_R8` by default, or `_R16` where supported), and a decode that puts the planes into three and waits: `R8` stores on Metal and copies elsewhere (D52); `R16` stores directly from the inverse transform (D76) |
 | `emberwave_texture_metal`, `emberwave_context_metal_device` | The `id<MTLTexture>` and `id<MTLDevice>` behind a texture and a context, borrowed, or `NULL` off Metal |
 | `emberwave_context_create_metal`, `emberwave_decoder_submit_texture_metal`, `_submit_plane_textures_metal` | A context on the client's own Metal device and queue, and decodes into textures that return without waiting, which only such a context takes |
 | `emberwave_texture_from_metal`, `_from_metal_plane` | The client's own `id<MTLTexture>`, such as a `CVPixelBuffer`'s, as a texture every decode above fills |
@@ -1931,4 +1932,47 @@ The last frame's detail, always, gains everything on a still picture and loses u
 **Risks.** The hidden surface drifts between the two crates; the tests' relative paths to `testdata` stay valid, as the new crate sits at the same depth; rustdoc links from `cpu` to `gpu` become plain text; the move is large (about 14,000 lines) but mechanical, which `git mv` keeps in the history; a published `emberwave-core` 0.18.1 has the `gpu` feature that later versions do not, which no known user has used.
 
 **Consequence.** The checklist item "stable C and Rust APIs" in the README can close when the library's name carries its version and the split has landed, or earlier, if the maintainer decides to ship 1.0 with option 1's plain statement instead; the data above is what that choice would weigh. No code moves with this entry.
+
+### 2026-11-22 — D76: 16-bit normalised (`R16Unorm`) decoded plane output for 10-bit pictures
+
+**Context.** PyroWave bitstreams carry floating-point wavelet coefficients without a fixed bit depth in the coded blocks (`reference_bit_depth` in the PWV1 header records the source depth). Inside the decoder, the inverse DWT produces `[0.0, 1.0]` samples in `f32`, which D41 and D52 quantise to 8-bit `R8Unorm` planes. Clients displaying 10-bit HDR or P010-style streams (on Vulkan/Android devices such as NVIDIA Shield TV / Tegra X1, as well as Metal and Direct3D 12) need more than 8 bits per sample before their own colour conversion and tone mapping, without breaking the portable 8-bit WebGPU path.
+
+**Decision.**
+- **Rust (`emberwave-core`)**:
+  - `emberwave_core::cpu::unorm16(sample: f32) -> u16` and `Plane::to_unorm16(&self) -> Vec<u16>` provide the CPU reference conversion.
+  - `emberwave_core::gpu` adds `PLANE_FORMAT_R16` (`wgpu::TextureFormat::R16Unorm`) and `PLANE_FORMATS` (`[PLANE_FORMAT, PLANE_FORMAT_R16]`), keeping `PLANE_FORMAT` (`TextureFormat::R8Unorm`) as the default.
+  - `GpuError::Unsupported(String)` reports operations that require an optional GPU feature missing from the device.
+  - `GpuContext::supports_plane_format(&self, format: wgpu::TextureFormat) -> bool` and `Decoder::supports_plane_format(&self, format: wgpu::TextureFormat) -> bool` report whether a plane format is available (`PLANE_FORMAT` is always `true`; `PLANE_FORMAT_R16` requires device support).
+  - `Decoder::create_plane_texture_with_format(&self, component: Component, format: wgpu::TextureFormat) -> Result<wgpu::Texture, GpuError>` creates a plane texture in the requested format (`create_plane_texture` stays `R8Unorm`), with `STORAGE_BINDING`, `TEXTURE_BINDING` and `COPY_SRC` for `PLANE_FORMAT_R16`.
+  - Existing plane-texture decode methods (`Decoder::record_to_plane_textures`, `decode_assembled_to_plane_textures`, `submit_assembled_to_plane_textures`, `submit_assembled_to_plane_textures_with`) accept either three `R8Unorm` views or three `R16Unorm` views, and reject mixed formats.
+- **Direct shader write**: `idwt_planes_r16.wgsl` (behind `idwt.wgsl`, exposed internally as `shader_sources::IDWT_PLANES_R16`) writes 16-bit levels straight from the final inverse DWT level into `texture_storage_2d<r16unorm, write>`, avoiding a full-frame conversion pass and a packed 16-bit buffer copy. The pipeline (`R16PlanePipeline`) is compiled lazily per `GpuContext` on the first R16 decode so 8-bit callers pay no extra shader compilation cost.
+- **C API (`emberwave-ffi`)**:
+  - Constants `EMBERWAVE_PLANE_FORMAT_R8` (`0`, default), `EMBERWAVE_PLANE_FORMAT_R16` (`1`), and `EMBERWAVE_CONTEXT_FEATURE_PLANE_R16` (`1 << 0`).
+  - `EmberwaveContextInfo` gains an append-only `uint32_t features;` member at the end (`FIRST_SIZE` remains 24 bytes per D69), with `EMBERWAVE_CONTEXT_FEATURE_PLANE_R16` set when `R16Unorm` plane output is supported.
+  - `emberwave_texture_create_plane_with_format(decoder, plane, format, &texture)` creates a plane texture in the chosen format (`emberwave_texture_create_plane` stays R8 default).
+  - Caller-owned plane wrappers accept R8 or R16:
+    - `emberwave_texture_from_vulkan_plane`: `VK_FORMAT_R8_UNORM` (needs `VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT`) or `VK_FORMAT_R16_UNORM` (needs `VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT`; `TRANSFER_DST_BIT` is not needed). Returns `EMBERWAVE_STATUS_UNSUPPORTED` if the device lacks R16 plane support.
+    - `emberwave_texture_from_metal_plane`: `MTLPixelFormatR8Unorm` or `MTLPixelFormatR16Unorm` (needs `MTLTextureUsageShaderWrite`).
+    - `emberwave_texture_from_d3d12_plane`: `DXGI_FORMAT_R8_UNORM` or `DXGI_FORMAT_R16_UNORM` (needs `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS` / `D3D11_BIND_UNORDERED_ACCESS`).
+  - Encoder sources (`emberwave_texture_from_*_source`) remain 8-bit (`R8Unorm`) only.
+
+**Conversion and rounding contract.**
+- The decoder's inverse DWT adds `DC_SHIFT` (`0.5`) and clamps to `[0.0, 1.0]`.
+- 16-bit UNORM mapping is `round_ties_even(clamp(v, 0.0, 1.0) * 65535.0)` (`u16` in `0..=65535`).
+- Key values: `0.0 -> 0`, `1/1023 -> 64`, `0.5 -> 32768` (ties to even from `32767.5`), `512/1023 -> 32800`, `1.0 -> 65535`. Every 10-bit code level `c` in `0..=1023` (`c / 1023.0`) maps to a distinct `u16` and round-trips to `c` via `round_ties_even((u16 as f32 / 65535.0) * 1023.0)`.
+- `idwt_planes_r16.wgsl` quantises in the shader with `to_unorm16(v) = round(clamp(v, 0.0, 1.0) * 65535.0)` and stores `level / 65535.0` into `texture_storage_2d<r16unorm, write>`. Pre-rounding in WGSL guarantees ties-to-even agreement with CPU `unorm16` across GPU backends instead of relying on hardware float-to-UNORM rounding rules.
+
+**Capability and Vulkan requirements.**
+- R16 plane output uses wgpu's `Features::TEXTURE_FORMAT_16BIT_NORM`, which in wgpu 30.0.2 guarantees `STORAGE_WRITE_ONLY` on `R16Unorm` without `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`. `GpuContext::device_descriptor` requests it when the adapter supports it (`TEXTURE_FORMAT_16BIT_NORM` and `R16Unorm` `STORAGE_BINDING | TEXTURE_BINDING | COPY_SRC` with `STORAGE_WRITE_ONLY`) and `strict_webgpu` is false.
+- `IDWT_PLANES_R16` is excluded from the portable `shader_sources::ALL` suite; `tests/shaders.rs` verifies that it fails validation with `Capabilities::empty()` and passes with `naga::valid::Capabilities::STORAGE_TEXTURE_16BIT_NORM_FORMATS`.
+- On unsupported devices, `supports_plane_format(PLANE_FORMAT_R16)` returns `false` and `EmberwaveContextInfo.features` omits `EMBERWAVE_CONTEXT_FEATURE_PLANE_R16`. Requesting R16 plane creation, wrapping, or decoding fails explicitly (`GpuError::Unsupported` / `EMBERWAVE_STATUS_UNSUPPORTED`) and never silently falls back to 8-bit. The portable 8-bit (`R8Unorm`) path continues to work unchanged, including under `strict_webgpu`.
+- On Vulkan (verified against wgpu 30.0.2 `wgpu-hal` and Vulkan 1.0–1.3, where `OpCapability StorageImageExtendedFormats` is core in Vulkan 1.0), enabling `TEXTURE_FORMAT_16BIT_NORM` requires **no** additional Vulkan device extensions and **no** additional `VkPhysicalDeviceFeatures` bits beyond what `emberwave_vulkan_requirements_create` already advertises. wgpu exposes the feature when the physical device supports optimal-tiling `SAMPLED_IMAGE | STORAGE_IMAGE | TRANSFER_SRC | TRANSFER_DST` for all six 16-bit normalised formats (`R16`, `R16G16`, and `R16G16B16A16` in `UNORM` and `SNORM`).
+- Caller-owned R16 Vulkan images must be `VK_FORMAT_R16_UNORM`, 2D, 1 mip level, 1 array layer, 1 sample, optimal tiling, exclusive queue-family sharing, with `VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT`; decodes leave them in `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`. This enables 10-bit HDR and P010-style clients on Vulkan/Android (such as NVIDIA Shield TV / Tegra X1) through the existing caller-owned `VkDevice` path without device-specific branches.
+
+**Not done.**
+- Packed 16-bit CPU plane readback (`Frame` and `emberwave_decoder_decode_yuv` stay 8-bit) and 16-bit `yuv2rgb.wgsl` conversion.
+- 10-bit or 16-bit encoder input textures (`emberwave_texture_from_*_source` and `TexturePicture` stay 8-bit).
+- Measured decode timings on 10-bit Vulkan/Android hardware.
+
+**Consequence.** Clients on Vulkan, Metal, and Direct3D 12 whose devices support `R16Unorm` storage writes can decode straight into 16-bit normalised Y, Cb, and Cr textures for 10-bit display pipelines without extra passes or packed copies, while 8-bit and strict WebGPU callers incur no extra shader compilation or capability requirements.
 
