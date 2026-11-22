@@ -1971,8 +1971,39 @@ The last frame's detail, always, gains everything on a still picture and loses u
 
 **Not done.**
 - Packed 16-bit CPU plane readback (`Frame` and `emberwave_decoder_decode_yuv` stay 8-bit) and 16-bit `yuv2rgb.wgsl` conversion.
-- 10-bit or 16-bit encoder input textures (`emberwave_texture_from_*_source` and `TexturePicture` stay 8-bit).
+- 10-bit or 16-bit encoder input textures (`emberwave_texture_from_*_source` and `TexturePicture` stay 8-bit; added in D77).
 - Measured decode timings on 10-bit Vulkan/Android hardware.
 
 **Consequence.** Clients on Vulkan, Metal, and Direct3D 12 whose devices support `R16Unorm` storage writes can decode straight into 16-bit normalised Y, Cb, and Cr textures for 10-bit display pipelines without extra passes or packed copies, while 8-bit and strict WebGPU callers incur no extra shader compilation or capability requirements.
+
+### 2026-11-22 — D77: 10-bit / 16-bit UNORM and P010 encoded input support
+
+**Context.** D76 added 16-bit normalised (`R16Unorm`) decoded plane output so 10-bit and HDR streams keep more than 8 bits out of the decoder, while the encoder still took 8-bit inputs (`u8` planes, `R8Unorm`, NV12 `R8Unorm` + `Rg8Unorm`, and 8-bit RGB). Hosts capturing 10-bit HDR video on macOS (`kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange` / `FullRange`, P010), Windows (DXGI P010 / `R16_UNORM` + `R16G16_UNORM`), and Linux/Vulkan (`VK_FORMAT_R16_UNORM` + `VK_FORMAT_R16G16_UNORM`) need a 10-bit / 16-bit UNORM path into the encoder without quantising to 8 bits first, while keeping the 8-bit path bit-for-bit identical and portable under strict WebGPU.
+
+**Decision.**
+- **P010 included alongside 3-plane `R16Unorm`.** P010 stores 10-bit samples in the upper 10 bits of little-endian 16-bit unsigned words (`c << 6`), with luma in `R16Unorm` and interleaved Cb/Cr in `Rg16Unorm`. That matches emberwave's existing `TexturePicture::LumaChroma` and `EMBERWAVE_PLANE_CBCR` design (D32, D62), uses the same `gather_r16.wgsl` shader via `GatherParams.channel` (0 = red, 1 = green), and requires no extra Vulkan extensions or `VkPhysicalDeviceFeatures` beyond wgpu's `Features::TEXTURE_FORMAT_16BIT_NORM` (which already requires optimal-tiling `SAMPLED_IMAGE` for both `R16Unorm` and `Rg16Unorm`).
+- **Float and UNORM conversion contract.**
+  - CPU (`encode::fdwt::sample_level_u16`) and GPU (`fdwt.wgsl` at `is_plane == 2u`) map every `u16` sample `s` to `f32(s) / 65535.0 - 0.5`. This is the exact inverse of D76's `unorm16(v) = round_ties_even(clamp(v, 0.0, 1.0) * 65535.0)` and handles both full-range 16-bit UNORM (`unorm16(c / 1023.0)`) and P010 upper-10-bit values (`c << 6`) cleanly without separate scale modes.
+  - `gather_r16.wgsl` samples `R16Unorm` and `Rg16Unorm` via 2x2 `textureGather` and recovers exact 16-bit integers with `vec4<u32>(round(saturate(texel) * 65535.0))`, which round-trips all 65,536 `u16` values (`0..=65535`) without error.
+  - Packing: two `u16` samples per `u32` word (even column in low 16 bits, odd column in high 16 bits, trailing odd column zero-padded), row stride `ceil(width / 2)` words (`Planes16Layout`). On little-endian hosts this matches raw LE `u16` bytes directly, so 3-plane `R16Unorm` textures, P010 (`R16Unorm` + `Rg16Unorm`) textures, and CPU `u16` uploads fill the exact same `planes16` buffer word-for-word and encode to identical bitstreams byte-for-byte.
+- **Portable WGSL and lazy allocation.**
+  - Both `gather_r16.wgsl` and the `is_plane == 2u` branch in `fdwt.wgsl` validate under `naga::valid::Capabilities::empty()` and belong to `shader_sources::ALL` (now 12 shaders). `gather_r16.wgsl` uses 0 bytes of workgroup memory and one 2x2 `textureGather` per invocation to write two consecutive rows' `u32` words.
+  - `Planes16Resources` (the packed 16-bit planes buffer, optional staging upload buffer, gather uniforms, and 5 `fdwt` bind groups) is allocated lazily on the first 16-bit encode and reused across frames; `GatherR16Pipeline` is compiled lazily per `GpuContext` on the first 16-bit texture encode. 8-bit callers pay zero extra GPU memory or pipeline compilation cost.
+  - CPU 16-bit encoding (`encode_u16`, `encode_u16_strided`, `encode_u16_le_strided`, `encode_u16_timed`, and `emberwave_encoder_encode_u16`) uses only storage buffers and works on every GPU context, including `strict_webgpu` contexts without `TEXTURE_FORMAT_16BIT_NORM`.
+- **Rust (`emberwave-core`)**:
+  - CPU encoder: `encode::Encoder::encode_u16(&mut self, planes: [&[u16]; 3], budget: usize) -> Result<Vec<u8>, EncodeError>`, `encode::Encoder::transform_u16`, `encode::coefficient_error_u16`.
+  - GPU encoder: `CHROMA_FORMAT_RG16` (`wgpu::TextureFormat::Rg16Unorm`), `GpuContext::supports_source_format`, `Encoder::supports_source_format`, `Encoder::encode_u16`, `encode_u16_strided`, `encode_u16_le_strided`, `encode_u16_timed`.
+  - `TexturePicture::Planes` accepts three `R8Unorm` or three `R16Unorm` views; `TexturePicture::LumaChroma` accepts `(R8Unorm, Rg8Unorm)` or `(R16Unorm, Rg16Unorm)`. Mixing 8-bit and 16-bit views fails with `GpuError::Texture`. Requesting 16-bit / P010 textures on a device lacking `TEXTURE_FORMAT_16BIT_NORM` fails explicitly with `GpuError::Unsupported` rather than downsampling to 8-bit.
+- **C API (`emberwave-ffi`)**:
+  - Constant `EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16` (`1 << 1`) in `EmberwaveContextInfo.features` (set when both `R16Unorm` and `Rg16Unorm` source textures are supported).
+  - `emberwave_encoder_encode_u16(encoder, y, cb, cr, frame, budget, size)` accepts little-endian 16-bit samples in `EmberwaveSourcePlane` with byte strides (at least `2 * width` bytes) and byte sizes (at least `stride * (height - 1) + 2 * width`).
+  - `emberwave_texture_from_{vulkan,metal,d3d12}_source` accept `R16_UNORM` for `EMBERWAVE_PLANE_{Y,CB,CR}` and `R16G16_UNORM` / `RG16Unorm` for `EMBERWAVE_PLANE_CBCR`, returning `EMBERWAVE_STATUS_UNSUPPORTED` when the device lacks `TEXTURE_FORMAT_16BIT_NORM`.
+  - Decoded `R16Unorm` plane textures from `emberwave_texture_create_plane_with_format` or `emberwave_texture_from_*_plane` can be passed directly into `emberwave_encoder_encode_textures` (and `_vulkan` / `_d3d12`) for GPU transcoding.
+
+**Not done.**
+- Single-resource multi-planar `DXGI_FORMAT_P010` or `DXGI_FORMAT_NV12` imports (callers on Direct3D pass separate `DXGI_FORMAT_R16_UNORM` and `DXGI_FORMAT_R16G16_UNORM` shared plane textures, as with NV12).
+- 10-bit or half-float RGB encoder conversion (`Rgb10a2Unorm` / `Rgba16Float` in `gather_rgb.wgsl`).
+- `emberwave-cli` 10-bit Y4M (`C420p10` / `C444p10`) CLI flags and benchmarks on Apple silicon / discrete GPUs.
+
+**Consequence.** Hosts and transcoders can encode 10-bit / 16-bit UNORM and P010 pictures from CPU memory or GPU textures across Vulkan, Metal, and Direct3D 12 and round-trip them through D76's `R16Unorm` decoder plane output with >10-bit gradient fidelity, while keeping 8-bit encoding bit-for-bit identical and strict-WebGPU portable.
 
