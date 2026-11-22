@@ -1413,7 +1413,8 @@ fn context_info_keeps_first_size_and_reports_plane_r16_feature() {
             "{}",
             last_error()
         );
-        assert_eq!(full.features & !EMBERWAVE_CONTEXT_FEATURE_PLANE_R16, 0);
+        let known = EMBERWAVE_CONTEXT_FEATURE_PLANE_R16 | EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16;
+        assert_eq!(full.features & !known, 0);
 
         let rust_context = GpuContext::new(&GpuOptions::from_env().unwrap_or_default()).unwrap();
         let expected_r16 =
@@ -1421,6 +1422,13 @@ fn context_info_keeps_first_size_and_reports_plane_r16_feature() {
         assert_eq!(
             full.features & EMBERWAVE_CONTEXT_FEATURE_PLANE_R16 != 0,
             expected_r16
+        );
+        let expected_source_r16 = rust_context
+            .supports_source_format(emberwave_core::gpu::PLANE_FORMAT_R16)
+            && rust_context.supports_source_format(emberwave_core::gpu::CHROMA_FORMAT_RG16);
+        assert_eq!(
+            full.features & EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16 != 0,
+            expected_source_r16
         );
 
         // A caller built with the 0.17 layout passes struct_size = 24 (6 u32s):
@@ -1663,7 +1671,8 @@ fn plane_textures_with_format_match_r8_support_r16_and_reject_bad_uses() {
                 last_error()
             );
 
-            // Passing an R16 plane texture to emberwave_encoder_encode_textures fails.
+            // Mixing R16 and R8 plane textures in emberwave_encoder_encode_textures fails,
+            // while encoding all three decoded R16 plane textures succeeds when SOURCE_R16 is set.
             let mut tmp_encoded = vec![0u8; 64 * 1024];
             let mut size = 0usize;
             assert_eq!(
@@ -1678,6 +1687,23 @@ fn plane_textures_with_format_match_r8_support_r16_and_reject_bad_uses() {
                 ),
                 EmberwaveStatus::InvalidArgument
             );
+            if ctx_info.features & EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16 != 0 {
+                assert_eq!(
+                    emberwave_encoder_encode_textures(
+                        encoder,
+                        r16[0],
+                        r16[1],
+                        r16[2],
+                        tmp_encoded.as_mut_ptr(),
+                        tmp_encoded.len(),
+                        &mut size
+                    ),
+                    EmberwaveStatus::Ok,
+                    "{}",
+                    last_error()
+                );
+                assert!(size > 8);
+            }
 
             for texture in r16 {
                 emberwave_texture_destroy(texture);

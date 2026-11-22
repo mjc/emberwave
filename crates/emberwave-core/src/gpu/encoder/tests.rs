@@ -99,8 +99,8 @@ impl Encoder {
     fn run_stages(&self, transform: bool) {
         self.run(|this, encoder| {
             if transform {
-                this.encode_upload(encoder);
-                this.encode_transform(encoder, None, None);
+                this.encode_upload(encoder, false);
+                this.encode_transform(encoder, None, false, None);
             }
             this.encode_quantisation(encoder, None);
         });
@@ -702,7 +702,7 @@ fn gathering_textures_writes_the_words_of_the_upload() {
         }
         let bytes = gpu.buffers.packed_words * 4;
         gpu.upload_planes(as_slices(&planes), None).unwrap();
-        gpu.run(|this, encoder| this.encode_upload(encoder));
+        gpu.run(|this, encoder| this.encode_upload(encoder, false));
         let uploaded = gpu.read_buffer(&gpu.planes, 0, bytes);
 
         let sizes = Component::ALL.map(|component| layout.plane_size(component));
@@ -739,8 +739,9 @@ fn gathering_textures_writes_the_words_of_the_upload() {
             // A pattern where the gather must write, padding included.
             gpu.queue
                 .write_buffer(&gpu.planes, 0, &vec![0xab; bytes as usize]);
-            let gather = gpu.gather(picture).unwrap();
-            gpu.run(|this, encoder| this.encode_transform(encoder, Some(&gather), None));
+            let (gather, is_16bit) = gpu.gather(picture).unwrap();
+            assert!(!is_16bit);
+            gpu.run(|this, encoder| this.encode_transform(encoder, Some(&gather), false, None));
             let gathered = gpu.read_buffer(&gpu.planes, 0, bytes);
             assert!(
                 gathered == uploaded,
@@ -829,7 +830,7 @@ fn gathering_rgb_writes_the_words_of_its_converted_planes() {
             .unwrap();
             let bytes = gpu.buffers.packed_words * 4;
             gpu.upload_planes(as_slices(&planes), None).unwrap();
-            gpu.run(|this, encoder| this.encode_upload(encoder));
+            gpu.run(|this, encoder| this.encode_upload(encoder, false));
             let uploaded = gpu.read_buffer(&gpu.planes, 0, bytes);
 
             let bgra = rgb_picture(width, height, 4 * width as usize, RgbOrder::Bgra, seed);
@@ -857,8 +858,9 @@ fn gathering_rgb_writes_the_words_of_its_converted_planes() {
             for (name, view) in &views {
                 gpu.queue
                     .write_buffer(&gpu.planes, 0, &vec![0xab; bytes as usize]);
-                let gather = gpu.gather(TexturePicture::Rgb(view)).unwrap();
-                gpu.run(|this, encoder| this.encode_transform(encoder, Some(&gather), None));
+                let (gather, is_16bit) = gpu.gather(TexturePicture::Rgb(view)).unwrap();
+                assert!(!is_16bit);
+                gpu.run(|this, encoder| this.encode_transform(encoder, Some(&gather), false, None));
                 let gathered = gpu.read_buffer(&gpu.planes, 0, bytes);
                 assert!(
                     gathered == uploaded,
@@ -889,5 +891,273 @@ fn planes_go_where_the_shaders_read_them_where_memory_is_shared() {
             .usage()
             .contains(wgpu::BufferUsages::MAP_WRITE),
         context.shares_uploads()
+    );
+}
+
+/// A 16-bit UNORM picture with flat regions, 10-bit gradients, sharp edges,
+/// fine texture, and 16-bit noise.
+fn picture_u16(layout: &FrameLayout, seed: u32) -> [Vec<u16>; 3] {
+    let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+    let mut random = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    Component::ALL.map(|component| {
+        let (width, height) = layout.plane_size(component);
+        let phase = component.index() as f32;
+        (0..width * height)
+            .map(|i| {
+                let (x, y) = (i % width, i / width);
+                let (fx, fy) = (x as f32 / width as f32, y as f32 / height as f32);
+                match (4 * x / width, 2 * y / height) {
+                    (0, 0) => ((90 + 20 * component.index() as u32) << 8) as u16,
+                    (1, 0) => crate::cpu::unorm16((0.1 + 0.8 * fx * fy).clamp(0.0, 1.0)),
+                    (2, 0) => {
+                        let code = if (x / 3 + y / 5) % 2 == 0 {
+                            64u16
+                        } else {
+                            940u16
+                        };
+                        code << 6
+                    }
+                    (3, 0) => crate::cpu::unorm16(
+                        (0.5 + 0.25 * ((x as f32 * 0.9 + phase).sin() * (y as f32 * 0.7).cos()))
+                            .clamp(0.0, 1.0),
+                    ),
+                    (0 | 1, _) => crate::cpu::unorm16(
+                        (0.5 + 0.4 * (fx * 7.0 + fy * 3.0 + phase).sin()).clamp(0.0, 1.0),
+                    ),
+                    _ => (random() >> 16) as u16,
+                }
+            })
+            .collect()
+    })
+}
+
+fn as_slices_u16(planes: &[Vec<u16>; 3]) -> [&[u16]; 3] {
+    [&planes[0], &planes[1], &planes[2]]
+}
+
+fn psnr_u16(reference: &[u16], test: &[u16]) -> f64 {
+    let squared: f64 = reference
+        .iter()
+        .zip(test)
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+        .sum();
+    let mse = squared / reference.len() as f64;
+    10.0 * (65535.0 * 65535.0 / mse.max(1e-12)).log10()
+}
+
+fn quality_u16(layout: &FrameLayout, planes: &[Vec<u16>; 3], frame: &[u8]) -> f64 {
+    let mut assembler = FrameAssembler::new(layout.clone());
+    assembler
+        .push_packet(frame)
+        .expect("the decoder takes the frame");
+    assert!(assembler.is_ready(false));
+    let decoded = decode_frame(&assembler.frame()).expect("the frame decodes");
+    let decoded: Vec<u16> = decoded
+        .planes
+        .iter()
+        .flat_map(|plane| plane.to_unorm16())
+        .collect();
+    psnr_u16(&planes.concat(), &decoded)
+}
+
+#[test]
+fn the_16bit_forward_transform_matches_the_cpu() {
+    let Some(context) = test_context() else {
+        return;
+    };
+    const TOLERANCE: f32 = 1e-5;
+    let mut worst = 0.0f32;
+    let mut compared = 0usize;
+
+    for (width, height, chroma) in SHAPES {
+        let mut gpu = Encoder::new(context, width, height, chroma, Signalling::default()).unwrap();
+        let cpu = CpuEncoder::new(width, height, chroma, Signalling::default()).unwrap();
+        let planes = picture_u16(gpu.layout(), width ^ height);
+        gpu.upload_planes_u16(as_slices_u16(&planes), None).unwrap();
+        gpu.run(|this, encoder| {
+            this.encode_upload(encoder, true);
+            this.encode_transform(encoder, None, true, None);
+        });
+        let bands = cpu.transform_u16(as_slices_u16(&planes));
+
+        for (component, level, band, expected) in sent_bands(&bands) {
+            let actual = gpu.read_band(component, level, band);
+            assert_eq!(actual.len(), expected.len());
+            for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+                let difference = (a - e).abs() / e.abs().max(1.0);
+                worst = worst.max(difference);
+                assert!(
+                    difference <= TOLERANCE,
+                    "{width}x{height} {chroma:?} {component:?} level {level} {band:?} \
+                     coefficient {i}: GPU {a}, CPU {e}"
+                );
+            }
+            compared += actual.len();
+        }
+    }
+    assert!(
+        compared > 1_000_000,
+        "only {compared} coefficients compared"
+    );
+    println!("largest 16-bit difference to the CPU in any coefficient: {worst:e}");
+}
+
+#[test]
+fn gathering_16bit_and_p010_textures_writes_the_words_of_the_upload() {
+    let Some(context) = test_context() else {
+        return;
+    };
+    if !context.supports_source_format(PLANE_FORMAT_R16)
+        || !context.supports_source_format(CHROMA_FORMAT_RG16)
+    {
+        return;
+    }
+
+    // Include 256x256 4:4:4 to exhaustively test all 65,536 u16 values
+    // (0..=65535) through R16Unorm and Rg16Unorm textureGather rounding.
+    let shapes = SHAPES.into_iter().chain([(256, 256, Yuv444)]);
+    for (width, height, chroma) in shapes {
+        let mut gpu = Encoder::new(context, width, height, chroma, Signalling::default()).unwrap();
+        let layout = gpu.layout.clone();
+        let mut planes = picture_u16(&layout, width ^ height);
+        if (width, height) == (256, 256) {
+            for (component, plane) in Component::ALL.into_iter().zip(&mut planes) {
+                let shift = 21_845 * component.index();
+                for (i, sample) in plane.iter_mut().enumerate() {
+                    *sample = ((i + shift) & 0xffff) as u16;
+                }
+            }
+        } else {
+            // Embed extreme values, P010 levels, and 10-bit unorm16 levels.
+            for (component, plane) in Component::ALL.into_iter().zip(&mut planes) {
+                let specials: [u16; 8] = [
+                    0,
+                    1,
+                    64 << 6,
+                    crate::cpu::unorm16(512.0 / 1023.0),
+                    940 << 6,
+                    1023 << 6,
+                    65534,
+                    65535,
+                ];
+                for (i, sample) in plane.iter_mut().enumerate().take(specials.len()) {
+                    *sample = specials[(i + component.index()) % specials.len()];
+                }
+            }
+        }
+
+        gpu.upload_planes_u16(as_slices_u16(&planes), None).unwrap();
+        gpu.run(|this, encoder| this.encode_upload(encoder, true));
+        let bytes = gpu.planes16.as_ref().unwrap().layout.packed_words * 4;
+        let uploaded = gpu.read_buffer(&gpu.planes16.as_ref().unwrap().planes, 0, bytes);
+
+        let sizes = Component::ALL.map(|component| layout.plane_size(component));
+        let plane_bytes: Vec<Vec<u8>> = planes
+            .iter()
+            .map(|plane| plane.iter().flat_map(|s| s.to_le_bytes()).collect())
+            .collect();
+        let textures: Vec<wgpu::Texture> = (0..3)
+            .map(|i| texture_of(&gpu, PLANE_FORMAT_R16, sizes[i], &plane_bytes[i]))
+            .collect();
+        let views: Vec<wgpu::TextureView> = textures
+            .iter()
+            .map(|texture| texture.create_view(&Default::default()))
+            .collect();
+        let interleaved: Vec<u8> = planes[1]
+            .iter()
+            .zip(&planes[2])
+            .flat_map(|(&cb, &cr)| {
+                let [cb0, cb1] = cb.to_le_bytes();
+                let [cr0, cr1] = cr.to_le_bytes();
+                [cb0, cb1, cr0, cr1]
+            })
+            .collect();
+        let chroma_texture = texture_of(&gpu, CHROMA_FORMAT_RG16, sizes[1], &interleaved);
+        let chroma_view = chroma_texture.create_view(&Default::default());
+
+        let pictures = [
+            (
+                "r16 planes",
+                TexturePicture::Planes([&views[0], &views[1], &views[2]]),
+            ),
+            (
+                "p010 luma and chroma",
+                TexturePicture::LumaChroma {
+                    luma: &views[0],
+                    chroma: &chroma_view,
+                },
+            ),
+        ];
+        for (name, picture) in pictures {
+            gpu.queue.write_buffer(
+                &gpu.planes16.as_ref().unwrap().planes,
+                0,
+                &vec![0xab; bytes as usize],
+            );
+            let (gather, is_16bit) = gpu.gather(picture).unwrap();
+            assert!(is_16bit);
+            gpu.run(|this, encoder| this.encode_transform(encoder, Some(&gather), true, None));
+            let gathered = gpu.read_buffer(&gpu.planes16.as_ref().unwrap().planes, 0, bytes);
+            assert!(
+                gathered == uploaded,
+                "{width}x{height} {chroma:?} {name}: {} of {bytes} bytes differ",
+                gathered
+                    .iter()
+                    .zip(&uploaded)
+                    .filter(|(a, b)| a != b)
+                    .count()
+            );
+        }
+    }
+}
+
+#[test]
+fn frames_u16_are_the_cpu_encoders_or_as_good() {
+    let Some(context) = test_context() else {
+        return;
+    };
+    let (mut frames, mut identical, mut worst) = (0, 0, 0.0f64);
+    for (width, height, chroma) in SHAPES {
+        let mut gpu = Encoder::new(context, width, height, chroma, Signalling::default()).unwrap();
+        let mut cpu = CpuEncoder::new(width, height, chroma, Signalling::default()).unwrap();
+        let samples = gpu.layout().plane_size(Component::Y).0 as usize
+            * gpu.layout().plane_size(Component::Y).1 as usize;
+        for (seed, bytes_per_sample) in [(31, 2.0), (32, 0.4), (33, 0.1), (34, 0.02)] {
+            let planes = picture_u16(gpu.layout(), seed);
+            let Err(EncodeError::BudgetTooSmall { minimum, .. }) =
+                cpu.encode_u16(as_slices_u16(&planes), 0)
+            else {
+                panic!("no frame fits no bytes");
+            };
+            let budget = minimum + 64 + (samples as f64 * bytes_per_sample) as usize;
+            let expected = cpu
+                .encode_u16(as_slices_u16(&planes), budget)
+                .expect("the frame fits");
+            let actual = gpu
+                .encode_u16(as_slices_u16(&planes), budget)
+                .expect("the frame fits");
+            assert!(actual.len() <= budget);
+            frames += 1;
+            if actual == expected {
+                identical += 1;
+                continue;
+            }
+            let (cpu_db, gpu_db) = (
+                quality_u16(gpu.layout(), &planes, &expected),
+                quality_u16(gpu.layout(), &planes, &actual),
+            );
+            worst = worst.max(cpu_db - gpu_db);
+        }
+    }
+    println!("16-bit: {identical} of {frames} frames identical; worst loss {worst:.4} dB");
+    assert_eq!(frames, SHAPES.len() * 4);
+    assert!(
+        worst < 0.05,
+        "the GPU's 16-bit frames are {worst:.3} dB worse"
     );
 }

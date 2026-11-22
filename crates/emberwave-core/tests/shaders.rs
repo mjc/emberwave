@@ -111,7 +111,7 @@ fn the_workgroup_variables_are_the_ones_checked_for_writes_before_reads() {
         ("block8_plane_bytes", 64),
         ("block8_signs", 64),
     ];
-    let lists: [(&str, Vec<Variable>); 11] = [
+    let lists: [(&str, Vec<Variable>); 12] = [
         ("dequant", dequant.to_vec()),
         (
             "conceal",
@@ -120,6 +120,7 @@ fn the_workgroup_variables_are_the_ones_checked_for_writes_before_reads() {
         ("idwt", idwt.to_vec()),
         ("yuv2rgb", Vec::new()),
         ("gather", Vec::new()),
+        ("gather_r16", Vec::new()),
         ("gather_rgb", Vec::new()),
         ("fdwt", fdwt.to_vec()),
         ("equant", [quantise, equant].concat()),

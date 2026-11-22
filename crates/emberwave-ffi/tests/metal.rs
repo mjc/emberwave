@@ -1855,3 +1855,145 @@ fn an_encode_on_the_app_queue_reads_what_the_app_committed_before() {
         emberwave_context_destroy(context);
     }
 }
+
+#[test]
+fn the_apps_own_16bit_and_p010_textures_encode_as_u16_memory() {
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        assert!(
+            std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
+            "no Metal device"
+        );
+        return;
+    };
+    let queue = device.newCommandQueue().expect("a command queue");
+    let context = metal_context(&device, &queue).0;
+    let mut info = EmberwaveContextInfo::default();
+    // SAFETY: live context and valid struct.
+    let status = unsafe { emberwave_context_info(context, &mut info) };
+    assert_eq!(status, EmberwaveStatus::Ok);
+    if info.features & EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16 == 0 {
+        // SAFETY: live context.
+        unsafe { emberwave_context_destroy(context) };
+        return;
+    }
+
+    for (size, chroma, code) in [
+        ((192, 136), (96, 68), EMBERWAVE_CHROMA_420),
+        ((131, 67), (131, 67), EMBERWAVE_CHROMA_444),
+    ] {
+        let usage = MTLTextureUsage::ShaderRead;
+        let r16 = |s| app_texture(&device, MTLPixelFormat::R16Unorm, s, usage, false);
+        let planes_mtl = [r16(size), r16(chroma), r16(chroma)];
+        let chroma_mtl = app_texture(&device, MTLPixelFormat::RG16Unorm, chroma, usage, false);
+
+        let memory = encoder_of(context, size, code);
+        let as_planes = encoder_of(context, size, code);
+        let as_p010 = encoder_of(context, size, code);
+        let plane_ids = [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR];
+        let [y, cb, cr] =
+            [0, 1, 2].map(|i| source(as_planes, plane_ids[i], &planes_mtl[i]).unwrap());
+        let cbcr = source(as_p010, EMBERWAVE_PLANE_CBCR, &chroma_mtl).unwrap();
+
+        let picture_u16: [Vec<u16>; 3] = [0, 1, 2].map(|plane| {
+            let (w, h) = if plane == 0 { size } else { chroma };
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    let code = ((64 + x * 4 + y * 3 + plane * 80) % 940) as u16;
+                    code << 6
+                })
+                .collect()
+        });
+        let bytes: [Vec<u8>; 3] = [0, 1, 2].map(|i| {
+            picture_u16[i]
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect()
+        });
+        for i in 0..3 {
+            fill(&planes_mtl[i], &bytes[i], planes_mtl[i].width() * 2);
+        }
+        let interleaved_bytes: Vec<u8> = picture_u16[1]
+            .iter()
+            .zip(&picture_u16[2])
+            .flat_map(|(&b, &r)| {
+                let [b0, b1] = b.to_le_bytes();
+                let [r0, r1] = r.to_le_bytes();
+                [b0, b1, r0, r1]
+            })
+            .collect();
+        fill(&chroma_mtl, &interleaved_bytes, chroma_mtl.width() * 4);
+
+        let widths = [size.0, chroma.0, chroma.0];
+        let mut expected = vec![0u8; 18_000];
+        let mut expected_size = 0;
+        let [sy, scb, scr] = [0, 1, 2].map(|i| EmberwaveSourcePlane {
+            data: bytes[i].as_ptr(),
+            stride: widths[i] * 2,
+            size: bytes[i].len(),
+        });
+        // SAFETY: live encoder, valid planes, and output buffer.
+        let status = unsafe {
+            emberwave_encoder_encode_u16(
+                memory,
+                sy,
+                scb,
+                scr,
+                expected.as_mut_ptr(),
+                expected.len(),
+                &mut expected_size,
+            )
+        };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        expected.truncate(expected_size);
+
+        let mut frame = vec![0u8; 18_000];
+        let mut frame_size = 0;
+        // SAFETY: live encoder, textures, and output buffer.
+        let status = unsafe {
+            emberwave_encoder_encode_textures(
+                as_planes,
+                y,
+                cb,
+                cr,
+                frame.as_mut_ptr(),
+                frame.len(),
+                &mut frame_size,
+            )
+        };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        frame.truncate(frame_size);
+        assert_eq!(frame, expected, "{size:?} Metal R16 planes");
+
+        let mut frame_p010 = vec![0u8; 18_000];
+        let mut frame_p010_size = 0;
+        // SAFETY: live encoder, textures, and output buffer.
+        let status = unsafe {
+            emberwave_encoder_encode_textures(
+                as_p010,
+                y,
+                cbcr,
+                ptr::null(),
+                frame_p010.as_mut_ptr(),
+                frame_p010.len(),
+                &mut frame_p010_size,
+            )
+        };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        frame_p010.truncate(frame_p010_size);
+        assert_eq!(frame_p010, expected, "{size:?} Metal P010");
+
+        // SAFETY: live objects destroyed once each.
+        unsafe {
+            for texture in [y, cb, cr, cbcr] {
+                emberwave_texture_destroy(texture);
+            }
+            for encoder in [memory, as_planes, as_p010] {
+                emberwave_encoder_destroy(encoder);
+            }
+        }
+    }
+
+    // SAFETY: live context.
+    unsafe { emberwave_context_destroy(context) };
+}

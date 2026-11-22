@@ -112,6 +112,11 @@
 // supports `EMBERWAVE_PLANE_FORMAT_R16` decoded plane textures.
 #define EMBERWAVE_CONTEXT_FEATURE_PLANE_R16 (1 << 0)
 
+// Bit flag in `EmberwaveContextInfo.features` indicating that the context
+// supports 16-bit unsigned normalised source textures for encoding
+// (`R16Unorm` planes and P010 `R16Unorm` + `Rg16Unorm`).
+#define EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16 (1 << 1)
+
 // The ITU-R BT.601 matrix.
 #define EMBERWAVE_MATRIX_BT601 0
 
@@ -180,11 +185,15 @@
 #define EMBERWAVE_PLANE_CR 2
 
 // The two chroma planes interleaved in one texture of two unsigned
-// normalised 8-bit channels, Cb in the first and Cr in the second, as the
-// second plane of NV12 holds them: `MTLPixelFormatRG8Unorm` in Metal,
-// `VK_FORMAT_R8G8_UNORM` in Vulkan. Only for the textures encoders read,
-// `emberwave_texture_from_metal_source` and
-// `emberwave_texture_from_vulkan_source` (decision D62).
+// normalised 8-bit or 16-bit channels, Cb in the first and Cr in the second,
+// as the second plane of NV12 (`MTLPixelFormatRG8Unorm` in Metal,
+// `VK_FORMAT_R8G8_UNORM` in Vulkan, `DXGI_FORMAT_R8G8_UNORM` in Direct3D) or
+// P010 (`MTLPixelFormatRG16Unorm`, `VK_FORMAT_R16G16_UNORM`,
+// `DXGI_FORMAT_R16G16_UNORM`; requires `EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16`)
+// holds them. Only for the textures encoders read:
+// `emberwave_texture_from_metal_source`,
+// `emberwave_texture_from_vulkan_source` and
+// `emberwave_texture_from_d3d12_source` (decisions D62, D77).
 #define EMBERWAVE_PLANE_CBCR 3
 
 // The whole picture as R', G' and B', in one texture of four unsigned
@@ -286,8 +295,9 @@ typedef struct EmberwaveEncoder EmberwaveEncoder;
 // `emberwave_texture_from_d3d12_source`, decision D62). An 8-bit plane
 // texture (`EMBERWAVE_PLANE_FORMAT_R8`) serves the decoders and encoders of
 // its context whose pictures have planes of its size, so 8-bit planes a
-// decode put into textures can be encoded again; 16-bit
-// (`EMBERWAVE_PLANE_FORMAT_R16`) plane textures are for decode output only.
+// decode put into textures can be encoded again. When the context supports
+// 16-bit sources (`EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16`), decoded 16-bit
+// (`EMBERWAVE_PLANE_FORMAT_R16`) plane textures can also be encoded again.
 //
 // How the decodes and the caller's reads of a texture are ordered:
 // - On a context of `emberwave_context_create`, emberwave works on a queue
@@ -451,8 +461,8 @@ typedef struct EmberwaveVulkanImage {
   uint64_t image;
   // Its `VkFormat`: `VK_FORMAT_B8G8R8A8_UNORM` or
   // `VK_FORMAT_R8G8B8A8_UNORM` for the picture, `VK_FORMAT_R8_UNORM` or
-  // `VK_FORMAT_R16_UNORM` for a decoded plane, `VK_FORMAT_R8_UNORM` for an
-  // encoded plane, `VK_FORMAT_R8G8_UNORM` for Cb and Cr interleaved.
+  // `VK_FORMAT_R16_UNORM` for a plane, `VK_FORMAT_R8G8_UNORM` or
+  // `VK_FORMAT_R16G16_UNORM` for Cb and Cr interleaved.
   uint32_t format;
   // The `VkImageUsageFlags` it was made with.
   uint32_t usage;
@@ -952,13 +962,16 @@ enum EmberwaveStatus emberwave_texture_from_vulkan_plane(const struct EmberwaveD
 // Wraps the caller's own Vulkan image that holds a plane of a picture for
 // the encodes of `encoder` to read, `emberwave_encoder_encode_textures` and
 // `emberwave_encoder_encode_textures_vulkan`, on a context of
-// `emberwave_context_create_vulkan` (decision D62); for an encoder on
+// `emberwave_context_create_vulkan` (decisions D62, D77); for an encoder on
 // another context, `EMBERWAVE_STATUS_INVALID_ARGUMENT`. `plane` is
 // `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR` for an
-// image in `VK_FORMAT_R8_UNORM`, `EMBERWAVE_PLANE_CBCR` for one in
-// `VK_FORMAT_R8G8_UNORM` with Cb and Cr interleaved, or
+// image in `VK_FORMAT_R8_UNORM` or `VK_FORMAT_R16_UNORM`,
+// `EMBERWAVE_PLANE_CBCR` for one in `VK_FORMAT_R8G8_UNORM` (NV12) or
+// `VK_FORMAT_R16G16_UNORM` (P010) with Cb and Cr interleaved, or
 // `EMBERWAVE_PLANE_RGB` for the whole picture in `VK_FORMAT_B8G8R8A8_UNORM`
-// or `VK_FORMAT_R8G8B8A8_UNORM` (decision D65).
+// or `VK_FORMAT_R8G8B8A8_UNORM` (decision D65). 16-bit formats require
+// `EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16` and fail with
+// `EMBERWAVE_STATUS_UNSUPPORTED` otherwise.
 //
 // The image is on the context's device, 2D, of one level, layer and
 // sample, with optimal tiling and exclusive sharing on the context's queue
@@ -1181,15 +1194,24 @@ enum EmberwaveStatus emberwave_texture_from_d3d12_plane(const struct EmberwaveDe
 // Wraps a texture of the caller's Direct3D 12 or Direct3D 11 device that
 // holds a plane of a picture for the encodes of `encoder` to read, from the
 // NT handle `handle`, as `emberwave_texture_from_d3d12` does for a decoder
-// (decision D63): `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
-// `EMBERWAVE_PLANE_CR` for a texture in `DXGI_FORMAT_R8_UNORM`,
-// `EMBERWAVE_PLANE_CBCR` for one in `DXGI_FORMAT_R8G8_UNORM` with Cb and Cr
-// interleaved, or `EMBERWAVE_PLANE_RGB` for the whole picture in
+// (decisions D63, D77): `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB`
+// or `EMBERWAVE_PLANE_CR` for a texture in `DXGI_FORMAT_R8_UNORM` or
+// `DXGI_FORMAT_R16_UNORM`, `EMBERWAVE_PLANE_CBCR` for one in
+// `DXGI_FORMAT_R8G8_UNORM` (NV12) or `DXGI_FORMAT_R16G16_UNORM` (P010) with
+// Cb and Cr interleaved, or `EMBERWAVE_PLANE_RGB` for the whole picture in
 // `DXGI_FORMAT_B8G8R8A8_UNORM` or `DXGI_FORMAT_R8G8B8A8_UNORM`, as a
 // desktop duplication gives it (decision D65), of the plane's size as
 // `emberwave_encoder_info` gives it (that of Cb for `EMBERWAVE_PLANE_CBCR`,
-// the picture's for `EMBERWAVE_PLANE_RGB`). The texture can be sampled.
-// Only `emberwave_encoder_encode_textures_d3d12` takes it.
+// the picture's for `EMBERWAVE_PLANE_RGB`). 16-bit formats require
+// `EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16` and fail with
+// `EMBERWAVE_STATUS_UNSUPPORTED` otherwise. The texture can be sampled.
+// Only `emberwave_encoder_encode_textures_d3d12` takes it. Pass handles to
+// distinct underlying Direct3D resources: reusing a handle or passing a
+// `DuplicateHandle` copy for two planes is rejected with
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT` when encoding, whereas separate
+// `CreateSharedHandle` calls on one resource or placed-memory aliases cannot
+// be distinguished by the API and are the caller's responsibility to keep
+// distinct.
 //
 // # Safety
 //
@@ -1249,7 +1271,11 @@ enum EmberwaveStatus emberwave_decoder_submit_plane_textures_d3d12(struct Emberw
 // Encodes the picture in the textures `y`, `cb` and `cr`, or in RGB in `y`,
 // as `emberwave_encoder_encode_textures` does, with the fences of `sync`, on
 // a context of `emberwave_context_create_d3d12` (decision D63); elsewhere
-// `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT`. The plane textures must refer to
+// distinct underlying Direct3D resources: reused or duplicated shared NT
+// handles are rejected with `EMBERWAVE_STATUS_INVALID_ARGUMENT` (separate
+// `CreateSharedHandle` handles or placed-memory aliases cannot be
+// distinguished by the API).
 //
 // The encode's GPU work waits until `sync.wait_fence` has reached
 // `wait_value` before it reads the textures: the caller signals it once its
@@ -1613,17 +1639,19 @@ enum EmberwaveStatus emberwave_texture_from_metal_plane(const struct EmberwaveDe
 
 // Wraps the caller's own Metal texture, `metal`, an `id<MTLTexture>`, that
 // holds a plane of a picture for the encodes of `encoder` to read,
-// `emberwave_encoder_encode_textures` (decision D62): a texture of a
+// `emberwave_encoder_encode_textures` (decisions D62, D77): a texture of a
 // `CVPixelBuffer` from a `CVMetalTextureCache`, as a screen capture gives
 // them, or one the caller drew. `plane` is `EMBERWAVE_PLANE_Y`,
 // `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR` for a texture in
-// `MTLPixelFormatR8Unorm`, `EMBERWAVE_PLANE_CBCR` for one in
-// `MTLPixelFormatRG8Unorm` with Cb and Cr interleaved, as the second plane
-// of an NV12 pixel buffer holds them, or `EMBERWAVE_PLANE_RGB` for the
-// whole picture in `MTLPixelFormatBGRA8Unorm` or `MTLPixelFormatRGBA8Unorm`,
-// as a BGRA pixel buffer holds it (decision D65). Only on iPhones, iPads and
-// Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are not
-// `NULL`.
+// `MTLPixelFormatR8Unorm` or `MTLPixelFormatR16Unorm`,
+// `EMBERWAVE_PLANE_CBCR` for one in `MTLPixelFormatRG8Unorm` (NV12) or
+// `MTLPixelFormatRG16Unorm` (P010) with Cb and Cr interleaved, or
+// `EMBERWAVE_PLANE_RGB` for the whole picture in `MTLPixelFormatBGRA8Unorm`
+// or `MTLPixelFormatRGBA8Unorm`, as a BGRA pixel buffer holds it (decision
+// D65). 16-bit formats require `EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16` and
+// fail with `EMBERWAVE_STATUS_UNSUPPORTED` otherwise. Only on iPhones, iPads
+// and Macs; elsewhere `EMBERWAVE_STATUS_UNSUPPORTED` for arguments that are
+// not `NULL`.
 //
 // The texture is on the device of the encoder's context
 // (`emberwave_context_metal_device`), 2D, of one level, layer and sample,
@@ -1907,6 +1935,36 @@ enum EmberwaveStatus emberwave_encoder_encode(struct EmberwaveEncoder *encoder,
                                               size_t budget,
                                               size_t *size);
 
+// Encodes one 16-bit unsigned normalised picture into a frame of at most
+// `budget` bytes, as `emberwave_encoder_encode` encodes an 8-bit one
+// (decision D77): each plane's `data` points to little-endian 16-bit unsigned
+// samples (`uint16_t` on little-endian platforms), with rows `stride` bytes
+// apart (at least `2 * width` bytes) and `size` at least
+// `stride * (height - 1) + 2 * width` bytes for the plane sizes of
+// `emberwave_encoder_info`. Each sample `s` maps to `s / 65535.0 - 0.5`,
+// matching both full-range 16-bit UNORM values and P010 upper-10-bit values
+// (`c << 6`), and producing the same bytes as encoding `R16Unorm` or P010
+// source textures. Works on every GPU context. Waits for the GPU.
+//
+// On a context of `emberwave_context_create_metal`, do not call it inside a
+// completion handler of a command buffer of the context's queue: the wait
+// never ends there.
+//
+// # Safety
+//
+// `encoder` is a live encoder that no other thread is using. Each plane's
+// `data` points to `size` readable bytes, `size` being at least
+// `stride * (height - 1) + 2 * width`. `frame` points to `budget` bytes that
+// may be written, and `size` to a `size_t`; neither overlaps the planes or
+// the other.
+enum EmberwaveStatus emberwave_encoder_encode_u16(struct EmberwaveEncoder *encoder,
+                                                  struct EmberwaveSourcePlane y,
+                                                  struct EmberwaveSourcePlane cb,
+                                                  struct EmberwaveSourcePlane cr,
+                                                  uint8_t *frame,
+                                                  size_t budget,
+                                                  size_t *size);
+
 // Encodes a picture of R', G' and B' in the caller's memory, as screen
 // captures and renderers hold them, as `emberwave_encoder_encode` encodes
 // one of Y', Cb and Cr: `rgb.data` points to its first row of four bytes a
@@ -1935,19 +1993,24 @@ enum EmberwaveStatus emberwave_encoder_encode_rgb(struct EmberwaveEncoder *encod
                                                   size_t *size);
 
 // Encodes the picture whose planes are in textures on the GPU, as
-// `emberwave_encoder_encode` encodes one in CPU memory and into the same
-// bytes (decision D62): `y` holds the Y plane, and `cb` and `cr` the Cb and
-// Cr planes, or `cb` both of them interleaved (`EMBERWAVE_PLANE_CBCR`) with
-// `cr` `NULL`. Or `y` holds the whole picture in RGB
-// (`EMBERWAVE_PLANE_RGB`), with `cb` and `cr` `NULL`: the encoder converts
-// it to Y'CbCr as it reads it, as `emberwave_encoder_encode_rgb` does a
-// picture in CPU memory and into the same bytes (decision D65). The
+// `emberwave_encoder_encode` (for 8-bit textures) or
+// `emberwave_encoder_encode_u16` (for 16-bit / P010 textures) encodes one in
+// CPU memory and into the same bytes (decisions D62, D77): `y` holds the Y
+// plane, and `cb` and `cr` the Cb and Cr planes (all three 8-bit `R8Unorm` or
+// all three 16-bit `R16Unorm`), or `cb` both of them interleaved
+// (`EMBERWAVE_PLANE_CBCR`: `R8Unorm` + `Rg8Unorm` for NV12, or `R16Unorm` +
+// `Rg16Unorm` for P010) with `cr` `NULL`. Mixing 8-bit and 16-bit textures
+// gives `EMBERWAVE_STATUS_INVALID_ARGUMENT`. Or `y` holds the whole picture
+// in RGB (`EMBERWAVE_PLANE_RGB`), with `cb` and `cr` `NULL`: the encoder
+// converts it to Y'CbCr as it reads it, as `emberwave_encoder_encode_rgb`
+// does a picture in CPU memory and into the same bytes (decision D65). The
 // textures are on the encoder's context, with the sizes of what they hold:
 // the caller's, from `emberwave_texture_from_metal_source` or
 // `emberwave_texture_from_vulkan_source`, textures of pictures from
-// `emberwave_decoder_decode_texture`, or 8-bit (`EMBERWAVE_PLANE_FORMAT_R8`
-// / `R8Unorm`) plane textures from decodes (16-bit
-// `EMBERWAVE_PLANE_FORMAT_R16` plane textures are not accepted). Others give
+// `emberwave_decoder_decode_texture`, or plane textures from decodes
+// (`EMBERWAVE_PLANE_FORMAT_R8` / `R8Unorm`, or
+// `EMBERWAVE_PLANE_FORMAT_R16` / `R16Unorm` when the context advertises
+// `EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16`). Others give
 // `EMBERWAVE_STATUS_INVALID_ARGUMENT` before any work on the GPU, textures
 // shared from Direct3D included, which take
 // `emberwave_encoder_encode_textures_d3d12`. A budget too small gives

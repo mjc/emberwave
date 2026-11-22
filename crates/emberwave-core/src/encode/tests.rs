@@ -521,3 +521,133 @@ fn a_frame_that_loses_finer_packets_decodes_in_part() {
     assert!(partial.is_ready(true));
     decode_frame(&partial.frame()).unwrap();
 }
+
+fn psnr_u16(reference: &[u16], test: &[u16]) -> f64 {
+    let squared: f64 = reference
+        .iter()
+        .zip(test)
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+        .sum();
+    let mse = squared / reference.len() as f64;
+    if mse == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (65535.0 * 65535.0 / mse).log10()
+    }
+}
+
+fn decode_u16(layout: &FrameLayout, frame: &[u8]) -> [Vec<u16>; 3] {
+    let mut assembler = FrameAssembler::new(layout.clone());
+    assembler
+        .push_packet(frame)
+        .expect("the decoder takes the frame");
+    assert!(assembler.is_ready(false));
+    let decoded = decode_frame(&assembler.frame()).expect("the frame decodes");
+    decoded.planes.map(|plane| plane.to_unorm16())
+}
+
+#[test]
+fn frames_u16_decode_close_to_their_10bit_pictures_and_exceed_8bit_precision() {
+    // Smooth 10-bit gradient with 1/1023 steps (finer than 1/255): encoding in
+    // 16-bit UNORM and decoding to 16-bit UNORM preserves precision that 8-bit
+    // input loses before transform.
+    for (chroma, width, height, budget) in [
+        (ChromaSubsampling::Yuv420, 192, 136, 80_000),
+        (ChromaSubsampling::Yuv444, 131, 67, 80_000),
+    ] {
+        let layout = FrameLayout::new(width, height, chroma).unwrap();
+        let planes16: [Vec<u16>; 3] = Component::ALL.map(|component| {
+            let (w, h) = layout.plane_size(component);
+            let offset = component.index() as u32 * 120;
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    // 10-bit code value spanning 64..=940 with single-step ramps.
+                    let code = (64 + offset + x * 4 + y * 2) % 940;
+                    crate::cpu::unorm16(code as f32 / 1023.0)
+                })
+                .collect()
+        });
+        let planes8: [Vec<u8>; 3] = [0, 1, 2].map(|i| {
+            planes16[i]
+                .iter()
+                .map(|&s| ((u32::from(s) * 255 + 32767) / 65535) as u8)
+                .collect()
+        });
+
+        let mut enc16 = Encoder::new(width, height, chroma, Signalling::default()).unwrap();
+        let frame16 = enc16
+            .encode_u16([&planes16[0], &planes16[1], &planes16[2]], budget)
+            .expect("16-bit frame fits");
+        assert!(frame16.len() <= budget);
+        let dec16 = decode_u16(&layout, &frame16);
+
+        let mut enc8 = Encoder::new(width, height, chroma, Signalling::default()).unwrap();
+        let frame8 = enc8
+            .encode([&planes8[0], &planes8[1], &planes8[2]], budget)
+            .expect("8-bit frame fits");
+        let dec8_as_u16 = decode_u16(&layout, &frame8);
+
+        let psnr16 = (0..3)
+            .map(|i| psnr_u16(&planes16[i], &dec16[i]))
+            .fold(f64::INFINITY, f64::min);
+        let psnr8 = (0..3)
+            .map(|i| psnr_u16(&planes16[i], &dec8_as_u16[i]))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            psnr16 > 60.0,
+            "{width}x{height} {chroma:?}: 16-bit PSNR {psnr16:.2} dB"
+        );
+        assert!(
+            psnr16 > psnr8 + 5.0,
+            "{width}x{height} {chroma:?}: expected 16-bit ({psnr16:.2} dB) to beat 8-bit ({psnr8:.2} dB)"
+        );
+    }
+}
+
+#[test]
+fn frames_u16_support_p010_levels_and_check_errors() {
+    let (width, height, chroma) = (200, 120, ChromaSubsampling::Yuv420);
+    let layout = FrameLayout::new(width, height, chroma).unwrap();
+    // P010 stores 10-bit code values in the upper 10 bits (c << 6).
+    let planes: [Vec<u16>; 3] = Component::ALL.map(|component| {
+        let (w, h) = layout.plane_size(component);
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let code = ((64 + x * 3 + y * 5 + component.index() as u32 * 97) % 940) as u16;
+                code << 6
+            })
+            .collect()
+    });
+    let mut encoder = Encoder::new(width, height, chroma, Signalling::default()).unwrap();
+    let frame_tight = encoder
+        .encode_u16([&planes[0], &planes[1], &planes[2]], 4_000)
+        .unwrap();
+    let frame_wide = encoder
+        .encode_u16([&planes[0], &planes[1], &planes[2]], 40_000)
+        .unwrap();
+    assert!(frame_tight.len() <= 4_000);
+    assert!(frame_wide.len() <= 40_000);
+
+    let err_of = |frame: &[u8]| {
+        let mut assembler = FrameAssembler::new(layout.clone());
+        assembler.push_packet(frame).unwrap();
+        coefficient_error_u16([&planes[0], &planes[1], &planes[2]], &assembler.frame()).unwrap()
+    };
+    assert!(err_of(&frame_wide).weighted_total() < err_of(&frame_tight).weighted_total());
+    let decoded = decode_u16(&layout, &frame_wide);
+    let worst = (0..3)
+        .map(|i| psnr_u16(&planes[i], &decoded[i]))
+        .fold(f64::INFINITY, f64::min);
+    assert!(worst > 55.0, "P010 PSNR {worst:.2} dB");
+
+    // Wrong plane size is an error.
+    assert!(matches!(
+        encoder.encode_u16([&planes[0][1..], &planes[1], &planes[2]], 10_000),
+        Err(EncodeError::PlaneSize {
+            component: Component::Y,
+            ..
+        })
+    ));
+}
