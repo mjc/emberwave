@@ -1205,7 +1205,13 @@ enum EmberwaveStatus emberwave_texture_from_d3d12_plane(const struct EmberwaveDe
 // the picture's for `EMBERWAVE_PLANE_RGB`). 16-bit formats require
 // `EMBERWAVE_CONTEXT_FEATURE_SOURCE_R16` and fail with
 // `EMBERWAVE_STATUS_UNSUPPORTED` otherwise. The texture can be sampled.
-// Only `emberwave_encoder_encode_textures_d3d12` takes it.
+// Only `emberwave_encoder_encode_textures_d3d12` takes it. Pass handles to
+// distinct underlying Direct3D resources: reusing a handle or passing a
+// `DuplicateHandle` copy for two planes is rejected with
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT` when encoding, whereas separate
+// `CreateSharedHandle` calls on one resource or placed-memory aliases cannot
+// be distinguished by the API and are the caller's responsibility to keep
+// distinct.
 //
 // # Safety
 //
@@ -1265,7 +1271,11 @@ enum EmberwaveStatus emberwave_decoder_submit_plane_textures_d3d12(struct Emberw
 // Encodes the picture in the textures `y`, `cb` and `cr`, or in RGB in `y`,
 // as `emberwave_encoder_encode_textures` does, with the fences of `sync`, on
 // a context of `emberwave_context_create_d3d12` (decision D63); elsewhere
-// `EMBERWAVE_STATUS_INVALID_ARGUMENT`.
+// `EMBERWAVE_STATUS_INVALID_ARGUMENT`. The plane textures must refer to
+// distinct underlying Direct3D resources: reused or duplicated shared NT
+// handles are rejected with `EMBERWAVE_STATUS_INVALID_ARGUMENT` (separate
+// `CreateSharedHandle` handles or placed-memory aliases cannot be
+// distinguished by the API).
 //
 // The encode's GPU work waits until `sync.wait_fence` has reached
 // `wait_value` before it reads the textures: the caller signals it once its

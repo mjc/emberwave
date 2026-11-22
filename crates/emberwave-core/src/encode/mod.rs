@@ -84,13 +84,13 @@ impl Default for Signalling {
 #[non_exhaustive]
 pub enum EncodeError {
     /// A plane does not have the size the stream's pictures have.
-    #[error("the {component:?} plane has {actual} samples, {expected} expected")]
+    #[error("the {component:?} plane has length {actual}, {expected} expected")]
     PlaneSize {
         /// Which plane.
         component: Component,
-        /// `width * height` of the plane.
+        /// Expected plane length (in bytes for byte planes, or in samples for `u16` planes).
         expected: usize,
-        /// Samples given.
+        /// Actual length given (in the same unit as `expected`).
         actual: usize,
     },
     /// Not even the smallest frame the encoder can make fits the budget.
