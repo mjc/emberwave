@@ -102,15 +102,13 @@ pub enum EncodeError {
         minimum: usize,
     },
     /// A plane's rows are closer together than the plane is wide.
-    #[error(
-        "the rows of the {component:?} plane are {stride} bytes apart, less than its {width} samples"
-    )]
+    #[error("the rows of the {component:?} plane have stride {stride}, less than {width}")]
     PlaneStride {
         /// Which plane.
         component: Component,
-        /// Bytes from the start of one row to the start of the next.
+        /// Row stride (in bytes for byte planes, or in samples for `u16` planes).
         stride: usize,
-        /// Samples in a row.
+        /// Minimum row stride (in the same unit as `stride`).
         width: usize,
     },
     /// A frame to measure with [`coefficient_error`] does not decode.
@@ -201,7 +199,31 @@ impl Encoder {
     /// the sizes of [`FrameLayout::plane_size`].
     pub fn encode(&mut self, planes: [&[u8]; 3], budget: usize) -> Result<Vec<u8>, EncodeError> {
         check_planes(&self.layout, planes)?;
-        let blocks = self.quantise(&self.transform(planes));
+        let bands = self.transform(planes);
+        self.encode_bands(&bands, budget)
+    }
+
+    /// Encodes one 16-bit UNORM picture into a frame of at most `budget` bytes,
+    /// as [`encode`](Self::encode) does for 8-bit pictures (decision D77).
+    ///
+    /// `planes` are the Y, Cb and Cr samples in `0..=65535` (such as 10-bit
+    /// values mapped with [`crate::cpu::unorm16`] or P010 samples in the upper
+    /// 10 bits, `c << 6`), row-major without padding, at the sizes of
+    /// [`FrameLayout::plane_size`]. Each sample enters the forward transform as
+    /// `f32::from(sample) / 65535.0 - 0.5`.
+    pub fn encode_u16(
+        &mut self,
+        planes: [&[u16]; 3],
+        budget: usize,
+    ) -> Result<Vec<u8>, EncodeError> {
+        check_planes_u16(&self.layout, planes)?;
+        let bands = self.transform_u16(planes);
+        self.encode_bands(&bands, budget)
+    }
+
+    /// Quantises, rate-controls and packs transformed `bands` within `budget` bytes.
+    fn encode_bands(&mut self, bands: &Bands, budget: usize) -> Result<Vec<u8>, EncodeError> {
+        let blocks = self.quantise(bands);
         let costs: Vec<BlockCost> = blocks.iter().map(|block| block.cost.clone()).collect();
         let budget_words = (budget.saturating_sub(HEADER_BYTES) / 4) as u64;
         let drops = (budget >= HEADER_BYTES)
@@ -273,17 +295,46 @@ impl Encoder {
 
     /// The forward transform of a picture whose planes have the right sizes.
     pub(crate) fn transform(&self, planes: [&[u8]; 3]) -> Bands {
+        self.transform_with(|component, width, height, aligned_width, aligned_height| {
+            fdwt::pad_plane(
+                planes[component.index()],
+                width,
+                height,
+                aligned_width,
+                aligned_height,
+            )
+        })
+    }
+
+    /// The forward transform of a 16-bit UNORM picture whose planes have the
+    /// right sizes.
+    pub(crate) fn transform_u16(&self, planes: [&[u16]; 3]) -> Bands {
+        self.transform_with(|component, width, height, aligned_width, aligned_height| {
+            fdwt::pad_plane_u16(
+                planes[component.index()],
+                width,
+                height,
+                aligned_width,
+                aligned_height,
+            )
+        })
+    }
+
+    fn transform_with(
+        &self,
+        pad: impl Fn(Component, usize, usize, usize, usize) -> Vec<f32>,
+    ) -> Bands {
         let layout = &self.layout;
         let mut bands: Bands = Default::default();
-        for (component, plane) in Component::ALL.into_iter().zip(planes) {
+        for component in Component::ALL {
             let (width, height) = layout.plane_size(component);
             let first = layout.finest_level(component);
             let (mut level_width, mut level_height) = (
                 (layout.aligned_width() >> first) as usize,
                 (layout.aligned_height() >> first) as usize,
             );
-            let mut image = fdwt::pad_plane(
-                plane,
+            let mut image = pad(
+                component,
                 width as usize,
                 height as usize,
                 level_width,
@@ -411,6 +462,26 @@ pub(crate) fn check_planes(layout: &FrameLayout, planes: [&[u8]; 3]) -> Result<(
     Ok(())
 }
 
+/// An error unless 16-bit `planes` have the sample counts of
+/// [`FrameLayout::plane_size`].
+pub(crate) fn check_planes_u16(
+    layout: &FrameLayout,
+    planes: [&[u16]; 3],
+) -> Result<(), EncodeError> {
+    for (component, plane) in Component::ALL.into_iter().zip(planes) {
+        let (width, height) = layout.plane_size(component);
+        let expected = width as usize * height as usize;
+        if plane.len() != expected {
+            return Err(EncodeError::PlaneSize {
+                component,
+                expected,
+                actual: plane.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// An error unless `planes` hold the planes of [`FrameLayout::plane_size`]
 /// with their rows `strides` bytes apart: each at least its width, and at
 /// least `(height - 1) * stride + width` bytes in the plane. For the GPU
@@ -433,6 +504,71 @@ pub(crate) fn check_strided_planes(
             });
         }
         let expected = (height - 1).saturating_mul(stride).saturating_add(width);
+        if plane.len() < expected {
+            return Err(EncodeError::PlaneSize {
+                component,
+                expected,
+                actual: plane.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// An error unless 16-bit `planes` hold the planes of
+/// [`FrameLayout::plane_size`] with their rows `strides` samples apart.
+#[cfg(feature = "gpu")]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn check_strided_planes_u16(
+    layout: &FrameLayout,
+    planes: [&[u16]; 3],
+    strides: [usize; 3],
+) -> Result<(), EncodeError> {
+    for ((component, plane), stride) in Component::ALL.into_iter().zip(planes).zip(strides) {
+        let (width, height) = layout.plane_size(component);
+        let (width, height) = (width as usize, height as usize);
+        if stride < width {
+            return Err(EncodeError::PlaneStride {
+                component,
+                stride,
+                width,
+            });
+        }
+        let expected = (height - 1).saturating_mul(stride).saturating_add(width);
+        if plane.len() < expected {
+            return Err(EncodeError::PlaneSize {
+                component,
+                expected,
+                actual: plane.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// An error unless little-endian 16-bit byte `planes` hold the planes of
+/// [`FrameLayout::plane_size`] with their rows `strides` bytes apart (each at
+/// least `2 * width` bytes).
+#[cfg(feature = "gpu")]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn check_strided_planes_u16_le(
+    layout: &FrameLayout,
+    planes: [&[u8]; 3],
+    strides: [usize; 3],
+) -> Result<(), EncodeError> {
+    for ((component, plane), stride) in Component::ALL.into_iter().zip(planes).zip(strides) {
+        let (width, height) = layout.plane_size(component);
+        let (row_bytes, height) = (width as usize * 2, height as usize);
+        if stride < row_bytes {
+            return Err(EncodeError::PlaneStride {
+                component,
+                stride,
+                width: row_bytes,
+            });
+        }
+        let expected = (height - 1)
+            .saturating_mul(stride)
+            .saturating_add(row_bytes);
         if plane.len() < expected {
             return Err(EncodeError::PlaneSize {
                 component,
@@ -481,6 +617,31 @@ pub fn coefficient_error(
         sequence: 0,
     };
     let picture = encoder.transform(planes);
+    coefficient_error_of_bands(layout, &picture, frame)
+}
+
+/// Like [`coefficient_error`], for 16-bit UNORM source planes as taken by
+/// [`Encoder::encode_u16`].
+pub fn coefficient_error_u16(
+    planes: [&[u16]; 3],
+    frame: &FrameView<'_>,
+) -> Result<CoefficientError, EncodeError> {
+    let layout = frame.layout();
+    check_planes_u16(layout, planes)?;
+    let encoder = Encoder {
+        layout: layout.clone(),
+        signalling: Signalling::default(),
+        sequence: 0,
+    };
+    let picture = encoder.transform_u16(planes);
+    coefficient_error_of_bands(layout, &picture, frame)
+}
+
+fn coefficient_error_of_bands(
+    layout: &FrameLayout,
+    picture: &Bands,
+    frame: &FrameView<'_>,
+) -> Result<CoefficientError, EncodeError> {
     let decoded = crate::cpu::dequant::dequantize(frame).map_err(EncodeError::Frame)?;
     let mut error = CoefficientError::default();
     for (component, level, band, _) in layout.bands() {

@@ -108,6 +108,12 @@ pub(crate) fn sample_level(sample: u8) -> f32 {
     f32::from(sample) / 255.0 - DC_SHIFT
 }
 
+/// A 16-bit UNORM sample as the transform takes it: scaled to `[0, 1]`, less
+/// the DC shift that the decoder adds back.
+pub(crate) fn sample_level_u16(sample: u16) -> f32 {
+    f32::from(sample) / 65535.0 - DC_SHIFT
+}
+
 /// The samples of an 8-bit plane as the transform takes them
 /// ([`sample_level`]), padded to `aligned_width` x `aligned_height` by
 /// repeating the last column and the last row. Repeating the edge keeps the
@@ -123,6 +129,24 @@ pub(crate) fn pad_plane(
     for y in 0..aligned_height {
         let row = &samples[y.min(height - 1) * width..][..width];
         padded.extend((0..aligned_width).map(|x| sample_level(row[x.min(width - 1)])));
+    }
+    padded
+}
+
+/// The samples of a 16-bit UNORM plane as the transform takes them
+/// ([`sample_level_u16`]), padded to `aligned_width` x `aligned_height` by
+/// repeating the last column and the last row.
+pub(crate) fn pad_plane_u16(
+    samples: &[u16],
+    width: usize,
+    height: usize,
+    aligned_width: usize,
+    aligned_height: usize,
+) -> Vec<f32> {
+    let mut padded = Vec::with_capacity(aligned_width * aligned_height);
+    for y in 0..aligned_height {
+        let row = &samples[y.min(height - 1) * width..][..width];
+        padded.extend((0..aligned_width).map(|x| sample_level_u16(row[x.min(width - 1)])));
     }
     padded
 }
@@ -202,6 +226,20 @@ mod tests {
         assert_eq!(padded[1], expected(255));
         assert_eq!(padded[3], expected(255), "last column repeated");
         assert_eq!(padded[4], expected(51));
+        assert_eq!(padded[8..12], padded[4..8], "last row repeated");
+    }
+
+    #[test]
+    fn padding_u16_repeats_edges_and_preserves_10bit_levels() {
+        let samples = [0u16, 65535, 32768, 512 << 6];
+        let padded = pad_plane_u16(&samples, 2, 2, 4, 3);
+        let expected = |v: u16| f32::from(v) / 65535.0 - 0.5;
+        assert_eq!(padded.len(), 12);
+        assert_eq!(padded[0], -0.5);
+        assert_eq!(padded[1], 0.5);
+        assert_eq!(padded[3], 0.5, "last column repeated");
+        assert_eq!(padded[4], expected(32768));
+        assert_eq!(padded[5], expected(512 << 6));
         assert_eq!(padded[8..12], padded[4..8], "last row repeated");
     }
 }
