@@ -109,6 +109,27 @@ pub(crate) fn idwt_planes_r16_stage(device: &wgpu::Device) -> Result<Stage, GpuE
     })
 }
 
+/// The stage of `gather_r16.wgsl`: packs 16-bit UNORM textures (`R16Unorm`
+/// planes or P010 `R16Unorm` + `Rg16Unorm`) into the encoder's 16-bit planes
+/// buffer (decision D77). Built lazily on first 16-bit texture encode.
+pub(crate) fn gather_r16_stage(device: &wgpu::Device) -> Result<Stage, GpuError> {
+    with_error_scope(device, || {
+        create_stage(
+            device,
+            "gather r16",
+            shader_sources::GATHER_R16,
+            &[
+                storage_entry(0, false),
+                uniform_entry(1),
+                texture_entry(2),
+                texture_entry(3),
+                texture_entry(4),
+                sampler_entry(5),
+            ],
+        )
+    })
+}
+
 /// The stage of `conceal.wgsl`, the concealment of the blocks a frame drawn
 /// in part lacks. A context compiles it when one of its decoders first
 /// conceals such a frame, as most never do (decision D66).

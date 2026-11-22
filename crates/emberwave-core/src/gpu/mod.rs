@@ -32,7 +32,7 @@ pub use decoder::{
     Decoder, Frame, FramePlane, PLANE_FORMAT, PLANE_FORMAT_R16, PLANE_FORMATS, RgbFrame,
     StageTimings, TEXTURE_FORMATS, TimedOutput, Timings,
 };
-pub use encoder::{EncodeStageTimings, EncodeTimings, Encoder, TexturePicture};
+pub use encoder::{CHROMA_FORMAT_RG16, EncodeStageTimings, EncodeTimings, Encoder, TexturePicture};
 pub use error::GpuError;
 
 // What the docs and the C API promise: a context is shared by threads, and
@@ -84,6 +84,9 @@ pub mod shader_sources {
     pub const DRAW: &str = include_str!("shaders/draw.wgsl");
     /// A picture in textures packed into the encoder's planes buffer.
     pub const GATHER: &str = include_str!("shaders/gather.wgsl");
+    /// A 16-bit UNORM picture in textures (`R16Unorm` or P010 `R16Unorm` +
+    /// `Rg16Unorm`) packed into the encoder's 16-bit planes buffer (decision D77).
+    pub const GATHER_R16: &str = include_str!("shaders/gather_r16.wgsl");
     /// A picture in an RGB texture converted to YCbCr into the encoder's
     /// planes buffer (decision D65).
     pub const GATHER_RGB: &str = include_str!("shaders/gather_rgb.wgsl");
@@ -106,12 +109,13 @@ pub mod shader_sources {
     );
 
     /// Every shader, by name, with its compute entry points.
-    pub const ALL: [(&str, &str, &[&str]); 11] = [
+    pub const ALL: [(&str, &str, &[&str]); 12] = [
         ("dequant", DEQUANT, &["main"]),
         ("conceal", CONCEAL, &["main"]),
         ("idwt", IDWT, &["main"]),
         ("yuv2rgb", YUV2RGB, &["main"]),
         ("gather", GATHER, &["main"]),
+        ("gather_r16", GATHER_R16, &["main"]),
         ("gather_rgb", GATHER_RGB, &["yuv444", "yuv420"]),
         ("fdwt", FDWT, &["main"]),
         ("equant", EQUANT, &["main"]),

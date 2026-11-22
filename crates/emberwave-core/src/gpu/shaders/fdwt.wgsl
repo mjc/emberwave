@@ -30,7 +30,9 @@ struct CompParams {
     // image size at the finest level.
     plane_width: u32,
     plane_height: u32,
-    // 1: the finest level, which reads the packed plane; 0: a later level.
+    // 0: a later level reading the pyramid;
+    // 1: finest level reading packed 8-bit planes (4 samples per u32);
+    // 2: finest level reading packed 16-bit UNORM planes (2 samples per u32).
     is_plane: u32,
     pad0: u32,
     pad1: u32,
@@ -121,11 +123,18 @@ fn lift(v: ptr<function, array<f32, 16>>) {
 
 // Sample (x, y) of the level's image, both inside it.
 fn image_at(comp: CompParams, x: u32, y: u32) -> f32 {
-    if (comp.is_plane != 0u) {
+    if (comp.is_plane == 1u) {
         let px = min(x, comp.plane_width - 1u);
         let py = min(y, comp.plane_height - 1u);
         let word = planes[comp.image_offset + py * comp.image_stride + px / 4u];
         return sample_levels[(word >> (8u * (px % 4u))) & 0xffu];
+    }
+    if (comp.is_plane == 2u) {
+        let px = min(x, comp.plane_width - 1u);
+        let py = min(y, comp.plane_height - 1u);
+        let word = planes[comp.image_offset + py * comp.image_stride + px / 2u];
+        let sample = (word >> (16u * (px % 2u))) & 0xffffu;
+        return f32(sample) / 65535.0 - 0.5;
     }
     return pyramid[comp.image_offset + y * comp.image_stride + x];
 }

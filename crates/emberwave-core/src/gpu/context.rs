@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::GpuError;
 use super::decoder::{PLANE_FORMAT, PLANE_FORMAT_R16};
+use super::encoder::CHROMA_FORMAT_RG16;
 use super::pipelines::{
-    EncoderPipelines, Pipelines, RgbStages, Stage, conceal_stage, idwt_planes_r16_stage,
-    with_error_scope,
+    EncoderPipelines, Pipelines, RgbStages, Stage, conceal_stage, gather_r16_stage,
+    idwt_planes_r16_stage, with_error_scope,
 };
 
 /// Environment variable that restricts the backends considered, for example
@@ -161,6 +162,12 @@ pub struct GpuContext {
     /// Whether the decoders can store 16-bit normalised planes into `r16unorm`
     /// storage textures.
     r16_planes: bool,
+    /// Whether the encoders can sample 16-bit normalised `R16Unorm` source
+    /// textures.
+    r16_source: bool,
+    /// Whether the encoders can sample 16-bit normalised `Rg16Unorm` interleaved
+    /// chroma source textures (P010).
+    rg16_source: bool,
     /// Built on first use, shared by every clone of the context: the
     /// decoder's and the encoder's, so that neither compiles the other's.
     pipelines: Arc<Mutex<Option<Arc<Pipelines>>>>,
@@ -168,6 +175,9 @@ pub struct GpuContext {
     /// The encoders' pipelines for RGB pictures, built when one first takes
     /// one (decision D65).
     rgb_pipelines: RgbPipelines,
+    /// The encoders' pipeline for 16-bit UNORM / P010 textures, built when one
+    /// first takes such a picture (decision D77).
+    gather_r16_pipeline: GatherR16Pipeline,
     /// The decoders' pipeline for the concealment of frames drawn in part,
     /// built when one first conceals one (decision D66).
     conceal_pipeline: ConcealPipeline,
@@ -251,8 +261,11 @@ impl GpuContext {
         let plane_stores = options.plane_stores && !options.strict_webgpu && stores_planes(adapter);
         let shared_uploads =
             options.shared_uploads && !options.strict_webgpu && shares_memory(adapter);
-        let r16_planes =
-            options.r16_planes && !options.strict_webgpu && supports_r16_planes(adapter);
+        let r16_planes = options.r16_planes
+            && !options.strict_webgpu
+            && (supports_r16_planes(adapter)
+                || supports_r16_source(adapter)
+                || supports_rg16_source(adapter));
         let mut required_features = wgpu::Features::empty();
         required_features.set(wgpu::Features::TIMESTAMP_QUERY, timestamps);
         required_features.set(
@@ -313,10 +326,12 @@ impl GpuContext {
             .features()
             .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS)
             && shares_memory(&adapter);
-        let r16_planes = device
+        let has_norm16 = device
             .features()
-            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
-            && supports_r16_planes(&adapter);
+            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        let r16_planes = has_norm16 && supports_r16_planes(&adapter);
+        let r16_source = has_norm16 && supports_r16_source(&adapter);
+        let rg16_source = has_norm16 && supports_rg16_source(&adapter);
 
         // A lost device stays lost. Errors of a lost device do not reach the
         // error scopes, so the decoders check this record before and after
@@ -338,9 +353,12 @@ impl GpuContext {
             plane_stores,
             shared_uploads,
             r16_planes,
+            r16_source,
+            rg16_source,
             pipelines: Arc::default(),
             encoder_pipelines: Arc::default(),
             rgb_pipelines: RgbPipelines::default(),
+            gather_r16_pipeline: GatherR16Pipeline::default(),
             conceal_pipeline: ConcealPipeline::default(),
             r16_plane_pipeline: R16PlanePipeline::default(),
             lost,
@@ -445,6 +463,24 @@ impl GpuContext {
         }
     }
 
+    /// Whether encoders on this context can read source textures of `format`.
+    ///
+    /// `R8Unorm`, `Rg8Unorm`, `Rgba8Unorm` and `Bgra8Unorm` are always
+    /// supported. [`PLANE_FORMAT_R16`] and [`CHROMA_FORMAT_RG16`] require
+    /// [`wgpu::Features::TEXTURE_FORMAT_16BIT_NORM`] and `TEXTURE_BINDING`
+    /// support on the device (decision D77).
+    pub fn supports_source_format(&self, format: wgpu::TextureFormat) -> bool {
+        match format {
+            wgpu::TextureFormat::R8Unorm
+            | wgpu::TextureFormat::Rg8Unorm
+            | wgpu::TextureFormat::Rgba8Unorm
+            | wgpu::TextureFormat::Bgra8Unorm => true,
+            wgpu::TextureFormat::R16Unorm => self.r16_source,
+            wgpu::TextureFormat::Rg16Unorm => self.rg16_source,
+            _ => false,
+        }
+    }
+
     /// The decoder's compute pipelines, compiled the first time they are
     /// asked for.
     pub(crate) fn pipelines(&self) -> Result<Arc<Pipelines>, GpuError> {
@@ -465,6 +501,12 @@ impl GpuContext {
     /// first that needs them builds.
     pub(crate) fn rgb_pipelines(&self) -> RgbPipelines {
         self.rgb_pipelines.clone()
+    }
+
+    /// Where the encoders find the pipeline for 16-bit UNORM / P010 textures,
+    /// which the first that needs it builds.
+    pub(crate) fn gather_r16_pipeline(&self) -> GatherR16Pipeline {
+        self.gather_r16_pipeline.clone()
     }
 
     /// Where the decoders find the pipeline that conceals what frames drawn
@@ -518,6 +560,18 @@ impl RgbPipelines {
     }
 }
 
+/// A context's pipeline for 16-bit UNORM / P010 source textures, shared by its
+/// encoders and built when the first of them takes such a picture (decision D77).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GatherR16Pipeline(Arc<Mutex<Option<Arc<Stage>>>>);
+
+impl GatherR16Pipeline {
+    /// The pipeline, compiled on `device`, the context's, if it is not yet.
+    pub(crate) fn get(&self, device: &wgpu::Device) -> Result<Arc<Stage>, GpuError> {
+        cached(&self.0, || gather_r16_stage(device))
+    }
+}
+
 /// Whether the decoders can store the planes into textures on `adapter`, once
 /// its device has the adapter's own format features: on Metal, whose GPUs
 /// write 8-bit storage textures (decision D52). Other adapters may write
@@ -553,6 +607,29 @@ fn supports_r16_planes(adapter: &wgpu::Adapter) -> bool {
         && format
             .flags
             .contains(wgpu::TextureFormatFeatureFlags::STORAGE_WRITE_ONLY)
+}
+
+/// Whether `adapter` supports sampling `R16Unorm` source textures for encoding.
+fn supports_r16_source(adapter: &wgpu::Adapter) -> bool {
+    adapter
+        .features()
+        .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+        && adapter
+            .get_texture_format_features(PLANE_FORMAT_R16)
+            .allowed_usages
+            .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+}
+
+/// Whether `adapter` supports sampling `Rg16Unorm` source textures for P010
+/// encoding.
+fn supports_rg16_source(adapter: &wgpu::Adapter) -> bool {
+    adapter
+        .features()
+        .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+        && adapter
+            .get_texture_format_features(CHROMA_FORMAT_RG16)
+            .allowed_usages
+            .contains(wgpu::TextureUsages::TEXTURE_BINDING)
 }
 
 /// Whether the decoders can write a frame where their shaders read it on

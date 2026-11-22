@@ -24,18 +24,21 @@ use crate::bitstream::{ChromaSubsampling, Component, FrameLayout, SequenceHeader
 use crate::color::{RgbOrder, check_rgb};
 use crate::encode::fdwt::sample_level;
 use crate::encode::{
-    EncodeError, Signalling, check_planes, check_strided_planes, next_sequence, start_of_frame,
+    EncodeError, Signalling, check_planes, check_planes_u16, check_strided_planes,
+    check_strided_planes_u16, check_strided_planes_u16_le, next_sequence, start_of_frame,
     stream_header,
 };
 
 use super::context::{
-    AfterSubmit, GpuContext, QueueTurns, RgbPipelines, SubmissionHooks, notice_loss, submit,
-    take_turn,
+    AfterSubmit, GatherR16Pipeline, GpuContext, QueueTurns, RgbPipelines, SubmissionHooks,
+    notice_loss, submit, take_turn,
 };
+use super::decoder::{PLANE_FORMAT, PLANE_FORMAT_R16, PLANE_FORMATS};
 use super::error::GpuError;
 use super::layout::{
-    BufferLayout, CostRecord, FrameParams, GatherParams, MAX_BLOCK_WORDS, QuantParams, RATE_KEYS,
-    RATE_STATE_BYTES, RateSummary, RgbGatherParams, ScanParams, TransformLevel, rate_grid,
+    BufferLayout, CostRecord, FrameParams, GatherParams, MAX_BLOCK_WORDS, Planes16Layout,
+    QuantParams, RATE_KEYS, RATE_STATE_BYTES, RateSummary, RgbGatherParams, ScanParams,
+    TransformLevel, rate_grid,
 };
 use super::pipelines::{EncoderPipelines, with_error_scope};
 use super::resources::{
@@ -88,6 +91,11 @@ pub struct EncodeTimings {
     pub stages: Option<EncodeStageTimings>,
 }
 
+/// The format of an interleaved 16-bit unsigned normalised chroma texture
+/// (`Rg16Unorm`: Cb in red, Cr in green), as the second plane of P010 holds
+/// them.
+pub const CHROMA_FORMAT_RG16: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Unorm;
+
 /// A picture in GPU memory, for [`Encoder::encode_textures`]: views of 2D
 /// textures on the encoder's device, each texture of the size of the plane
 /// it holds, with one sample per texel and the `TEXTURE_BINDING` usage.
@@ -100,11 +108,16 @@ pub struct EncodeTimings {
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum TexturePicture<'a> {
-    /// Y, Cb and Cr, each in an `R8Unorm` texture.
+    /// Y, Cb and Cr, each in an `R8Unorm` texture, or all three in `R16Unorm`
+    /// textures (10-bit / 16-bit normalised samples; requires
+    /// [`Encoder::supports_source_format`] for `R16Unorm`).
     Planes([&'a wgpu::TextureView; 3]),
-    /// The layout of NV12, or of its 4:4:4 counterpart: Y in an `R8Unorm`
-    /// texture, Cb and Cr together in an `Rg8Unorm` texture, Cb in red and
-    /// Cr in green.
+    /// The layout of NV12 (`R8Unorm` luma + `Rg8Unorm` chroma) or P010
+    /// (`R16Unorm` luma + `Rg16Unorm` chroma), or of their 4:4:4 counterparts:
+    /// Y in the luma texture, and Cb and Cr together in the chroma texture,
+    /// Cb in red and Cr in green. Both textures must share the same bit depth;
+    /// 16-bit P010 requires [`Encoder::supports_source_format`] for `R16Unorm`
+    /// and `Rg16Unorm`.
     LumaChroma {
         /// The Y plane.
         luma: &'a wgpu::TextureView,
@@ -127,9 +140,15 @@ pub enum TexturePicture<'a> {
 /// Where a picture to encode is.
 #[derive(Clone, Copy)]
 enum Input<'a> {
-    /// In CPU memory: the Y, Cb and Cr samples, with the bytes from one
+    /// In CPU memory: the Y, Cb and Cr 8-bit samples, with the bytes from one
     /// row to the next if the rows are not back to back.
     Planes([&'a [u8]; 3], Option<[usize; 3]>),
+    /// In CPU memory: the Y, Cb and Cr 16-bit UNORM samples, with the samples
+    /// from one row to the next if the rows are not back to back.
+    Planes16([&'a [u16]; 3], Option<[usize; 3]>),
+    /// In CPU memory: little-endian 16-bit UNORM samples as raw bytes with
+    /// byte row strides (for C FFI callers).
+    Planes16Le([&'a [u8]; 3], [usize; 3]),
     /// In textures on the GPU.
     Textures(TexturePicture<'a>),
     /// In CPU memory as R', G' and B': rows `stride` bytes apart of four
@@ -139,6 +158,132 @@ enum Input<'a> {
         stride: usize,
         order: RgbOrder,
     },
+}
+
+/// Buffers and forward-transform stages for 16-bit UNORM pictures, allocated on
+/// the first 16-bit encode and reused thereafter so 8-bit callers pay no GPU
+/// memory cost (decision D77).
+struct Planes16Resources {
+    layout: Planes16Layout,
+    /// Packed 16-bit planes: two `u16` samples per `u32` word, rows padded to
+    /// whole words with zeros.
+    planes: wgpu::Buffer,
+    /// Staging buffer for CPU `u16` uploads; `None` when uploads are shared.
+    upload: Option<wgpu::Buffer>,
+    upload_mapped: bool,
+    /// `gather_r16.wgsl`'s parameters for 3-plane `R16Unorm` and for P010
+    /// (`R16Unorm` + `Rg16Unorm`), and its workgroup grid.
+    gather_planes: wgpu::Buffer,
+    gather_luma_chroma: wgpu::Buffer,
+    gather_grid: (u32, u32, u32),
+    /// Forward-transform stages whose finest levels read from `planes`
+    /// (`is_plane == 2`).
+    fdwt_stages: Vec<FdwtStage>,
+}
+
+impl Planes16Resources {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        turns: Option<&QueueTurns>,
+        frame_layout: &FrameLayout,
+        buffers: &BufferLayout,
+        pyramid: &wgpu::Buffer,
+        sample_levels: &wgpu::Buffer,
+        pipelines: &EncoderPipelines,
+        shared_uploads: bool,
+    ) -> Result<Self, GpuError> {
+        let layout = Planes16Layout::new(frame_layout)?;
+        check_size(device, "the packed 16-bit planes", layout.packed_words * 4)?;
+        let turn = take_turn(turns, device, queue);
+        let made = with_error_scope(device, || {
+            let usage = wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST;
+            let mut planes_usage = usage;
+            planes_usage.set(wgpu::BufferUsages::MAP_WRITE, shared_uploads);
+            let planes = buffer(device, "planes16", layout.packed_words * 4, planes_usage);
+            let upload = (!shared_uploads).then(|| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("planes16 upload"),
+                    size: (layout.packed_words * 4).max(16),
+                    usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: true,
+                })
+            });
+            let gather_planes_data = GatherParams::new_u16(frame_layout, &layout, false);
+            let gather_planes =
+                uniform_buffer(device, queue, "gather r16 params", &gather_planes_data);
+            let gather_luma_chroma = uniform_buffer(
+                device,
+                queue,
+                "gather r16 params, luma and chroma",
+                &GatherParams::new_u16(frame_layout, &layout, true),
+            );
+            let fdwt_stages = (0..DECOMPOSITION_LEVELS)
+                .map(|level| {
+                    let stage = TransformLevel::new_u16(frame_layout, buffers, &layout, level);
+                    let params = uniform_buffer(device, queue, "fdwt16 params", &stage.params);
+                    FdwtStage {
+                        bind_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("fdwt16"),
+                            layout: &pipelines.fdwt.layout,
+                            entries: &[
+                                entry(0, pyramid),
+                                entry(1, &planes),
+                                entry(2, &params),
+                                entry(3, sample_levels),
+                            ],
+                        }),
+                        grid: stage.grid(),
+                    }
+                })
+                .collect();
+            Self {
+                layout,
+                upload_mapped: upload.is_some(),
+                planes,
+                upload,
+                gather_planes,
+                gather_luma_chroma,
+                gather_grid: gather_planes_data.grid(),
+                fdwt_stages,
+            }
+        });
+        drop(turn);
+        made
+    }
+
+    fn upload_target(&self) -> &wgpu::Buffer {
+        self.upload.as_ref().unwrap_or(&self.planes)
+    }
+
+    fn map_upload(&mut self, device: &wgpu::Device) -> Result<(), GpuError> {
+        if self.upload_mapped {
+            return Ok(());
+        }
+        map_for_writing(device, &[self.upload_target()])?;
+        self.upload_mapped = true;
+        Ok(())
+    }
+
+    fn unmap_upload(&mut self, device: &wgpu::Device) -> Result<(), GpuError> {
+        if self.upload_mapped {
+            with_error_scope(device, || self.upload_target().unmap())?;
+            self.upload_mapped = false;
+        }
+        Ok(())
+    }
+
+    fn destroy(&self) {
+        if let Some(upload) = &self.upload {
+            upload.destroy();
+        }
+        self.planes.destroy();
+        self.gather_planes.destroy();
+        self.gather_luma_chroma.destroy();
+    }
 }
 
 /// Where a picture in RGB in CPU memory goes on its way to the gather: a
@@ -269,6 +414,13 @@ pub struct Encoder {
 
     /// The 8-bit planes, rows padded to whole words, as the decoder's.
     planes: wgpu::Buffer,
+    /// Whether the context shares uploads (decision D54), remembered for the
+    /// lazy 16-bit planes buffer.
+    shared_uploads: bool,
+    /// Whether the device supports sampling `R16Unorm` source textures.
+    r16_source: bool,
+    /// Whether the device supports sampling `Rg16Unorm` source textures (P010).
+    rg16_source: bool,
     /// Where the CPU writes the planes for the GPU to copy into `planes`.
     /// Kept from frame to frame, so that a frame's planes go into memory
     /// that is there already; `Queue::write_buffer` allocates new memory for
@@ -286,8 +438,13 @@ pub struct Encoder {
     gather_planes: wgpu::Buffer,
     gather_luma_chroma: wgpu::Buffer,
     gather_grid: (u32, u32, u32),
-    /// The sampler `gather.wgsl`'s textureGather needs.
+    /// The sampler `gather.wgsl` and `gather_r16.wgsl`'s textureGather need.
     gather_sampler: wgpu::Sampler,
+    /// `gather_r16.wgsl`'s pipeline, compiled on first 16-bit texture encode.
+    gather_r16_pipeline: GatherR16Pipeline,
+    /// Buffers and `fdwt` stages for 16-bit UNORM pictures, allocated on the
+    /// first 16-bit encode and reused thereafter.
+    planes16: Option<Planes16Resources>,
     /// `gather_rgb.wgsl`'s parameters and workgroups, and its pipelines,
     /// which the context builds for the first picture in RGB.
     gather_rgb: wgpu::Buffer,
@@ -515,6 +672,9 @@ impl Encoder {
                 signalling,
                 sequence: 0,
                 pipelines: Arc::clone(&pipelines),
+                shared_uploads,
+                r16_source: context.supports_source_format(PLANE_FORMAT_R16),
+                rg16_source: context.supports_source_format(CHROMA_FORMAT_RG16),
                 upload_mapped: upload.is_some(),
                 planes,
                 upload,
@@ -523,6 +683,8 @@ impl Encoder {
                 gather_luma_chroma,
                 gather_grid: gather_planes_data.grid(),
                 gather_sampler,
+                gather_r16_pipeline: context.gather_r16_pipeline(),
+                planes16: None,
                 gather_rgb,
                 gather_rgb_grid: gather_rgb_data.grid(layout.chroma()),
                 rgb_pipelines: context.rgb_pipelines(),
@@ -594,6 +756,22 @@ impl Encoder {
         self.context_id
     }
 
+    /// Whether this encoder can read source textures in `format` via
+    /// [`encode_textures`](Self::encode_textures). `R8Unorm`, `Rg8Unorm`,
+    /// `Rgba8Unorm`, and `Bgra8Unorm` are always supported; `R16Unorm` and
+    /// `Rg16Unorm` (P010) require [`wgpu::Features::TEXTURE_FORMAT_16BIT_NORM`].
+    pub fn supports_source_format(&self, format: wgpu::TextureFormat) -> bool {
+        match format {
+            PLANE_FORMAT
+            | wgpu::TextureFormat::Rg8Unorm
+            | wgpu::TextureFormat::Rgba8Unorm
+            | wgpu::TextureFormat::Bgra8Unorm => true,
+            PLANE_FORMAT_R16 => self.r16_source,
+            CHROMA_FORMAT_RG16 => self.rg16_source,
+            _ => false,
+        }
+    }
+
     /// Encodes one picture into a frame of at most `budget` bytes: a start of
     /// frame header and the coded blocks in block index order, as a PWV1 file
     /// stores a frame and as [`crate::encode::Encoder::encode`] makes it.
@@ -636,6 +814,64 @@ impl Encoder {
         budget: usize,
     ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
         self.run_encode(Input::Planes(planes, None), budget, true, None)
+    }
+
+    /// Encodes one 16-bit unsigned normalised picture into a frame of at most
+    /// `budget` bytes, as [`crate::encode::Encoder::encode_u16`] does on the
+    /// CPU (decision D77).
+    ///
+    /// Each `u16` sample maps to `f32::from(sample) / 65535.0 - 0.5`, which
+    /// covers both full-range 16-bit UNORM values (such as 10-bit levels
+    /// scaled to `0..=65535`) and P010-style upper-10-bit values (`c << 6`).
+    /// Works on every GPU context, including strict WebGPU contexts without
+    /// `TEXTURE_FORMAT_16BIT_NORM`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn encode_u16(&mut self, planes: [&[u16]; 3], budget: usize) -> Result<Vec<u8>, GpuError> {
+        self.run_encode(Input::Planes16(planes, None), budget, false, None)
+            .map(|(frame, _)| frame)
+    }
+
+    /// Encodes like [`encode_u16`](Self::encode_u16) a 16-bit picture whose
+    /// rows are `strides` samples (not bytes) apart: plane `i` holds at least
+    /// `(height - 1) * strides[i] + width` `u16` samples, and samples between
+    /// rows are not read. A stride below the plane width is
+    /// [`EncodeError::PlaneStride`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn encode_u16_strided(
+        &mut self,
+        planes: [&[u16]; 3],
+        strides: [usize; 3],
+        budget: usize,
+    ) -> Result<Vec<u8>, GpuError> {
+        self.run_encode(Input::Planes16(planes, Some(strides)), budget, false, None)
+            .map(|(frame, _)| frame)
+    }
+
+    /// Encodes like [`encode_u16_strided`](Self::encode_u16_strided) a picture
+    /// stored as little-endian 16-bit unsigned normalised samples in byte
+    /// slices whose rows are `strides` bytes apart: plane `i` holds at least
+    /// `(height - 1) * strides[i] + 2 * width` bytes. A stride below
+    /// `2 * width` is [`EncodeError::PlaneStride`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn encode_u16_le_strided(
+        &mut self,
+        planes: [&[u8]; 3],
+        strides: [usize; 3],
+        budget: usize,
+    ) -> Result<Vec<u8>, GpuError> {
+        self.run_encode(Input::Planes16Le(planes, strides), budget, false, None)
+            .map(|(frame, _)| frame)
+    }
+
+    /// Encodes like [`encode_u16`](Self::encode_u16) and reports timings, as
+    /// [`encode_timed`](Self::encode_timed) does.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn encode_u16_timed(
+        &mut self,
+        planes: [&[u16]; 3],
+        budget: usize,
+    ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
+        self.run_encode(Input::Planes16(planes, None), budget, true, None)
     }
 
     /// Encodes a picture that is in GPU memory already, as textures on the
@@ -743,15 +979,27 @@ impl Encoder {
         let prepare_start = Instant::now();
         // The planes in the upload buffer, or a pass that gathers them from
         // the textures.
-        let gather = match input {
+        let (gather, is_16bit) = match input {
             Input::Planes(planes, strides) => {
                 self.upload_planes(planes, strides)?;
-                None
+                (None, false)
             }
-            Input::Textures(picture) => Some(self.gather(picture)?),
+            Input::Planes16(planes, strides) => {
+                self.upload_planes_u16(planes, strides)?;
+                (None, true)
+            }
+            Input::Planes16Le(planes, strides) => {
+                self.upload_planes_u16_le(planes, strides)?;
+                (None, true)
+            }
+            Input::Textures(picture) => {
+                let (gather, is_16bit) = self.gather(picture)?;
+                (Some(gather), is_16bit)
+            }
             Input::Rgb { rgb, stride, order } => {
                 let view = self.upload_rgb(rgb, stride, order)?;
-                Some(self.gather(TexturePicture::Rgb(&view))?)
+                let (gather, is_16bit) = self.gather(TexturePicture::Rgb(&view))?;
+                (Some(gather), is_16bit)
             }
         };
         let rgb_upload = matches!(input, Input::Rgb { .. });
@@ -798,12 +1046,12 @@ impl Encoder {
                 });
             encoder.clear_buffer(&self.rate_state, 0, None);
             if gather.is_none() {
-                self.encode_upload(&mut encoder);
+                self.encode_upload(&mut encoder, is_16bit);
             }
             if rgb_upload {
                 self.encode_rgb_upload(&mut encoder);
             }
-            self.encode_transform(&mut encoder, gather.as_ref(), queries);
+            self.encode_transform(&mut encoder, gather.as_ref(), is_16bit, queries);
             self.encode_quantisation(&mut encoder, queries);
             self.encode_rate_control(&mut encoder, queries);
             self.encode_packing(&mut encoder, queries);
@@ -1016,43 +1264,162 @@ impl Encoder {
         Ok(())
     }
 
-    /// The pass that packs `picture` into the planes buffer, or an error if
-    /// its textures cannot hold their planes.
-    fn gather(&self, picture: TexturePicture<'_>) -> Result<Gather, GpuError> {
+    /// Ensures the lazy 16-bit plane buffers and transform stages exist.
+    fn ensure_planes16(&mut self) -> Result<&mut Planes16Resources, GpuError> {
+        if self.planes16.is_none() {
+            let made = Planes16Resources::new(
+                &self.device,
+                &self.queue,
+                self.turns.as_deref(),
+                &self.layout,
+                &self.buffers,
+                &self.pyramid,
+                &self.sample_levels,
+                &self.pipelines,
+                self.shared_uploads,
+            )?;
+            self.planes16 = Some(made);
+        }
+        Ok(self.planes16.as_mut().expect("made above"))
+    }
+
+    /// Writes 16-bit UNORM planes into the 16-bit upload buffer, rows padded
+    /// to whole `u32` words (two `u16` samples per word, little-endian).
+    fn upload_planes_u16(
+        &mut self,
+        planes: [&[u16]; 3],
+        strides: Option<[usize; 3]>,
+    ) -> Result<(), GpuError> {
+        match strides {
+            None => check_planes_u16(&self.layout, planes)?,
+            Some(strides) => check_strided_planes_u16(&self.layout, planes, strides)?,
+        }
+        self.ensure_planes16()?;
+        let device = self.device.clone();
+        let planes16 = self.planes16.as_mut().expect("made above");
+        planes16.map_upload(&device)?;
+        let written = write_planes_u16(&self.layout, planes16, planes, strides);
+        let unmapped = planes16.unmap_upload(&device);
+        written?;
+        unmapped
+    }
+
+    /// Writes little-endian 16-bit UNORM byte planes with byte strides into
+    /// the 16-bit upload buffer, rows padded to whole `u32` words.
+    fn upload_planes_u16_le(
+        &mut self,
+        planes: [&[u8]; 3],
+        strides: [usize; 3],
+    ) -> Result<(), GpuError> {
+        check_strided_planes_u16_le(&self.layout, planes, strides)?;
+        self.ensure_planes16()?;
+        let device = self.device.clone();
+        let planes16 = self.planes16.as_mut().expect("made above");
+        planes16.map_upload(&device)?;
+        let written = write_planes_u16_le(&self.layout, planes16, planes, strides);
+        let unmapped = planes16.unmap_upload(&device);
+        written?;
+        unmapped
+    }
+
+    /// The pass that packs `picture` into the 8-bit or 16-bit planes buffer,
+    /// returning `(gather, is_16bit)`, or an error if its textures cannot hold
+    /// their planes or require an unsupported GPU feature.
+    fn gather(&mut self, picture: TexturePicture<'_>) -> Result<(Gather, bool), GpuError> {
         let size = |component| self.layout.plane_size(component);
-        let (views, params) = match picture {
+        let (views, is_16bit, luma_chroma) = match picture {
             TexturePicture::Planes(views) => {
                 for ((view, component), name) in
                     views.iter().zip(Component::ALL).zip(["Y", "Cb", "Cr"])
                 {
-                    check_texture(view, name, &[wgpu::TextureFormat::R8Unorm], size(component))?;
+                    check_texture(view, name, &PLANE_FORMATS, size(component))?;
                 }
-                (views, &self.gather_planes)
+                let format = views[0].texture().format();
+                if views[1].texture().format() != format || views[2].texture().format() != format {
+                    return Err(GpuError::Texture(
+                        "the Y, Cb and Cr textures must have the same format".to_owned(),
+                    ));
+                }
+                (views, format == PLANE_FORMAT_R16, false)
             }
             TexturePicture::LumaChroma { luma, chroma } => {
-                check_texture(
-                    luma,
-                    "luma",
-                    &[wgpu::TextureFormat::R8Unorm],
-                    size(Component::Y),
-                )?;
-                check_texture(
-                    chroma,
-                    "chroma",
-                    &[wgpu::TextureFormat::Rg8Unorm],
-                    size(Component::Cb),
-                )?;
-                ([luma, chroma, chroma], &self.gather_luma_chroma)
+                check_texture(luma, "luma", &PLANE_FORMATS, size(Component::Y))?;
+                check_texture(chroma, "chroma", &CHROMA_FORMATS, size(Component::Cb))?;
+                let is_16bit = match (luma.texture().format(), chroma.texture().format()) {
+                    (PLANE_FORMAT, wgpu::TextureFormat::Rg8Unorm) => false,
+                    (PLANE_FORMAT_R16, CHROMA_FORMAT_RG16) => true,
+                    (luma_format, chroma_format) => {
+                        return Err(GpuError::Texture(format!(
+                            "the luma texture is {luma_format:?} and the chroma texture is \
+                             {chroma_format:?}, which do not match: use R8Unorm with Rg8Unorm, \
+                             or R16Unorm with Rg16Unorm"
+                        )));
+                    }
+                };
+                ([luma, chroma, chroma], is_16bit, true)
             }
-            TexturePicture::Rgb(view) => return self.gather_rgb(view),
+            TexturePicture::Rgb(view) => return self.gather_rgb(view).map(|g| (g, false)),
         };
-        let stage = &self.pipelines.gather;
+
+        if !is_16bit {
+            let params = if luma_chroma {
+                &self.gather_luma_chroma
+            } else {
+                &self.gather_planes
+            };
+            let stage = &self.pipelines.gather;
+            let bind_group = with_error_scope(&self.device, || {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("gather"),
+                    layout: &stage.layout,
+                    entries: &[
+                        entry(0, &self.planes),
+                        entry(1, params),
+                        texture(2, views[0]),
+                        texture(3, views[1]),
+                        texture(4, views[2]),
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::Sampler(&self.gather_sampler),
+                        },
+                    ],
+                })
+            })?;
+            return Ok((
+                Gather {
+                    pipeline: stage.pipeline.clone(),
+                    bind_group,
+                    grid: self.gather_grid,
+                },
+                false,
+            ));
+        }
+
+        if !self.r16_source || (luma_chroma && !self.rg16_source) {
+            return Err(GpuError::Unsupported(if luma_chroma {
+                "16-bit normalised P010 source textures (R16Unorm + Rg16Unorm) require the \
+                 TEXTURE_FORMAT_16BIT_NORM GPU feature, which this device does not support"
+                    .to_owned()
+            } else {
+                "16-bit normalised source textures (R16Unorm) require the \
+                 TEXTURE_FORMAT_16BIT_NORM GPU feature, which this device does not support"
+                    .to_owned()
+            }));
+        }
+        let stage = self.gather_r16_pipeline.get(&self.device)?;
+        self.ensure_planes16()?;
+        let planes16 = self.planes16.as_ref().expect("made above");
+        let params = if luma_chroma {
+            &planes16.gather_luma_chroma
+        } else {
+            &planes16.gather_planes
+        };
         let bind_group = with_error_scope(&self.device, || {
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("gather"),
+                label: Some("gather r16"),
                 layout: &stage.layout,
                 entries: &[
-                    entry(0, &self.planes),
+                    entry(0, &planes16.planes),
                     entry(1, params),
                     texture(2, views[0]),
                     texture(3, views[1]),
@@ -1064,11 +1431,14 @@ impl Encoder {
                 ],
             })
         })?;
-        Ok(Gather {
-            pipeline: stage.pipeline.clone(),
-            bind_group,
-            grid: self.gather_grid,
-        })
+        Ok((
+            Gather {
+                pipeline: stage.pipeline.clone(),
+                bind_group,
+                grid: planes16.gather_grid,
+            },
+            true,
+        ))
     }
 
     /// The pass that converts a picture in an RGB texture into the planes
@@ -1164,8 +1534,20 @@ impl Encoder {
 
     /// Records the copy of the uploaded planes into the planes buffer, if
     /// they went into the upload buffer.
-    fn encode_upload(&self, encoder: &mut wgpu::CommandEncoder) {
-        if let Some(upload) = &self.upload {
+    fn encode_upload(&self, encoder: &mut wgpu::CommandEncoder, is_16bit: bool) {
+        if is_16bit {
+            if let Some(planes16) = &self.planes16 {
+                if let Some(upload) = &planes16.upload {
+                    encoder.copy_buffer_to_buffer(
+                        upload,
+                        0,
+                        &planes16.planes,
+                        0,
+                        planes16.layout.packed_words * 4,
+                    );
+                }
+            }
+        } else if let Some(upload) = &self.upload {
             encoder.copy_buffer_to_buffer(
                 upload,
                 0,
@@ -1182,6 +1564,7 @@ impl Encoder {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         gather: Option<&Gather>,
+        is_16bit: bool,
         queries: Option<&StageQueries>,
     ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1197,7 +1580,12 @@ impl Encoder {
             pass.dispatch_workgroups(x, y, z);
         }
         pass.set_pipeline(&self.pipelines.fdwt.pipeline);
-        for stage in &self.fdwt_stages {
+        let stages = if is_16bit {
+            &self.planes16.as_ref().expect("planes16 made").fdwt_stages
+        } else {
+            &self.fdwt_stages
+        };
+        for stage in stages {
             pass.set_bind_group(0, &stage.bind_group, &[]);
             pass.dispatch_workgroups(stage.grid.0, stage.grid.1, stage.grid.2);
         }
@@ -1352,6 +1740,95 @@ impl PackBuffers<'_> {
     }
 }
 
+/// Writes 16-bit UNORM planes into the mapped 16-bit upload buffer, two `u16`
+/// samples per little-endian `u32` word, rows padded to whole words with zeros.
+fn write_planes_u16(
+    layout: &FrameLayout,
+    planes16: &Planes16Resources,
+    planes: [&[u16]; 3],
+    strides: Option<[usize; 3]>,
+) -> Result<(), GpuError> {
+    let mut view = planes16
+        .upload_target()
+        .slice(..)
+        .get_mapped_range_mut()
+        .map_err(|error| GpuError::Device(error.to_string()))?;
+    for (component, plane) in Component::ALL.into_iter().zip(planes) {
+        let i = component.index();
+        let (width, height) = layout.plane_size(component);
+        let (width, height) = (width as usize, height as usize);
+        let row_bytes = width * 2;
+        let source_stride = strides.map_or(width, |strides| strides[i]);
+        let stride_bytes = planes16.layout.packed_strides[i] as usize * 4;
+        let start = planes16.layout.packed_offsets[i] as usize * 4;
+        if cfg!(target_endian = "little") && row_bytes == stride_bytes && source_stride == width {
+            view.slice(start..start + row_bytes * height)
+                .copy_from_slice(bytemuck::cast_slice(&plane[..width * height]));
+            continue;
+        }
+        for row in 0..height {
+            let samples = &plane[row * source_stride..][..width];
+            let at = start + row * stride_bytes;
+            if cfg!(target_endian = "little") {
+                view.slice(at..at + row_bytes)
+                    .copy_from_slice(bytemuck::cast_slice(samples));
+            } else {
+                for (col, &sample) in samples.iter().enumerate() {
+                    let bytes = sample.to_le_bytes();
+                    view.slice(at + col * 2..at + col * 2 + 2)
+                        .copy_from_slice(&bytes);
+                }
+            }
+            if row_bytes < stride_bytes {
+                view.slice(at + row_bytes..at + stride_bytes).fill(0);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Writes little-endian 16-bit UNORM byte planes with byte strides into the
+/// mapped 16-bit upload buffer, rows padded to whole `u32` words with zeros.
+fn write_planes_u16_le(
+    layout: &FrameLayout,
+    planes16: &Planes16Resources,
+    planes: [&[u8]; 3],
+    strides: [usize; 3],
+) -> Result<(), GpuError> {
+    let mut view = planes16
+        .upload_target()
+        .slice(..)
+        .get_mapped_range_mut()
+        .map_err(|error| GpuError::Device(error.to_string()))?;
+    for (component, plane) in Component::ALL.into_iter().zip(planes) {
+        let i = component.index();
+        let (width, height) = layout.plane_size(component);
+        let (width, height) = (width as usize, height as usize);
+        let row_bytes = width * 2;
+        let source_stride = strides[i];
+        let stride_bytes = planes16.layout.packed_strides[i] as usize * 4;
+        let start = planes16.layout.packed_offsets[i] as usize * 4;
+        if row_bytes == stride_bytes && source_stride == row_bytes {
+            view.slice(start..start + row_bytes * height)
+                .copy_from_slice(&plane[..row_bytes * height]);
+            continue;
+        }
+        for row in 0..height {
+            let bytes = &plane[row * source_stride..][..row_bytes];
+            let at = start + row * stride_bytes;
+            view.slice(at..at + row_bytes).copy_from_slice(bytes);
+            if row_bytes < stride_bytes {
+                view.slice(at + row_bytes..at + stride_bytes).fill(0);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The formats of the interleaved chroma texture of [`TexturePicture::LumaChroma`].
+const CHROMA_FORMATS: [wgpu::TextureFormat; 2] =
+    [wgpu::TextureFormat::Rg8Unorm, CHROMA_FORMAT_RG16];
+
 /// The formats of the textures of [`TexturePicture::Rgb`].
 const RGB_FORMATS: [wgpu::TextureFormat; 2] = [
     wgpu::TextureFormat::Rgba8Unorm,
@@ -1434,6 +1911,9 @@ impl Drop for Encoder {
     fn drop(&mut self) {
         if let Some(upload) = &self.upload {
             upload.destroy();
+        }
+        if let Some(planes16) = &self.planes16 {
+            planes16.destroy();
         }
         if let Some(upload) = &self.rgb_upload {
             upload.destroy();

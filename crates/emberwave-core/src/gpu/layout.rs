@@ -133,6 +133,39 @@ impl BufferLayout {
     }
 }
 
+/// Where packed 16-bit UNORM planes live in the encoder's 16-bit planes buffer,
+/// in 32-bit words (two 16-bit samples per word, rows padded to whole words).
+#[derive(Debug, Clone)]
+pub(crate) struct Planes16Layout {
+    /// Word offset of each packed 16-bit plane.
+    pub packed_offsets: [u32; NUM_COMPONENTS],
+    /// Words per row of each packed 16-bit plane (`ceil(width / 2)`).
+    pub packed_strides: [u32; NUM_COMPONENTS],
+    /// Size of the packed 16-bit planes in words.
+    pub packed_words: u64,
+}
+
+impl Planes16Layout {
+    /// Computes the packed 16-bit plane layout for `layout`.
+    pub(crate) fn new(layout: &FrameLayout) -> Result<Self, GpuError> {
+        let mut packed_offsets = [0; NUM_COMPONENTS];
+        let mut packed_strides = [0; NUM_COMPONENTS];
+        let mut packed_words = 0u64;
+        for component in Component::ALL {
+            let (width, height) = layout.plane_size(component);
+            let stride = width.div_ceil(2);
+            packed_offsets[component.index()] = to_offset(packed_words)?;
+            packed_strides[component.index()] = stride;
+            packed_words += u64::from(stride) * u64::from(height);
+        }
+        Ok(Self {
+            packed_offsets,
+            packed_strides,
+            packed_words,
+        })
+    }
+}
+
 /// Buffer offsets must fit the `u32` the shaders index with.
 fn to_offset(value: u64) -> Result<u32, GpuError> {
     u32::try_from(value).map_err(|_| GpuError::TooLarge)
@@ -486,6 +519,25 @@ impl GatherParams {
         params
     }
 
+    /// The parameters for 16-bit UNORM pictures of `layout` packed into
+    /// `planes16`, with Cr in the green channel of its texture if `cr_in_green`
+    /// (P010 / biplanar 16-bit).
+    pub(crate) fn new_u16(
+        layout: &FrameLayout,
+        planes16: &Planes16Layout,
+        cr_in_green: bool,
+    ) -> Self {
+        let mut params = Self::zeroed();
+        for component in Component::ALL {
+            let i = component.index();
+            (params.width[i], params.height[i]) = layout.plane_size(component);
+            params.offset[i] = planes16.packed_offsets[i];
+            params.stride[i] = planes16.packed_strides[i];
+        }
+        params.channel[Component::Cr.index()] = u32::from(cr_in_green);
+        params
+    }
+
     /// Workgroups of the dispatch: the words of the longest row in x and the
     /// pairs of rows of the tallest plane in y, 16 of each to a workgroup,
     /// and the components in z.
@@ -650,6 +702,28 @@ impl TransformLevel {
         }
 
         Self { params, components }
+    }
+
+    /// Parameters for the 16-bit forward transform between the bands of `level`
+    /// and its image: finest levels read two 16-bit UNORM samples per word from
+    /// the 16-bit planes buffer (`is_plane = 2`).
+    pub(crate) fn new_u16(
+        layout: &FrameLayout,
+        buffers: &BufferLayout,
+        planes16: &Planes16Layout,
+        level: usize,
+    ) -> Self {
+        let mut stage = Self::new(layout, buffers, level);
+        for component in Component::ALL {
+            if level == layout.finest_level(component) {
+                let i = component.index();
+                let comp = &mut stage.params.comps[i];
+                comp.image_offset = planes16.packed_offsets[i];
+                comp.image_stride = planes16.packed_strides[i];
+                comp.is_plane = 2;
+            }
+        }
+        stage
     }
 
     /// Workgroup grid: 32x32 tiles of the image in x and y, components in z.
@@ -876,6 +950,46 @@ mod tests {
         for offset in buffers.packed_offsets {
             assert_eq!(offset % DECODER_PLANE_WORDS, 0);
         }
+    }
+
+    #[test]
+    fn packed_16bit_plane_sizes_and_levels() {
+        let layout = layout_420(); // 200x120, chroma 100x60
+        let buffers = BufferLayout::new(&layout).unwrap();
+        let planes16 = Planes16Layout::new(&layout).unwrap();
+        assert_eq!(planes16.packed_strides, [100, 50, 50]);
+        assert_eq!(planes16.packed_offsets, [0, 100 * 120, 100 * 120 + 50 * 60]);
+        assert_eq!(planes16.packed_words, 100 * 120 + 2 * 50 * 60);
+
+        let gather = GatherParams::new_u16(&layout, &planes16, true);
+        assert_eq!(gather.stride, [100, 50, 50, 0]);
+        assert_eq!(gather.channel, [0, 0, 1, 0]);
+        assert_eq!(gather.grid(), (100u32.div_ceil(16), 60u32.div_ceil(16), 3));
+
+        // Finest levels point at the 16-bit buffer with is_plane = 2; coarser
+        // levels still point at the pyramid with is_plane = 0.
+        let l0 = TransformLevel::new_u16(&layout, &buffers, &planes16, 0);
+        assert_eq!(l0.params.comps[0].is_plane, 2);
+        assert_eq!(l0.params.comps[0].image_offset, planes16.packed_offsets[0]);
+        assert_eq!(l0.params.comps[0].image_stride, planes16.packed_strides[0]);
+        let l1 = TransformLevel::new_u16(&layout, &buffers, &planes16, 1);
+        assert_eq!(l1.params.comps[0].is_plane, 0);
+        assert_eq!(l1.params.comps[1].is_plane, 2);
+        assert_eq!(l1.params.comps[1].image_offset, planes16.packed_offsets[1]);
+        assert_eq!(l1.params.comps[2].is_plane, 2);
+        assert_eq!(l1.params.comps[2].image_offset, planes16.packed_offsets[2]);
+
+        // Odd widths round up to whole u32 words (2 u16 samples per word).
+        let odd = FrameLayout::new(131, 67, ChromaSubsampling::Yuv444).unwrap();
+        let odd_p16 = Planes16Layout::new(&odd).unwrap();
+        assert_eq!(odd_p16.packed_strides, [66, 66, 66]);
+        assert_eq!(odd_p16.packed_words, 3 * 66 * 67);
+
+        // Max 16384x16384 4:4:4 fits 32-bit word offsets.
+        let max = FrameLayout::new(16384, 16384, ChromaSubsampling::Yuv444).unwrap();
+        let max_p16 = Planes16Layout::new(&max).unwrap();
+        assert_eq!(max_p16.packed_strides, [8192, 8192, 8192]);
+        assert_eq!(max_p16.packed_words, 3 * 8192 * 16384);
     }
 
     #[test]

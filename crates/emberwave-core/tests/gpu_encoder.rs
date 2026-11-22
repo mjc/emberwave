@@ -626,7 +626,7 @@ fn textures_that_cannot_hold_their_planes_are_errors() {
         (
             "format",
             TexturePicture::Planes([&rgba, &good.planes[1], &good.planes[2]]),
-            "the Y texture is Rgba8Unorm rather than R8Unorm",
+            "the Y texture is Rgba8Unorm rather than R8Unorm or R16Unorm",
         ),
         (
             "size",
@@ -644,7 +644,7 @@ fn textures_that_cannot_hold_their_planes_are_errors() {
                 luma: &good.planes[0],
                 chroma: &flat_chroma,
             },
-            "the chroma texture is R8Unorm rather than Rg8Unorm",
+            "the chroma texture is R8Unorm rather than Rg8Unorm or Rg16Unorm",
         ),
     ];
     for (what, picture, message) in cases {
@@ -1189,4 +1189,433 @@ fn a_frame_that_outgrows_the_payload_buffer_decodes_as_in_a_new_decoder() {
             assert!(a.data == b.data, "{} bytes, plane {plane}", frame.len());
         }
     }
+}
+
+/// 16-bit UNORM picture textures (3-plane `R16Unorm` and P010 `R16Unorm` + `Rg16Unorm`).
+struct Textures16 {
+    _owned: Vec<wgpu::Texture>,
+    planes: [wgpu::TextureView; 3],
+    chroma: wgpu::TextureView,
+}
+
+impl Textures16 {
+    fn new(context: &GpuContext, layout: &FrameLayout, source: &[Vec<u16>; 3]) -> Self {
+        let usage = wgpu::TextureUsages::TEXTURE_BINDING;
+        let sizes = Component::ALL.map(|c| layout.plane_size(c));
+        let bytes: [Vec<u8>; 3] =
+            std::array::from_fn(|i| source[i].iter().flat_map(|s| s.to_le_bytes()).collect());
+        let mut owned: Vec<wgpu::Texture> = (0..3)
+            .map(|i| {
+                texture(
+                    context,
+                    emberwave_core::gpu::PLANE_FORMAT_R16,
+                    usage,
+                    sizes[i],
+                    &bytes[i],
+                )
+            })
+            .collect();
+        let interleaved: Vec<u8> = source[1]
+            .iter()
+            .zip(&source[2])
+            .flat_map(|(&cb, &cr)| {
+                let [cb0, cb1] = cb.to_le_bytes();
+                let [cr0, cr1] = cr.to_le_bytes();
+                [cb0, cb1, cr0, cr1]
+            })
+            .collect();
+        owned.push(texture(
+            context,
+            emberwave_core::gpu::CHROMA_FORMAT_RG16,
+            usage,
+            sizes[1],
+            &interleaved,
+        ));
+        let planes = std::array::from_fn(|i| owned[i].create_view(&Default::default()));
+        let chroma = owned[3].create_view(&Default::default());
+        Self {
+            _owned: owned,
+            planes,
+            chroma,
+        }
+    }
+
+    fn planes(&self) -> TexturePicture<'_> {
+        TexturePicture::Planes([&self.planes[0], &self.planes[1], &self.planes[2]])
+    }
+
+    fn p010(&self) -> TexturePicture<'_> {
+        TexturePicture::LumaChroma {
+            luma: &self.planes[0],
+            chroma: &self.chroma,
+        }
+    }
+}
+
+fn gradient_u16(layout: &FrameLayout, seed: u32, p010: bool) -> [Vec<u16>; 3] {
+    Component::ALL.map(|component| {
+        let (width, height) = layout.plane_size(component);
+        let base = 64 + component.index() as u32 * 100 + seed * 17;
+        (0..width * height)
+            .map(|i| {
+                let (x, y) = (i % width, i / width);
+                let code = (base + x * 4 + y * 3) % 940;
+                if p010 {
+                    (code as u16) << 6
+                } else {
+                    emberwave_core::cpu::unorm16(code as f32 / 1023.0)
+                }
+            })
+            .collect()
+    })
+}
+
+fn read_u16_texture(context: &GpuContext, texture: &wgpu::Texture) -> Vec<u16> {
+    let size = texture.size();
+    let row_bytes = size.width * 2;
+    let aligned = row_bytes.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let staging = context.device().create_buffer(&wgpu::BufferDescriptor {
+        label: Some("r16 readback"),
+        size: u64::from(aligned) * u64::from(size.height),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = context
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(aligned),
+                rows_per_image: Some(size.height),
+            },
+        },
+        size,
+    );
+    context.queue().submit([encoder.finish()]);
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+    context
+        .device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    rx.recv().unwrap().unwrap();
+    let mapped = slice.get_mapped_range().unwrap();
+    let mut out = Vec::with_capacity((size.width * size.height) as usize);
+    for row in 0..size.height as usize {
+        let bytes = &mapped[row * aligned as usize..][..row_bytes as usize];
+        for pair in bytes.chunks_exact(2) {
+            out.push(u16::from_le_bytes([pair[0], pair[1]]));
+        }
+    }
+    drop(mapped);
+    staging.unmap();
+    out
+}
+
+#[test]
+fn u16_planes_strided_and_textures_including_p010_encode_identically() {
+    let context = gpu_or_return!();
+    let has_r16 = context.supports_source_format(emberwave_core::gpu::PLANE_FORMAT_R16)
+        && context.supports_source_format(emberwave_core::gpu::CHROMA_FORMAT_RG16);
+    for (width, height, chroma) in [
+        (200, 120, ChromaSubsampling::Yuv420),
+        (131, 67, ChromaSubsampling::Yuv444),
+    ] {
+        let layout = FrameLayout::new(width, height, chroma).unwrap();
+        let mut from_u16 = encoder_for(context, &layout);
+        let mut from_strided = encoder_for(context, &layout);
+        let mut from_le = encoder_for(context, &layout);
+        let mut from_timed = encoder_for(context, &layout);
+        let mut from_planes_tex = encoder_for(context, &layout);
+        let mut from_p010_tex = encoder_for(context, &layout);
+
+        for (seed, p010) in [(0, false), (1, true)] {
+            let src = gradient_u16(&layout, seed, p010);
+            let expected = from_u16
+                .encode_u16([&src[0], &src[1], &src[2]], 30_000)
+                .unwrap();
+
+            // Sample-strided u16 planes with trailing garbage samples.
+            let mut strides_u16 = [0usize; 3];
+            let padded_u16: [Vec<u16>; 3] = std::array::from_fn(|i| {
+                let w = layout.plane_size(Component::ALL[i]).0 as usize;
+                let extra = 5 + i;
+                strides_u16[i] = w + extra;
+                src[i]
+                    .chunks_exact(w)
+                    .flat_map(|row| {
+                        row.iter()
+                            .copied()
+                            .chain(std::iter::repeat_n(0xBEEF, extra))
+                    })
+                    .collect()
+            });
+            let got_strided = from_strided
+                .encode_u16_strided(
+                    [&padded_u16[0], &padded_u16[1], &padded_u16[2]],
+                    strides_u16,
+                    30_000,
+                )
+                .unwrap();
+            assert_eq!(got_strided, expected);
+
+            // Byte-strided LE planes (including odd byte stride!).
+            let mut strides_le = [0usize; 3];
+            let padded_le: [Vec<u8>; 3] = std::array::from_fn(|i| {
+                let w = layout.plane_size(Component::ALL[i]).0 as usize;
+                let extra = 3 + i * 2;
+                strides_le[i] = w * 2 + extra;
+                src[i]
+                    .chunks_exact(w)
+                    .flat_map(|row| {
+                        row.iter()
+                            .flat_map(|s| s.to_le_bytes())
+                            .chain(std::iter::repeat_n(0xA5, extra))
+                    })
+                    .collect()
+            });
+            let got_le = from_le
+                .encode_u16_le_strided(
+                    [&padded_le[0], &padded_le[1], &padded_le[2]],
+                    strides_le,
+                    30_000,
+                )
+                .unwrap();
+            assert_eq!(got_le, expected);
+
+            let (got_timed, timings) = from_timed
+                .encode_u16_timed([&src[0], &src[1], &src[2]], 30_000)
+                .unwrap();
+            assert_eq!(got_timed, expected);
+            assert!(
+                timings.gpu_wall > std::time::Duration::ZERO
+                    || timings.prepare >= std::time::Duration::ZERO
+            );
+
+            if has_r16 {
+                let textures = Textures16::new(context, &layout, &src);
+                let got_planes = from_planes_tex
+                    .encode_textures(textures.planes(), 30_000)
+                    .unwrap();
+                assert_eq!(
+                    got_planes, expected,
+                    "{width}x{height} r16 planes seed {seed}"
+                );
+                let got_p010 = from_p010_tex
+                    .encode_textures(textures.p010(), 30_000)
+                    .unwrap();
+                assert_eq!(got_p010, expected, "{width}x{height} p010 seed {seed}");
+            }
+        }
+    }
+}
+
+#[test]
+fn u16_encode_to_r16_decode_roundtrip_preserves_10bit_precision() {
+    let context = gpu_or_return!();
+    if !context.supports_plane_format(emberwave_core::gpu::PLANE_FORMAT_R16)
+        || !context.supports_source_format(emberwave_core::gpu::PLANE_FORMAT_R16)
+        || !context.supports_source_format(emberwave_core::gpu::CHROMA_FORMAT_RG16)
+    {
+        return;
+    }
+    let layout = FrameLayout::new(192, 136, ChromaSubsampling::Yuv420).unwrap();
+    let src16 = gradient_u16(&layout, 0, false);
+    let src8: [Vec<u8>; 3] = std::array::from_fn(|i| {
+        src16[i]
+            .iter()
+            .map(|&s| ((u32::from(s) * 255 + 32767) / 65535) as u8)
+            .collect()
+    });
+
+    let mut enc16 = encoder_for(context, &layout);
+    let textures = Textures16::new(context, &layout, &src16);
+    let frame16 = enc16.encode_textures(textures.p010(), 80_000).unwrap();
+
+    let mut enc8 = encoder_for(context, &layout);
+    let frame8 = enc8.encode(planes(&src8), 80_000).unwrap();
+
+    let mut decoder = Decoder::new(context, 192, 136, ChromaSubsampling::Yuv420).unwrap();
+    let out_tex = Component::ALL.map(|c| {
+        decoder
+            .create_plane_texture_with_format(c, emberwave_core::gpu::PLANE_FORMAT_R16)
+            .unwrap()
+    });
+    let out_views: [_; 3] = std::array::from_fn(|i| out_tex[i].create_view(&Default::default()));
+
+    let decode_to_u16 = |decoder: &mut Decoder, frame: &[u8]| -> [Vec<u16>; 3] {
+        decoder.clear();
+        decoder.push_packet(frame).unwrap();
+        decoder
+            .decode_assembled_to_plane_textures([&out_views[0], &out_views[1], &out_views[2]])
+            .unwrap();
+        std::array::from_fn(|i| read_u16_texture(context, &out_tex[i]))
+    };
+
+    let dec16 = decode_to_u16(&mut decoder, &frame16);
+    let dec8 = decode_to_u16(&mut decoder, &frame8);
+
+    let psnr16_fn = |a: &[u16], b: &[u16]| -> f64 {
+        let mse = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2))
+            .sum::<f64>()
+            / a.len() as f64;
+        10.0 * (65535.0 * 65535.0 / mse.max(1e-12)).log10()
+    };
+    let psnr16 = (0..3)
+        .map(|i| psnr16_fn(&src16[i], &dec16[i]))
+        .fold(f64::INFINITY, f64::min);
+    let psnr8 = (0..3)
+        .map(|i| psnr16_fn(&src16[i], &dec8[i]))
+        .fold(f64::INFINITY, f64::min);
+    assert!(psnr16 > 60.0, "16-bit GPU round-trip PSNR {psnr16:.2} dB");
+    assert!(
+        psnr16 > psnr8 + 5.0,
+        "16-bit GPU round-trip ({psnr16:.2} dB) must beat 8-bit ({psnr8:.2} dB)"
+    );
+}
+
+#[test]
+fn u16_unsupported_feature_and_invalid_textures_are_rejected() {
+    let context = gpu_or_return!();
+    let layout = FrameLayout::new(64, 32, ChromaSubsampling::Yuv420).unwrap();
+
+    // Even under strict_webgpu or r16_planes = false (no TEXTURE_FORMAT_16BIT_NORM),
+    // CPU encode_u16 works, while supports_source_format reports false for R16/Rg16.
+    for mut opts in [
+        {
+            let mut o = common::options();
+            o.strict_webgpu = true;
+            o
+        },
+        {
+            let mut o = common::options();
+            o.r16_planes = false;
+            o
+        },
+    ] {
+        opts.timestamps = false;
+        if let Some(limited) = create_context(&opts) {
+            assert!(!limited.supports_source_format(emberwave_core::gpu::PLANE_FORMAT_R16));
+            assert!(!limited.supports_source_format(emberwave_core::gpu::CHROMA_FORMAT_RG16));
+            let mut enc = encoder_for(&limited, &layout);
+            assert!(!enc.supports_source_format(emberwave_core::gpu::PLANE_FORMAT_R16));
+            assert!(!enc.supports_source_format(emberwave_core::gpu::CHROMA_FORMAT_RG16));
+            let src = gradient_u16(&layout, 0, false);
+            let frame = enc
+                .encode_u16([&src[0], &src[1], &src[2]], 10_000)
+                .expect("CPU encode_u16 works without TEXTURE_FORMAT_16BIT_NORM");
+            assert_eq!(sequence_of(&frame), 1);
+        }
+    }
+
+    // Bad strides/sizes and mixed 8-bit/16-bit textures are rejected without
+    // advancing the sequence number.
+    let mut encoder = encoder_for(context, &layout);
+    let src16 = gradient_u16(&layout, 0, false);
+    assert!(matches!(
+        encoder.encode_u16_strided([&src16[0], &src16[1], &src16[2]], [64, 31, 32], 10_000),
+        Err(GpuError::Encode(EncodeError::PlaneStride {
+            component: Component::Cb,
+            stride: 31,
+            width: 32,
+        }))
+    ));
+    let bytes_le: [Vec<u8>; 3] =
+        std::array::from_fn(|i| src16[i].iter().flat_map(|s| s.to_le_bytes()).collect());
+    assert!(matches!(
+        encoder.encode_u16_le_strided(
+            [&bytes_le[0], &bytes_le[1], &bytes_le[2]],
+            [127, 64, 64],
+            10_000
+        ),
+        Err(GpuError::Encode(EncodeError::PlaneStride {
+            component: Component::Y,
+            stride: 127,
+            width: 128,
+        }))
+    ));
+
+    if context.supports_source_format(emberwave_core::gpu::PLANE_FORMAT_R16)
+        && context.supports_source_format(emberwave_core::gpu::CHROMA_FORMAT_RG16)
+    {
+        let src8: [Vec<u8>; 3] = std::array::from_fn(|i| {
+            let (w, h) = layout.plane_size(Component::ALL[i]);
+            vec![128u8; (w * h) as usize]
+        });
+        let tex8 = Textures::new(context, &layout, &src8);
+        let tex16 = Textures16::new(context, &layout, &src16);
+        for mixed in [
+            TexturePicture::Planes([&tex16.planes[0], &tex8.planes[1], &tex8.planes[2]]),
+            TexturePicture::Planes([&tex8.planes[0], &tex16.planes[1], &tex8.planes[2]]),
+            TexturePicture::LumaChroma {
+                luma: &tex16.planes[0],
+                chroma: &tex8.chroma,
+            },
+            TexturePicture::LumaChroma {
+                luma: &tex8.planes[0],
+                chroma: &tex16.chroma,
+            },
+        ] {
+            assert!(
+                matches!(
+                    encoder.encode_textures(mixed, 10_000),
+                    Err(GpuError::Texture(_))
+                ),
+                "mixed 8-bit/16-bit textures must fail"
+            );
+        }
+    }
+
+    let first = encoder
+        .encode_u16([&src16[0], &src16[1], &src16[2]], 10_000)
+        .unwrap();
+    assert_eq!(sequence_of(&first), 1);
+}
+
+#[test]
+fn encoding_u16_frame_after_frame_allocates_nothing() {
+    let Some(context) = create_context(&common::options()) else {
+        return;
+    };
+    let layout = FrameLayout::new(200, 120, ChromaSubsampling::Yuv420).unwrap();
+    let src = gradient_u16(&layout, 0, true);
+    let has_r16 = context.supports_source_format(emberwave_core::gpu::PLANE_FORMAT_R16)
+        && context.supports_source_format(emberwave_core::gpu::CHROMA_FORMAT_RG16);
+    let tex16 = has_r16.then(|| Textures16::new(&context, &layout, &src));
+    let mut encoder = encoder_for(&context, &layout);
+
+    let mut run_round = |round: usize| {
+        if let Some(tex) = &tex16 {
+            match round % 3 {
+                0 => encoder.encode_u16([&src[0], &src[1], &src[2]], 20_000),
+                1 => encoder.encode_textures(tex.planes(), 20_000),
+                _ => encoder.encode_textures(tex.p010(), 20_000),
+            }
+        } else {
+            encoder.encode_u16([&src[0], &src[1], &src[2]], 20_000)
+        }
+        .unwrap();
+    };
+    for round in 0..6 {
+        run_round(round);
+    }
+    let before = live_resources(&context);
+    for round in 0..24 {
+        run_round(round);
+    }
+    assert_eq!(
+        live_resources(&context),
+        before,
+        "live GPU objects and memory"
+    );
 }
