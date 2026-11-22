@@ -1398,3 +1398,309 @@ fn a_decoder_tells_what_arrived_and_a_context_its_gpu() {
         emberwave_context_destroy(context);
     }
 }
+
+#[test]
+fn context_info_keeps_first_size_and_reports_plane_r16_feature() {
+    let Some(context) = context() else {
+        return;
+    };
+    // SAFETY: a live context and structs as large as their sizes say.
+    unsafe {
+        let mut full = EmberwaveContextInfo::default();
+        assert_eq!(
+            emberwave_context_info(context, &mut full),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        assert_eq!(full.features & !EMBERWAVE_CONTEXT_FEATURE_PLANE_R16, 0);
+
+        let rust_context = GpuContext::new(&GpuOptions::from_env().unwrap_or_default()).unwrap();
+        let expected_r16 =
+            rust_context.supports_plane_format(emberwave_core::gpu::PLANE_FORMAT_R16);
+        assert_eq!(
+            full.features & EMBERWAVE_CONTEXT_FEATURE_PLANE_R16 != 0,
+            expected_r16
+        );
+
+        // A caller built with the 0.17 layout passes struct_size = 24 (6 u32s):
+        // the call succeeds and writes only those 6 fields, leaving `features`
+        // untouched.
+        #[repr(C)]
+        struct LegacyWithSentinel {
+            struct_size: u32,
+            backend: u32,
+            device_type: u32,
+            vendor_id: u32,
+            device_id: u32,
+            kind: u32,
+            sentinel: u32,
+        }
+        let mut legacy = LegacyWithSentinel {
+            struct_size: 24,
+            backend: 0,
+            device_type: 0,
+            vendor_id: 0,
+            device_id: 0,
+            kind: 0,
+            sentinel: 0x5a5a_5a5a,
+        };
+        assert_eq!(
+            emberwave_context_info(context, ptr::from_mut(&mut legacy).cast()),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        assert_eq!(legacy.backend, full.backend);
+        assert_eq!(legacy.device_type, full.device_type);
+        assert_eq!(legacy.vendor_id, full.vendor_id);
+        assert_eq!(legacy.device_id, full.device_id);
+        assert_eq!(legacy.kind, full.kind);
+        assert_eq!(legacy.sentinel, 0x5a5a_5a5a);
+
+        emberwave_context_destroy(context);
+    }
+}
+
+#[test]
+fn plane_textures_with_format_match_r8_support_r16_and_reject_bad_uses() {
+    let Some(context) = context() else {
+        return;
+    };
+    let bytes = testdata("noise_192x136_420.pwv1");
+    let frame = frames(&bytes)[0];
+    let decoder = decoder_for(context, &bytes);
+    // SAFETY: live context, decoder, encoder and textures, and valid buffers.
+    unsafe {
+        let mut ctx_info = EmberwaveContextInfo::default();
+        assert_eq!(
+            emberwave_context_info(context, &mut ctx_info),
+            EmberwaveStatus::Ok
+        );
+        let supports_r16 = ctx_info.features & EMBERWAVE_CONTEXT_FEATURE_PLANE_R16 != 0;
+
+        // Unknown format fails and nulls out the output pointer.
+        let mut marker = 0u8;
+        for bad_format in [2, 99] {
+            let mut bad_tex = ptr::from_mut(&mut marker).cast::<EmberwaveTexture>();
+            assert_eq!(
+                emberwave_texture_create_plane_with_format(
+                    decoder,
+                    EMBERWAVE_PLANE_Y,
+                    bad_format,
+                    &mut bad_tex
+                ),
+                EmberwaveStatus::InvalidArgument
+            );
+            assert!(bad_tex.is_null());
+            assert!(last_error().contains("format"), "{}", last_error());
+        }
+
+        // R8 textures via create_plane_with_format decode identically to decode_yuv.
+        let r8 = [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR].map(|plane| {
+            let mut texture = ptr::null_mut();
+            assert_eq!(
+                emberwave_texture_create_plane_with_format(
+                    decoder,
+                    plane,
+                    EMBERWAVE_PLANE_FORMAT_R8,
+                    &mut texture
+                ),
+                EmberwaveStatus::Ok,
+                "{}",
+                last_error()
+            );
+            texture
+        });
+
+        let mut frame_info = EmberwaveFrameInfo::default();
+        assert_eq!(
+            emberwave_decoder_info(decoder, &mut frame_info),
+            EmberwaveStatus::Ok
+        );
+        let (w, h) = (frame_info.width as usize, frame_info.height as usize);
+        let (cw, ch) = (
+            frame_info.chroma_width as usize,
+            frame_info.chroma_height as usize,
+        );
+        let mut y_mem = Target::new(w, h, 0);
+        let mut cb_mem = Target::new(cw, ch, 0);
+        let mut cr_mem = Target::new(cw, ch, 0);
+        assert_eq!(
+            emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+            EmberwaveStatus::Ok
+        );
+        assert_eq!(
+            emberwave_decoder_decode_yuv(decoder, y_mem.plane(), cb_mem.plane(), cr_mem.plane()),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+
+        emberwave_decoder_clear(decoder);
+        assert_eq!(
+            emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+            EmberwaveStatus::Ok
+        );
+        assert_eq!(
+            emberwave_decoder_decode_plane_textures(decoder, r8[0], r8[1], r8[2]),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+
+        let mut mem_encoder = ptr::null_mut();
+        assert_eq!(
+            emberwave_encoder_create(
+                context,
+                frame_info.width,
+                frame_info.height,
+                frame_info.chroma,
+                ptr::null(),
+                &mut mem_encoder
+            ),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        let mut expected_encoded = vec![0u8; 64 * 1024];
+        let mut expected_size = 0usize;
+        let src_plane = |data: &[u8], stride| EmberwaveSourcePlane {
+            data: data.as_ptr(),
+            stride,
+            size: data.len(),
+        };
+        assert_eq!(
+            emberwave_encoder_encode(
+                mem_encoder,
+                src_plane(&y_mem.bytes, w),
+                src_plane(&cb_mem.bytes, cw),
+                src_plane(&cr_mem.bytes, cw),
+                expected_encoded.as_mut_ptr(),
+                expected_encoded.len(),
+                &mut expected_size
+            ),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        emberwave_encoder_destroy(mem_encoder);
+        expected_encoded.truncate(expected_size);
+
+        let mut encoder = ptr::null_mut();
+        assert_eq!(
+            emberwave_encoder_create(
+                context,
+                frame_info.width,
+                frame_info.height,
+                frame_info.chroma,
+                ptr::null(),
+                &mut encoder
+            ),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+
+        let mut actual_encoded = vec![0u8; 64 * 1024];
+        let mut actual_size = 0usize;
+        assert_eq!(
+            emberwave_encoder_encode_textures(
+                encoder,
+                r8[0],
+                r8[1],
+                r8[2],
+                actual_encoded.as_mut_ptr(),
+                actual_encoded.len(),
+                &mut actual_size
+            ),
+            EmberwaveStatus::Ok,
+            "{}",
+            last_error()
+        );
+        actual_encoded.truncate(actual_size);
+        assert_eq!(actual_encoded, expected_encoded);
+
+        if supports_r16 {
+            let r16 = [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR].map(|plane| {
+                let mut texture = ptr::null_mut();
+                assert_eq!(
+                    emberwave_texture_create_plane_with_format(
+                        decoder,
+                        plane,
+                        EMBERWAVE_PLANE_FORMAT_R16,
+                        &mut texture
+                    ),
+                    EmberwaveStatus::Ok,
+                    "{}",
+                    last_error()
+                );
+                texture
+            });
+
+            emberwave_decoder_clear(decoder);
+            assert_eq!(
+                emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                EmberwaveStatus::Ok
+            );
+            // Mixed R8 and R16 fails with InvalidArgument and keeps the frame.
+            for mixed in [
+                [r16[0], r8[1], r8[2]],
+                [r8[0], r16[1], r8[2]],
+                [r8[0], r8[1], r16[2]],
+            ] {
+                assert_eq!(
+                    emberwave_decoder_decode_plane_textures(decoder, mixed[0], mixed[1], mixed[2]),
+                    EmberwaveStatus::InvalidArgument
+                );
+                assert!(emberwave_decoder_is_ready(decoder, 0));
+            }
+
+            assert_eq!(
+                emberwave_decoder_decode_plane_textures(decoder, r16[0], r16[1], r16[2]),
+                EmberwaveStatus::Ok,
+                "{}",
+                last_error()
+            );
+
+            // Passing an R16 plane texture to emberwave_encoder_encode_textures fails.
+            let mut tmp_encoded = vec![0u8; 64 * 1024];
+            let mut size = 0usize;
+            assert_eq!(
+                emberwave_encoder_encode_textures(
+                    encoder,
+                    r16[0],
+                    r8[1],
+                    r8[2],
+                    tmp_encoded.as_mut_ptr(),
+                    tmp_encoded.len(),
+                    &mut size
+                ),
+                EmberwaveStatus::InvalidArgument
+            );
+
+            for texture in r16 {
+                emberwave_texture_destroy(texture);
+            }
+        } else {
+            let mut texture = ptr::from_mut(&mut marker).cast::<EmberwaveTexture>();
+            assert_eq!(
+                emberwave_texture_create_plane_with_format(
+                    decoder,
+                    EMBERWAVE_PLANE_Y,
+                    EMBERWAVE_PLANE_FORMAT_R16,
+                    &mut texture
+                ),
+                EmberwaveStatus::Unsupported
+            );
+            assert!(texture.is_null());
+        }
+
+        for texture in r8 {
+            emberwave_texture_destroy(texture);
+        }
+        emberwave_encoder_destroy(encoder);
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+    }
+}

@@ -7,7 +7,7 @@
 
 use crate::bitstream::ChromaSubsampling;
 
-use super::decoder::PLANE_FORMAT;
+use super::decoder::{PLANE_FORMAT, PLANE_FORMAT_R16};
 use super::error::GpuError;
 use super::shader_sources;
 
@@ -78,9 +78,9 @@ impl Pipelines {
                     &[
                         storage_entry(0, false),
                         uniform_entry(2),
-                        plane_entry(3),
-                        plane_entry(4),
-                        plane_entry(5),
+                        plane_entry(3, PLANE_FORMAT),
+                        plane_entry(4, PLANE_FORMAT),
+                        plane_entry(5, PLANE_FORMAT),
                     ],
                 )
             })
@@ -88,6 +88,25 @@ impl Pipelines {
         }
         Ok(pipelines)
     }
+}
+
+/// The inverse transform stage that stores decoded planes into `r16unorm`
+/// storage textures. Built lazily on first 16-bit plane decode.
+pub(crate) fn idwt_planes_r16_stage(device: &wgpu::Device) -> Result<Stage, GpuError> {
+    with_error_scope(device, || {
+        create_stage(
+            device,
+            "idwt planes r16",
+            shader_sources::IDWT_PLANES_R16,
+            &[
+                storage_entry(0, false),
+                uniform_entry(2),
+                plane_entry(3, PLANE_FORMAT_R16),
+                plane_entry(4, PLANE_FORMAT_R16),
+                plane_entry(5, PLANE_FORMAT_R16),
+            ],
+        )
+    })
 }
 
 /// The stage of `conceal.wgsl`, the concealment of the blocks a frame drawn
@@ -291,14 +310,14 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-/// A plane's texture that `idwt_planes.wgsl` stores into.
-fn plane_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+/// A plane's texture that `idwt_planes.wgsl` or `idwt_planes_r16.wgsl` stores into.
+fn plane_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::StorageTexture {
             access: wgpu::StorageTextureAccess::WriteOnly,
-            format: PLANE_FORMAT,
+            format,
             view_dimension: wgpu::TextureViewDimension::D2,
         },
         count: None,
@@ -466,13 +485,22 @@ fn create_stages<const N: usize>(
     })
 }
 
-/// Runs `body` and turns validation and out-of-memory errors raised inside it
-/// into an error value instead of letting the default handler panic.
+/// Error captured by [`with_error_scope_kind`], separating wgpu validation
+/// errors from device errors such as internal or out-of-memory failures.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) enum ScopedError {
+    Validation(String),
+    Device(GpuError),
+}
+
+/// Runs `body` and turns validation, internal and out-of-memory errors raised
+/// inside it into a [`ScopedError`] instead of letting the default handler
+/// panic.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn with_error_scope<T>(
+pub(crate) fn with_error_scope_kind<T>(
     device: &wgpu::Device,
     body: impl FnOnce() -> T,
-) -> Result<T, GpuError> {
+) -> Result<T, ScopedError> {
     let memory_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     // Internal errors are what a driver's failure to compile a shader or to
     // build a pipeline becomes.
@@ -484,10 +512,36 @@ pub(crate) fn with_error_scope<T>(
     let internal = pollster::block_on(internal_scope.pop());
     let memory = pollster::block_on(memory_scope.pop());
 
-    match validation.or(internal).or(memory) {
-        Some(error) => Err(GpuError::Device(error.to_string())),
-        None => Ok(value),
+    if let Some(error) = validation {
+        Err(ScopedError::Validation(error.to_string()))
+    } else if let Some(error) = internal.or(memory) {
+        Err(ScopedError::Device(GpuError::Device(error.to_string())))
+    } else {
+        Ok(value)
     }
+}
+
+/// Runs `body` and turns validation and out-of-memory errors raised inside it
+/// into an error value instead of letting the default handler panic.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn with_error_scope<T>(
+    device: &wgpu::Device,
+    body: impl FnOnce() -> T,
+) -> Result<T, GpuError> {
+    with_error_scope_kind(device, body).map_err(|error| match error {
+        ScopedError::Validation(message) => GpuError::Device(message),
+        ScopedError::Device(error) => error,
+    })
+}
+
+/// In a browser nothing may block, so the scopes cannot be waited for. The
+/// work runs as it is; WebGPU reports its errors to the browser's console.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn with_error_scope_kind<T>(
+    _device: &wgpu::Device,
+    body: impl FnOnce() -> T,
+) -> Result<T, ScopedError> {
+    Ok(body())
 }
 
 /// In a browser nothing may block, so the scopes cannot be waited for. The

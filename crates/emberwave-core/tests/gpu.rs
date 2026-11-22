@@ -21,7 +21,10 @@ use emberwave_core::bitstream::{
 };
 use emberwave_core::color::{ColorMatrix, ColorParams, yuv_to_rgb8};
 use emberwave_core::cpu;
-use emberwave_core::gpu::{Decoder, Frame, GpuContext, GpuError, TEXTURE_FORMATS, TimedOutput};
+use emberwave_core::gpu::{
+    Decoder, Frame, GpuContext, GpuError, PLANE_FORMAT, PLANE_FORMAT_R16, TEXTURE_FORMATS,
+    TimedOutput,
+};
 
 /// Skips the current test when there is no GPU.
 macro_rules! gpu_or_return {
@@ -338,6 +341,13 @@ fn read_texture(context: &GpuContext, texture: &wgpu::Texture) -> Vec<u8> {
     mapped
         .chunks(padded as usize)
         .flat_map(|line| line[..row as usize].to_vec())
+        .collect()
+}
+
+fn read_texture_u16(context: &GpuContext, texture: &wgpu::Texture) -> Vec<u16> {
+    read_texture(context, texture)
+        .chunks_exact(2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
         .collect()
 }
 
@@ -2216,4 +2226,460 @@ fn encoding_into_a_callers_encoder_gives_the_same_picture() {
             decoder.decode_rgb(frame, &color).unwrap().data
         );
     }
+}
+
+fn empty_header_frame(width: u32, height: u32, chroma: ChromaSubsampling) -> Vec<u8> {
+    let word0 = (width - 1) | ((height - 1) << 14) | (1 << 28) | (1 << 31);
+    let word1 = u32::from(chroma == ChromaSubsampling::Yuv444) << 26;
+    [word0.to_le_bytes(), word1.to_le_bytes()].concat()
+}
+
+fn psnr_u16(reference: &[u16], test: &[u16]) -> f64 {
+    assert_eq!(reference.len(), test.len(), "plane sizes differ");
+    let squared_error: u128 = reference
+        .iter()
+        .zip(test)
+        .map(|(&a, &b)| {
+            let d = i64::from(a) - i64::from(b);
+            (d * d) as u128
+        })
+        .sum();
+    if squared_error == 0 {
+        return f64::INFINITY;
+    }
+    let mse = squared_error as f64 / reference.len() as f64;
+    10.0 * (65535.0f64 * 65535.0 / mse).log10()
+}
+
+#[test]
+fn r16_planes_match_cpu_reference_and_preserve_8bit_output() {
+    let context = gpu_or_return!();
+    if !context.supports_plane_format(PLANE_FORMAT_R16) {
+        return;
+    }
+
+    // 4:2:0 (including odd-chroma-padded sizes) and 4:4:4 with odd dimensions.
+    for name in [
+        "gradient_200x120_420",
+        "noise_192x136_420",
+        "noise_131x67_444",
+    ] {
+        let (layout, frames) = vector_frames(name);
+        let mut decoder = decoder_for(context, &layout);
+        assert!(decoder.supports_plane_format(PLANE_FORMAT));
+        assert!(decoder.supports_plane_format(PLANE_FORMAT_R16));
+
+        let r8_textures = Component::ALL.map(|component| {
+            decoder
+                .create_plane_texture_with_format(component, PLANE_FORMAT)
+                .expect("r8 plane texture")
+        });
+        let r8_views = r8_textures
+            .each_ref()
+            .map(|texture| texture.create_view(&Default::default()));
+
+        let r16_textures = Component::ALL.map(|component| {
+            decoder
+                .create_plane_texture_with_format(component, PLANE_FORMAT_R16)
+                .expect("r16 plane texture")
+        });
+        let r16_views = r16_textures
+            .each_ref()
+            .map(|texture| texture.create_view(&Default::default()));
+
+        let baseline_r8 = decoder.decode(&frames[0]).expect("baseline r8 decode");
+        let cpu_frame0 = cpu::decode_frame(&assembled(&layout, &frames[0]).frame()).unwrap();
+        let cpu_frame1 = cpu::decode_frame(&assembled(&layout, &frames[1]).frame()).unwrap();
+
+        // 1. decode_assembled_to_plane_textures
+        decoder.clear();
+        decoder.push_packet(&frames[0]).expect("packet");
+        decoder
+            .decode_assembled_to_plane_textures(r16_views.each_ref())
+            .expect("decode assembled to r16");
+        for (component, texture) in Component::ALL.into_iter().zip(&r16_textures) {
+            let actual = read_texture_u16(context, texture);
+            let expected = cpu_frame0.planes[component.index()].to_unorm16();
+            let max_diff = actual
+                .iter()
+                .zip(&expected)
+                .map(|(&a, &b)| a.abs_diff(b))
+                .max()
+                .unwrap_or(0);
+            let db = psnr_u16(&expected, &actual);
+            // GPU FMA may shift float DWT samples by ~1e-5 (< 2 LSBs at 16-bit).
+            assert!(
+                max_diff <= 2 && db >= 100.0,
+                "{name} {component:?} decode_assembled: max_diff={max_diff}, psnr={db:.2}"
+            );
+        }
+
+        // 2. record_to_plane_textures
+        let mut encoder = context.device().create_command_encoder(&Default::default());
+        decoder
+            .record_to_plane_textures(&frames[1], r16_views.each_ref(), &mut encoder)
+            .expect("record to r16");
+        context.queue().submit([encoder.finish()]);
+        for (component, texture) in Component::ALL.into_iter().zip(&r16_textures) {
+            let actual = read_texture_u16(context, texture);
+            let expected = cpu_frame1.planes[component.index()].to_unorm16();
+            let max_diff = actual
+                .iter()
+                .zip(&expected)
+                .map(|(&a, &b)| a.abs_diff(b))
+                .max()
+                .unwrap_or(0);
+            let db = psnr_u16(&expected, &actual);
+            assert!(
+                max_diff <= 2 && db >= 100.0,
+                "{name} {component:?} record: max_diff={max_diff}, psnr={db:.2}"
+            );
+        }
+
+        // 3. submit_assembled_to_plane_textures
+        decoder.clear();
+        decoder.push_packet(&frames[0]).expect("packet");
+        decoder
+            .submit_assembled_to_plane_textures(r16_views.each_ref())
+            .expect("submit assembled to r16");
+        for (component, texture) in Component::ALL.into_iter().zip(&r16_textures) {
+            let actual = read_texture_u16(context, texture);
+            let expected = cpu_frame0.planes[component.index()].to_unorm16();
+            let max_diff = actual
+                .iter()
+                .zip(&expected)
+                .map(|(&a, &b)| a.abs_diff(b))
+                .max()
+                .unwrap_or(0);
+            let db = psnr_u16(&expected, &actual);
+            assert!(
+                max_diff <= 2 && db >= 100.0,
+                "{name} {component:?} submit_assembled: max_diff={max_diff}, psnr={db:.2}"
+            );
+        }
+
+        // 8-bit plane output on the same decoder remains bit-identical after R16 decodes.
+        assert_eq!(decoder.decode(&frames[0]).expect("r8 decode"), baseline_r8);
+        decoder.clear();
+        decoder.push_packet(&frames[0]).expect("packet");
+        decoder
+            .decode_assembled_to_plane_textures(r8_views.each_ref())
+            .expect("r8 plane textures");
+        for (component, texture) in Component::ALL.into_iter().zip(&r8_textures) {
+            assert_eq!(
+                read_texture(context, texture),
+                baseline_r8.planes[component.index()].data,
+                "{name}: {component:?} 8-bit plane texture after R16"
+            );
+        }
+    }
+
+    // Empty frame (all-zero coefficients -> 0.5) decodes to exact 32768 (0x8000)
+    // in every R16 texel.
+    let layout = FrameLayout::new(160, 96, ChromaSubsampling::Yuv420).unwrap();
+    let mut decoder = decoder_for(context, &layout);
+    let r16_textures = Component::ALL.map(|component| {
+        decoder
+            .create_plane_texture_with_format(component, PLANE_FORMAT_R16)
+            .expect("r16 plane texture")
+    });
+    let r16_views = r16_textures
+        .each_ref()
+        .map(|texture| texture.create_view(&Default::default()));
+    let empty = empty_header_frame(160, 96, ChromaSubsampling::Yuv420);
+    decoder.push_packet(&empty).expect("empty header");
+    decoder
+        .decode_assembled_to_plane_textures(r16_views.each_ref())
+        .expect("empty r16 decode");
+    for (component, texture) in Component::ALL.into_iter().zip(&r16_textures) {
+        let samples = read_texture_u16(context, texture);
+        assert!(
+            samples.iter().all(|&s| s == 32768),
+            "{component:?} empty frame had sample != 32768"
+        );
+    }
+}
+
+#[test]
+fn r16_plane_format_is_unsupported_without_the_feature() {
+    let supported_context = gpu_or_return!();
+    let (layout, frames) = vector_frames("gradient_200x120_420");
+
+    // Prepare valid R16 textures on a context that supports them (if available),
+    // to verify that passing them to an unsupported decoder fails with
+    // Unsupported rather than silently falling back.
+    let r16_textures = supported_context
+        .supports_plane_format(PLANE_FORMAT_R16)
+        .then(|| {
+            Component::ALL.map(|component| {
+                let (width, height) = layout.plane_size(component);
+                supported_context
+                    .device()
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: Some("caller r16"),
+                        size: wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: PLANE_FORMAT_R16,
+                        usage: wgpu::TextureUsages::STORAGE_BINDING
+                            | wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    })
+            })
+        });
+
+    let mut strict = common::options();
+    strict.strict_webgpu = true;
+    let mut no_r16 = common::options();
+    no_r16.r16_planes = false;
+
+    for options in [strict, no_r16] {
+        let Some(context) = create_context(&options) else {
+            continue;
+        };
+        assert!(context.supports_plane_format(PLANE_FORMAT));
+        assert!(!context.supports_plane_format(PLANE_FORMAT_R16));
+        assert!(!context.supports_plane_format(wgpu::TextureFormat::Rgba8Unorm));
+
+        let mut decoder = decoder_for(&context, &layout);
+        assert!(decoder.supports_plane_format(PLANE_FORMAT));
+        assert!(!decoder.supports_plane_format(PLANE_FORMAT_R16));
+        assert!(!decoder.supports_plane_format(wgpu::TextureFormat::Rgba8Unorm));
+
+        for component in Component::ALL {
+            let outcome = decoder.create_plane_texture_with_format(component, PLANE_FORMAT_R16);
+            assert!(
+                matches!(outcome, Err(GpuError::Unsupported(_))),
+                "{outcome:?}"
+            );
+        }
+
+        if let Some(textures) = &r16_textures {
+            let views = textures
+                .each_ref()
+                .map(|texture| texture.create_view(&Default::default()));
+            decoder.clear();
+            decoder.push_packet(&frames[0]).expect("packet");
+            let outcome = decoder.decode_assembled_to_plane_textures(views.each_ref());
+            assert!(
+                matches!(outcome, Err(GpuError::Unsupported(_))),
+                "{outcome:?}"
+            );
+            let outcome = decoder.submit_assembled_to_plane_textures(views.each_ref());
+            assert!(
+                matches!(outcome, Err(GpuError::Unsupported(_))),
+                "{outcome:?}"
+            );
+            let mut encoder = context.device().create_command_encoder(&Default::default());
+            let outcome =
+                decoder.record_to_plane_textures(&frames[0], views.each_ref(), &mut encoder);
+            assert!(
+                matches!(outcome, Err(GpuError::Unsupported(_))),
+                "{outcome:?}"
+            );
+        }
+
+        // 8-bit decoding still works identically.
+        let r8_textures = Component::ALL.map(|component| {
+            decoder
+                .create_plane_texture(component)
+                .expect("r8 plane texture")
+        });
+        let r8_views = r8_textures
+            .each_ref()
+            .map(|texture| texture.create_view(&Default::default()));
+        let expected = decoder.decode(&frames[0]).expect("r8 decode");
+        decoder.clear();
+        decoder.push_packet(&frames[0]).expect("packet");
+        decoder
+            .decode_assembled_to_plane_textures(r8_views.each_ref())
+            .expect("r8 plane decode");
+        for (component, texture) in Component::ALL.into_iter().zip(&r8_textures) {
+            assert_eq!(
+                read_texture(&context, texture),
+                expected.planes[component.index()].data
+            );
+        }
+    }
+}
+
+#[test]
+fn caller_owned_r16_plane_textures_are_validated() {
+    let context = gpu_or_return!();
+    if !context.supports_plane_format(PLANE_FORMAT_R16) {
+        return;
+    }
+    let (layout, frames) = vector_frames("gradient_200x120_420");
+    let mut decoder = decoder_for(context, &layout);
+    let cpu_frame = cpu::decode_frame(&assembled(&layout, &frames[0]).frame()).unwrap();
+
+    let make = |(width, height), format, usage| {
+        context.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("caller plane"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        })
+    };
+
+    // Caller-owned R16 textures with STORAGE_BINDING | TEXTURE_BINDING | COPY_SRC
+    // (notably WITHOUT COPY_DST) must decode accurately.
+    let r16_usage = wgpu::TextureUsages::STORAGE_BINDING
+        | wgpu::TextureUsages::TEXTURE_BINDING
+        | wgpu::TextureUsages::COPY_SRC;
+    let r16_y = make(layout.plane_size(Component::Y), PLANE_FORMAT_R16, r16_usage);
+    let r16_cb = make(
+        layout.plane_size(Component::Cb),
+        PLANE_FORMAT_R16,
+        r16_usage,
+    );
+    let r16_cr = make(
+        layout.plane_size(Component::Cr),
+        PLANE_FORMAT_R16,
+        r16_usage,
+    );
+    let r16_views = [&r16_y, &r16_cb, &r16_cr].map(|t| t.create_view(&Default::default()));
+
+    decoder.clear();
+    decoder.push_packet(&frames[0]).expect("packet");
+    decoder
+        .decode_assembled_to_plane_textures(r16_views.each_ref())
+        .expect("caller r16 textures without COPY_DST");
+    for (component, texture) in Component::ALL.into_iter().zip([&r16_y, &r16_cb, &r16_cr]) {
+        let actual = read_texture_u16(context, texture);
+        let expected = cpu_frame.planes[component.index()].to_unorm16();
+        let max_diff = actual
+            .iter()
+            .zip(&expected)
+            .map(|(&a, &b)| a.abs_diff(b))
+            .max()
+            .unwrap_or(0);
+        assert!(max_diff <= 2, "{component:?}: max_diff={max_diff}");
+    }
+
+    // Invalid formats, mixed R8+R16, missing STORAGE_BINDING, wrong sizes, and
+    // duplicate textures must all be rejected with GpuError::Texture.
+    let (luma, chroma) = (
+        layout.plane_size(Component::Y),
+        layout.plane_size(Component::Cb),
+    );
+    let r8_y = make(luma, PLANE_FORMAT, wgpu::TextureUsages::COPY_DST);
+    let r8_cb = make(chroma, PLANE_FORMAT, wgpu::TextureUsages::COPY_DST);
+    let no_storage_cr = make(
+        chroma,
+        PLANE_FORMAT_R16,
+        wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+    );
+    let wrong_fmt_r16uint = make(
+        chroma,
+        wgpu::TextureFormat::R16Uint,
+        wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+    );
+    let wrong_fmt_rg8 = make(
+        chroma,
+        wgpu::TextureFormat::Rg8Unorm,
+        wgpu::TextureUsages::COPY_DST,
+    );
+    let wrong_fmt_rgba8 = make(
+        chroma,
+        wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::TextureUsages::COPY_DST,
+    );
+
+    let unsuitable: [[&wgpu::Texture; 3]; 8] = [
+        [&r16_y, &r16_cb, &wrong_fmt_r16uint],
+        [&r16_y, &r16_cb, &wrong_fmt_rg8],
+        [&r16_y, &r16_cb, &wrong_fmt_rgba8],
+        // Mixed R8 and R16 targets.
+        [&r8_y, &r16_cb, &r16_cr],
+        [&r16_y, &r8_cb, &r16_cr],
+        // R16 without STORAGE_BINDING (even with COPY_DST).
+        [&r16_y, &r16_cb, &no_storage_cr],
+        // Wrong plane size / order.
+        [&r16_cb, &r16_y, &r16_cr],
+        // Duplicate texture.
+        [&r16_y, &r16_cb, &r16_cb],
+    ];
+    for textures in unsuitable {
+        let views = textures.map(|t| t.create_view(&Default::default()));
+        decoder.clear();
+        decoder.push_packet(&frames[0]).expect("packet");
+        let outcome = decoder.decode_assembled_to_plane_textures(views.each_ref());
+        assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
+        let mut encoder = context.device().create_command_encoder(&Default::default());
+        let outcome = decoder.record_to_plane_textures(&frames[0], views.each_ref(), &mut encoder);
+        assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
+    }
+
+    // View restricting usage to TEXTURE_BINDING must fail with GpuError::Texture
+    // (no silent fallback).
+    let restricted_view = r16_cr.create_view(&wgpu::TextureViewDescriptor {
+        usage: Some(wgpu::TextureUsages::TEXTURE_BINDING),
+        ..Default::default()
+    });
+    decoder.clear();
+    decoder.push_packet(&frames[0]).expect("packet");
+    let outcome = decoder.decode_assembled_to_plane_textures([
+        &r16_views[0],
+        &r16_views[1],
+        &restricted_view,
+    ]);
+    assert!(matches!(outcome, Err(GpuError::Texture(_))), "{outcome:?}");
+
+    // create_plane_texture_with_format rejects unsupported formats.
+    assert!(matches!(
+        decoder.create_plane_texture_with_format(Component::Y, wgpu::TextureFormat::Rgba8Unorm),
+        Err(GpuError::Texture(_))
+    ));
+}
+
+#[test]
+fn decoding_into_r16_plane_textures_frame_after_frame_leaves_nothing_behind() {
+    let Some(context) = create_context(&common::options()) else {
+        return;
+    };
+    if !context.supports_plane_format(PLANE_FORMAT_R16) {
+        return;
+    }
+    let (layout, frames) = vector_frames("noise_192x136_420");
+    let mut decoder = decoder_for(&context, &layout);
+    let textures = Component::ALL.map(|component| {
+        decoder
+            .create_plane_texture_with_format(component, PLANE_FORMAT_R16)
+            .expect("r16 plane")
+    });
+    let views = textures
+        .each_ref()
+        .map(|texture| texture.create_view(&Default::default()));
+    let mut decode = |frame: &[u8]| {
+        decoder.clear();
+        decoder.push_packet(frame).expect("packet");
+        decoder
+            .decode_assembled_to_plane_textures(views.each_ref())
+            .expect("decode into r16 plane textures");
+    };
+    decode(&frames[0]);
+    let before = live_resources(&context);
+    for frame in frames.iter().cycle().take(24) {
+        decode(frame);
+    }
+    assert_eq!(
+        live_resources(&context),
+        before,
+        "live GPU objects and memory"
+    );
 }

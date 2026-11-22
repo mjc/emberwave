@@ -13,14 +13,17 @@
 // of extension on each side, one per lifting step): it lifts the rows of the
 // neighbourhood, read straight from the bands, into workgroup memory, then the
 // columns of the tile from there, and stores the tile.
-// At the last level of a component the tile becomes 8-bit samples, which is
-// what upstream's UNORM storage images hold; the float picture never goes to
-// memory. Workgroup z selects the colour component.
+// At the last level of a component the tile is quantised by `to_level`, which is
+// 8-bit UNORM levels for packed or `r8unorm` output and 16-bit UNORM levels
+// for `r16unorm` output; the float picture never goes to memory. Workgroup z
+// selects the colour component.
 //
-// This file is the front of two shaders, which differ in where the last level
-// stores its samples: `store_plane` of idwt_packed.wgsl packs them four to a
-// word into a buffer, and that of idwt_planes.wgsl stores them straight into
-// a texture per plane, where the adapter allows it (decision D52).
+// This file is the front of three shaders, which differ in quantisation and
+// where the last level stores its samples: `store_plane` of idwt_packed.wgsl
+// packs 8-bit levels four to a word into a buffer, idwt_planes.wgsl stores
+// them straight into an `r8unorm` texture per plane (decision D52), and
+// idwt_planes_r16.wgsl stores 16-bit levels into an `r16unorm` texture per
+// plane.
 
 // The parameters of a level are shared with fdwt.wgsl, which goes the other
 // way between the same places (gpu/layout.rs, TransformLevel).
@@ -75,7 +78,7 @@ const DC_SHIFT: f32 = 0.5;
 // `horizontal`, and at the last level the vertical pass all of `levels`,
 // which the store reads.
 var<workgroup> horizontal: array<f32, 1280>;
-// The last level's tile, as 8-bit levels.
+// The last level's tile, quantised by `to_level` (0..=255 or 0..=65535).
 var<workgroup> levels: array<f32, 1024>;
 
 // Whole-sample symmetric mirroring: -1 -> 1, n -> n - 2.
@@ -242,14 +245,14 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
 
         if (is_final) {
             let at = 8u * segment * TILE + column;
-            levels[at + 0u * TILE] = to_unorm8(v[4] + DC_SHIFT);
-            levels[at + 1u * TILE] = to_unorm8(v[5] + DC_SHIFT);
-            levels[at + 2u * TILE] = to_unorm8(v[6] + DC_SHIFT);
-            levels[at + 3u * TILE] = to_unorm8(v[7] + DC_SHIFT);
-            levels[at + 4u * TILE] = to_unorm8(v[8] + DC_SHIFT);
-            levels[at + 5u * TILE] = to_unorm8(v[9] + DC_SHIFT);
-            levels[at + 6u * TILE] = to_unorm8(v[10] + DC_SHIFT);
-            levels[at + 7u * TILE] = to_unorm8(v[11] + DC_SHIFT);
+            levels[at + 0u * TILE] = to_level(v[4] + DC_SHIFT);
+            levels[at + 1u * TILE] = to_level(v[5] + DC_SHIFT);
+            levels[at + 2u * TILE] = to_level(v[6] + DC_SHIFT);
+            levels[at + 3u * TILE] = to_level(v[7] + DC_SHIFT);
+            levels[at + 4u * TILE] = to_level(v[8] + DC_SHIFT);
+            levels[at + 5u * TILE] = to_level(v[9] + DC_SHIFT);
+            levels[at + 6u * TILE] = to_level(v[10] + DC_SHIFT);
+            levels[at + 7u * TILE] = to_level(v[11] + DC_SHIFT);
         } else {
             let x = tile_x + i32(column);
             let y = tile_y + i32(8u * segment);

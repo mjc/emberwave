@@ -29,8 +29,8 @@ pub use context::{
     parse_backends,
 };
 pub use decoder::{
-    Decoder, Frame, FramePlane, PLANE_FORMAT, RgbFrame, StageTimings, TEXTURE_FORMATS, TimedOutput,
-    Timings,
+    Decoder, Frame, FramePlane, PLANE_FORMAT, PLANE_FORMAT_R16, PLANE_FORMATS, RgbFrame,
+    StageTimings, TEXTURE_FORMATS, TimedOutput, Timings,
 };
 pub use encoder::{EncodeStageTimings, EncodeTimings, Encoder, TexturePicture};
 pub use error::GpuError;
@@ -68,6 +68,14 @@ pub mod shader_sources {
     pub const IDWT_PLANES: &str = concat!(
         include_str!("shaders/idwt.wgsl"),
         include_str!("shaders/idwt_planes.wgsl")
+    );
+    /// The inverse transform whose last level stores the planes straight into
+    /// three 16-bit normalised textures (`r16unorm`), on devices with
+    /// [`wgpu::Features::TEXTURE_FORMAT_16BIT_NORM`]. Not among the portable
+    /// shaders of [`ALL`].
+    pub const IDWT_PLANES_R16: &str = concat!(
+        include_str!("shaders/idwt.wgsl"),
+        include_str!("shaders/idwt_planes_r16.wgsl")
     );
     /// 8-bit YCbCr planes to RGB.
     pub const YUV2RGB: &str = include_str!("shaders/yuv2rgb.wgsl");

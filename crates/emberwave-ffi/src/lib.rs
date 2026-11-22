@@ -47,7 +47,8 @@ use emberwave_core::bitstream::{
 use emberwave_core::color::{ColorMatrix, ColorParams, RgbOrder};
 use emberwave_core::encode::{self, EncodeError, Signalling};
 use emberwave_core::gpu::{
-    Decoder, Encoder, GpuContext, GpuError, GpuOptions, QueueTurns, TexturePicture,
+    Decoder, Encoder, GpuContext, GpuError, GpuOptions, PLANE_FORMAT, PLANE_FORMAT_R16, QueueTurns,
+    TexturePicture,
 };
 
 /// The result of a call. Later versions may add statuses: treat any but
@@ -78,10 +79,13 @@ pub enum EmberwaveStatus {
     /// A bug in emberwave. Destroy the object the call was made on.
     Internal = 7,
     /// The system lacks the graphics API of the call, which makes a context
-    /// on it or wraps one of its objects: Metal's off Apple's systems,
+    /// on it or wraps one of its objects (Metal's off Apple's systems,
     /// Vulkan's off Linux, Android and 64-bit Windows, Direct3D's off
-    /// Windows. The calls that take what such a context made give
-    /// `EMBERWAVE_STATUS_INVALID_ARGUMENT` for a context of another kind.
+    /// Windows), or the device lacks an optional GPU capability required by
+    /// the call, such as `EMBERWAVE_PLANE_FORMAT_R16`
+    /// (`EMBERWAVE_CONTEXT_FEATURE_PLANE_R16`). The calls that take what a
+    /// platform context made give `EMBERWAVE_STATUS_INVALID_ARGUMENT` for a
+    /// context of another kind.
     Unsupported = 8,
     /// An output array or buffer of the caller's, or an encode's budget, is
     /// too small. Where the call can tell how much it needs, it stores that
@@ -169,6 +173,10 @@ pub const EMBERWAVE_CONTEXT_KIND_VULKAN: u32 = 2;
 /// the adapter the caller named, for textures it shares.
 pub const EMBERWAVE_CONTEXT_KIND_D3D12: u32 = 3;
 
+/// Bit flag in `EmberwaveContextInfo.features` indicating that the context
+/// supports `EMBERWAVE_PLANE_FORMAT_R16` decoded plane textures.
+pub const EMBERWAVE_CONTEXT_FEATURE_PLANE_R16: u32 = 1 << 0;
+
 /// The ITU-R BT.601 matrix.
 pub const EMBERWAVE_MATRIX_BT601: u32 = 0;
 /// The ITU-R BT.709 matrix.
@@ -201,6 +209,14 @@ pub const EMBERWAVE_TEXTURE_RGBA8: u32 = 0;
 /// 255: `MTLPixelFormatBGRA8Unorm` in Metal, the format of most display
 /// surfaces, onto which a copy needs the same order.
 pub const EMBERWAVE_TEXTURE_BGRA8: u32 = 1;
+
+/// 8-bit unsigned normalised plane format (`R8Unorm`: `VK_FORMAT_R8_UNORM`,
+/// `MTLPixelFormatR8Unorm`, `DXGI_FORMAT_R8_UNORM`), the default.
+pub const EMBERWAVE_PLANE_FORMAT_R8: u32 = 0;
+/// 16-bit unsigned normalised plane format (`R16Unorm`: `VK_FORMAT_R16_UNORM`,
+/// `MTLPixelFormatR16Unorm`, `DXGI_FORMAT_R16_UNORM`), for 10-bit and
+/// higher-precision decoded planes.
+pub const EMBERWAVE_PLANE_FORMAT_R16: u32 = 1;
 
 /// The luma plane, for `emberwave_texture_create_plane`, the functions that
 /// wrap a plane of the caller's for decodes
@@ -312,6 +328,9 @@ pub struct EmberwaveContextInfo {
     pub device_id: u32,
     /// An `EMBERWAVE_CONTEXT_KIND_*` value: which call made the context.
     pub kind: u32,
+    /// Optional features supported by the context: `EMBERWAVE_CONTEXT_FEATURE_*`
+    /// flags combined with `|`, or 0.
+    pub features: u32,
 }
 
 /// What a decoder has received of the frame it is assembling, from
@@ -484,8 +503,9 @@ pub struct EmberwaveDecoder {
 /// `emberwave_decoder_submit_plane_textures_metal`, and their `_vulkan` and
 /// `_d3d12` forms, for the caller's graphics API to read on the GPU.
 /// emberwave makes it (`emberwave_texture_create`,
-/// `emberwave_texture_create_plane`), wraps a Metal texture or a Vulkan
-/// image of the caller's (`emberwave_texture_from_metal`,
+/// `emberwave_texture_create_plane`,
+/// `emberwave_texture_create_plane_with_format`), wraps a Metal texture or a
+/// Vulkan image of the caller's (`emberwave_texture_from_metal`,
 /// `emberwave_texture_from_metal_plane`, `emberwave_texture_from_vulkan`,
 /// `emberwave_texture_from_vulkan_plane`), or opens a Direct3D texture the
 /// caller shares (`emberwave_texture_from_d3d12`,
@@ -495,10 +515,11 @@ pub struct EmberwaveDecoder {
 /// for `emberwave_encoder_encode_textures` and its `_vulkan` and `_d3d12`
 /// forms to read (`emberwave_texture_from_metal_source`,
 /// `emberwave_texture_from_vulkan_source`,
-/// `emberwave_texture_from_d3d12_source`, decision D62). A texture of a
-/// plane serves the decoders and encoders of its context whose pictures
-/// have planes of its size, so planes a decode put into textures can be
-/// encoded again.
+/// `emberwave_texture_from_d3d12_source`, decision D62). An 8-bit plane
+/// texture (`EMBERWAVE_PLANE_FORMAT_R8`) serves the decoders and encoders of
+/// its context whose pictures have planes of its size, so 8-bit planes a
+/// decode put into textures can be encoded again; 16-bit
+/// (`EMBERWAVE_PLANE_FORMAT_R16`) plane textures are for decode output only.
 ///
 /// How the decodes and the caller's reads of a texture are ordered:
 /// - On a context of `emberwave_context_create`, emberwave works on a queue
@@ -572,6 +593,11 @@ pub struct EmberwaveTexture {
     /// Direct3D 11 device: only the `_d3d12` calls take it, which leave it in
     /// `D3D12_RESOURCE_STATE_COMMON` (decision D63).
     d3d12: bool,
+    /// Duplicated NT handle for a shared Direct3D 12 resource, retained so
+    /// `CompareObjectHandles` detects duplicate shared resources after the
+    /// caller closes its input handles.
+    #[cfg(windows)]
+    d3d12_handle: Option<d3d12::SharedHandle>,
 }
 
 impl EmberwaveTexture {
@@ -596,6 +622,8 @@ impl EmberwaveTexture {
             tracked,
             vulkan: wrapping.vulkan,
             d3d12: false,
+            #[cfg(windows)]
+            d3d12_handle: None,
         }
     }
 }
@@ -671,6 +699,19 @@ struct Wrapping<'a> {
     /// it does on Metal only. Read where Metal textures are wrapped.
     #[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
     stores_planes: bool,
+    /// Whether the decoder supports 16-bit normalised plane textures
+    /// (`R16Unorm`). Read where textures of the caller's are wrapped.
+    #[cfg_attr(
+        not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "android",
+            windows
+        )),
+        allow(dead_code)
+    )]
+    r16_planes: bool,
 }
 
 #[cfg_attr(
@@ -694,6 +735,7 @@ impl<'a> Wrapping<'a> {
             holds: plane.map_or(Holds::Picture, Holds::Plane),
             read: false,
             stores_planes: decoder.decoder.stores_planes(),
+            r16_planes: decoder.decoder.supports_plane_format(PLANE_FORMAT_R16),
         }
     }
 
@@ -707,6 +749,7 @@ impl<'a> Wrapping<'a> {
             holds,
             read: true,
             stores_planes: false,
+            r16_planes: false,
         }
     }
 
@@ -752,6 +795,7 @@ impl From<GpuError> for Failure {
             GpuError::DeviceLost(_) => EmberwaveStatus::DeviceLost,
             GpuError::IncompleteFrame { .. } | GpuError::Bitstream(_) => EmberwaveStatus::Bitstream,
             GpuError::Encode(EncodeError::BudgetTooSmall { .. }) => EmberwaveStatus::BufferTooSmall,
+            GpuError::Unsupported(_) => EmberwaveStatus::Unsupported,
             // Planes the encoder cannot take, from emberwave_encoder_encode;
             // a texture a decode cannot fill.
             GpuError::Encode(_) | GpuError::Texture(_) | GpuError::InvalidArgument(_) => {
@@ -839,7 +883,7 @@ versioned!(
     EmberwaveVulkanImage { first_ends_with: user: *mut c_void, ends_with: user: *mut c_void },
     EmberwaveVulkanSync { first_ends_with: signal_value: u64, ends_with: signal_value: u64 },
     EmberwaveD3D12Sync { first_ends_with: signal_value: u64, ends_with: signal_value: u64 },
-    EmberwaveContextInfo { first_ends_with: kind: u32, ends_with: kind: u32 },
+    EmberwaveContextInfo { first_ends_with: kind: u32, ends_with: features: u32 },
     EmberwaveReception {
         first_ends_with: has_start_of_frame: u32,
         ends_with: has_start_of_frame: u32
@@ -1753,8 +1797,9 @@ pub struct EmberwaveVulkanImage {
     /// The `VkImage`.
     pub image: u64,
     /// Its `VkFormat`: `VK_FORMAT_B8G8R8A8_UNORM` or
-    /// `VK_FORMAT_R8G8B8A8_UNORM` for the picture, `VK_FORMAT_R8_UNORM` for a
-    /// plane, `VK_FORMAT_R8G8_UNORM` for Cb and Cr interleaved.
+    /// `VK_FORMAT_R8G8B8A8_UNORM` for the picture, `VK_FORMAT_R8_UNORM` or
+    /// `VK_FORMAT_R16_UNORM` for a decoded plane, `VK_FORMAT_R8_UNORM` for an
+    /// encoded plane, `VK_FORMAT_R8G8_UNORM` for Cb and Cr interleaved.
     pub format: u32,
     /// The `VkImageUsageFlags` it was made with.
     pub usage: u32,
@@ -2114,7 +2159,9 @@ pub unsafe extern "C" fn emberwave_context_create_vulkan(
 /// on: a decode leaves it so, and the caller gives it back so before the next
 /// call that uses it. It belongs to the context's queue family, and its
 /// usage is `VK_IMAGE_USAGE_SAMPLED_BIT`, `VK_IMAGE_USAGE_TRANSFER_SRC_BIT`
-/// and what the decodes need.
+/// and what the decodes need (for `emberwave_texture_create_plane_with_format`
+/// with `EMBERWAVE_PLANE_FORMAT_R16`, `VK_FORMAT_R16_UNORM` and
+/// `VK_IMAGE_USAGE_STORAGE_BIT`).
 ///
 /// # Safety
 ///
@@ -2169,11 +2216,15 @@ pub unsafe extern "C" fn emberwave_texture_from_vulkan(
 }
 
 /// Wraps the caller's own Vulkan image for the Y, Cb or Cr plane of the
-/// pictures of `decoder`, as `emberwave_texture_create_plane` makes one:
-/// `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
-/// `EMBERWAVE_PLANE_CR`. As for `emberwave_texture_from_vulkan`, but the
-/// image is `VK_FORMAT_R8_UNORM` of the plane's size, and a decode copies
-/// the plane into it, which needs `VK_IMAGE_USAGE_TRANSFER_DST_BIT`.
+/// pictures of `decoder`, as `emberwave_texture_create_plane` or
+/// `emberwave_texture_create_plane_with_format` makes one: `plane` is
+/// `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR`. As for
+/// `emberwave_texture_from_vulkan`, of the plane's size, in
+/// `VK_FORMAT_R8_UNORM` with `VK_IMAGE_USAGE_TRANSFER_DST_BIT` (the decode
+/// copies the plane into it), or in `VK_FORMAT_R16_UNORM` with
+/// `VK_IMAGE_USAGE_STORAGE_BIT` (the decode stores the 16-bit normalised
+/// plane into it; requires `EMBERWAVE_CONTEXT_FEATURE_PLANE_R16`, else
+/// `EMBERWAVE_STATUS_UNSUPPORTED`).
 ///
 /// # Safety
 ///
@@ -2593,10 +2644,21 @@ pub unsafe extern "C" fn emberwave_texture_from_d3d12(
 /// Wraps a texture of the caller's Direct3D 12 or Direct3D 11 device for the
 /// Y, Cb or Cr plane of the pictures of `decoder`, as
 /// `emberwave_texture_from_d3d12` does for the picture: `plane` is
-/// `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR`, and the
-/// texture is `DXGI_FORMAT_R8_UNORM` of the plane's size, which a decode
-/// copies the plane into. Only `emberwave_decoder_submit_plane_textures_d3d12`
-/// takes it.
+/// `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR`. As
+/// `emberwave_texture_create_plane` or
+/// `emberwave_texture_create_plane_with_format` makes one, the texture is of
+/// the plane's size, in `DXGI_FORMAT_R8_UNORM` (which a decode copies the
+/// plane into) or `DXGI_FORMAT_R16_UNORM` with
+/// `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS` (`D3D11_BIND_UNORDERED_ACCESS`,
+/// which a decode stores the 16-bit normalised plane into; requires
+/// `EMBERWAVE_CONTEXT_FEATURE_PLANE_R16`, else
+/// `EMBERWAVE_STATUS_UNSUPPORTED`). Only
+/// `emberwave_decoder_submit_plane_textures_d3d12` takes it. Pass handles to
+/// three distinct underlying Direct3D resources: reusing a handle or passing a
+/// `DuplicateHandle` copy for two planes is rejected with
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT`, whereas separate `CreateSharedHandle`
+/// calls on one resource or placed-memory aliases cannot be distinguished by the
+/// API and are the caller's responsibility to keep distinct.
 ///
 /// # Safety
 ///
@@ -2728,7 +2790,11 @@ pub unsafe extern "C" fn emberwave_decoder_submit_texture_d3d12(
 /// Decodes the frame received so far into the plane textures `y`, `cb` and
 /// `cr`, as `emberwave_decoder_decode_plane_textures` does, but returns once
 /// the work is submitted, with the fences of `sync`, as
-/// `emberwave_decoder_submit_texture_d3d12` does.
+/// `emberwave_decoder_submit_texture_d3d12` does. `y`, `cb` and `cr` must
+/// refer to three distinct underlying Direct3D resources: reused or duplicated
+/// shared NT handles are rejected with `EMBERWAVE_STATUS_INVALID_ARGUMENT`
+/// (separate `CreateSharedHandle` handles or placed-memory aliases cannot be
+/// distinguished by the API).
 ///
 /// # Safety
 ///
@@ -2839,6 +2905,10 @@ pub unsafe extern "C" fn emberwave_encoder_encode_textures_d3d12(
 /// Whether two textures are the same, or wrap the same texture of the
 /// caller's.
 fn same_texture(a: &EmberwaveTexture, b: &EmberwaveTexture) -> bool {
+    #[cfg(windows)]
+    if d3d12::same_resource(a, b) {
+        return true;
+    }
     a.texture == b.texture
 }
 
@@ -3166,7 +3236,8 @@ mod vulkan {
 
     use ash::vk::{self, Handle};
     use emberwave_core::gpu::{
-        CallerQueueLock, GpuContext, GpuOptions, PLANE_FORMAT, QueueTurns, SubmissionHooks,
+        CallerQueueLock, GpuContext, GpuOptions, PLANE_FORMAT, PLANE_FORMAT_R16, QueueTurns,
+        SubmissionHooks,
     };
     use wgpu::hal::api::Vulkan;
 
@@ -3536,13 +3607,29 @@ mod vulkan {
         let (width, height) = wrapping.size();
         let format = match (wrapping.holds, vk::Format::from_raw(image.format as i32)) {
             (Holds::Plane(_), vk::Format::R8_UNORM) => PLANE_FORMAT,
+            (Holds::Plane(_), vk::Format::R16_UNORM) if !wrapping.read => {
+                if !wrapping.r16_planes {
+                    return Err(Failure(
+                        EmberwaveStatus::Unsupported,
+                        "16-bit normalised plane textures require the TEXTURE_FORMAT_16BIT_NORM \
+                         GPU feature, which this device does not support"
+                            .into(),
+                    ));
+                }
+                PLANE_FORMAT_R16
+            }
             (Holds::Chroma, vk::Format::R8G8_UNORM) => wgpu::TextureFormat::Rg8Unorm,
             (Holds::Picture, vk::Format::R8G8B8A8_UNORM) => wgpu::TextureFormat::Rgba8Unorm,
             (Holds::Picture, vk::Format::B8G8R8A8_UNORM) => wgpu::TextureFormat::Bgra8Unorm,
             (Holds::Plane(_), format) => {
-                return Err(Failure::argument(format!(
-                    "the image's format is {format:?}, not VK_FORMAT_R8_UNORM"
-                )));
+                return Err(Failure::argument(if wrapping.read {
+                    format!("the image's format is {format:?}, not VK_FORMAT_R8_UNORM")
+                } else {
+                    format!(
+                        "the image's format is {format:?}, not VK_FORMAT_R8_UNORM or \
+                         VK_FORMAT_R16_UNORM"
+                    )
+                }));
             }
             (Holds::Chroma, format) => {
                 return Err(Failure::argument(format!(
@@ -3584,21 +3671,35 @@ mod vulkan {
                 usage |= use_;
             }
         }
-        let copies = usage.contains(wgpu::TextureUsages::COPY_DST);
-        let fillable = match wrapping.holds {
-            Holds::Picture => {
-                (copies && (width * 4).is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))
-                    || usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
-            }
-            Holds::Plane(_) | Holds::Chroma => copies,
-        };
+        if format == PLANE_FORMAT_R16 && flags.contains(vk::ImageUsageFlags::STORAGE) {
+            usage |= wgpu::TextureUsages::STORAGE_BINDING;
+        }
         // An encode only samples the image (decision D62).
-        if !wrapping.read && !fillable {
-            return Err(Failure::argument(
-                "neither a copy nor a draw can fill the image: a copy needs \
-                 VK_IMAGE_USAGE_TRANSFER_DST_BIT (and for the picture a width of a multiple \
-                 of 64 pixels), a draw of the picture VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT",
-            ));
+        if !wrapping.read {
+            if matches!(wrapping.holds, Holds::Plane(_)) && format == PLANE_FORMAT_R16 {
+                if !usage.contains(wgpu::TextureUsages::STORAGE_BINDING) {
+                    return Err(Failure::argument(
+                        "a 16-bit normalised plane image needs VK_IMAGE_USAGE_STORAGE_BIT, \
+                         which the decoder stores into",
+                    ));
+                }
+            } else {
+                let copies = usage.contains(wgpu::TextureUsages::COPY_DST);
+                let fillable = match wrapping.holds {
+                    Holds::Picture => {
+                        (copies && (width * 4).is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))
+                            || usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+                    }
+                    Holds::Plane(_) | Holds::Chroma => copies,
+                };
+                if !fillable {
+                    return Err(Failure::argument(
+                        "neither a copy nor a draw can fill the image: a copy needs \
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT (and for the picture a width of a multiple \
+                         of 64 pixels), a draw of the picture VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT",
+                    ));
+                }
+            }
         }
         let state = match vk::ImageLayout::from_raw(image.layout as i32) {
             // What an encode reads is in the image already: its layout is
@@ -3636,6 +3737,10 @@ mod vulkan {
                 (
                     wgpu::TextureUsages::RENDER_ATTACHMENT,
                     wgpu::TextureUses::COLOR_TARGET,
+                ),
+                (
+                    wgpu::TextureUsages::STORAGE_BINDING,
+                    wgpu::TextureUses::STORAGE_WRITE_ONLY,
                 ),
             ] {
                 if usage.contains(use_) {
@@ -3773,22 +3878,70 @@ mod d3d12 {
     use std::ffi::c_void;
     use std::sync::Arc;
 
-    use emberwave_core::gpu::{GpuContext, GpuOptions, PLANE_FORMAT, QueueTurns, SubmissionHooks};
+    use emberwave_core::gpu::{
+        GpuContext, GpuOptions, PLANE_FORMAT, PLANE_FORMAT_R16, QueueTurns, SubmissionHooks,
+    };
     use wgpu::hal::api::Dx12;
-    use windows::Win32::Foundation::{HANDLE, LUID};
+    use windows::Win32::Foundation::{
+        CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, LUID,
+    };
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-        D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE, ID3D12Fence, ID3D12Resource,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+        ID3D12Fence, ID3D12Resource,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM,
-        DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16_UNORM,
     };
 
     use super::{
         EmberwaveD3D12Fence, EmberwaveStatus, EmberwaveTexture, Failure, Holds, Wrapping,
         creation_failure,
     };
+
+    /// A duplicated NT handle to a shared Direct3D 12 resource, retained so
+    /// `CompareObjectHandles` recognises wrappers of the same kernel object
+    /// even after the caller closes its input handles.
+    pub(super) struct SharedHandle(HANDLE);
+
+    // SAFETY: kernel handles in this process are not thread-affine.
+    unsafe impl Send for SharedHandle {}
+    // SAFETY: read-only handle comparisons and drop-time closing are safe across threads.
+    unsafe impl Sync for SharedHandle {}
+
+    impl Drop for SharedHandle {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` was obtained from `DuplicateHandle` in this process.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn raw_resource_ptr(texture: &wgpu::Texture) -> Option<*mut c_void> {
+        // SAFETY: only reads the HAL texture resource while the guard is held.
+        let hal = unsafe { texture.as_hal::<Dx12>() }?;
+        // SAFETY: `hal` is a live HAL texture whose raw resource stays valid for the guard's lifetime.
+        let raw = unsafe { hal.raw_resource() };
+        Some(windows::core::Interface::as_raw(raw))
+    }
+
+    /// Whether `a` and `b` refer to the same underlying Direct3D 12 resource.
+    pub(super) fn same_resource(a: &EmberwaveTexture, b: &EmberwaveTexture) -> bool {
+        if let (Some(ah), Some(bh)) = (&a.d3d12_handle, &b.d3d12_handle) {
+            // SAFETY: both handles are live duplicated handles owned by `SharedHandle`.
+            if unsafe { CompareObjectHandles(ah.0, bh.0) }.as_bool() {
+                return true;
+            }
+        }
+        if let (Some(a_raw), Some(b_raw)) =
+            (raw_resource_ptr(&a.texture), raw_resource_ptr(&b.texture))
+        {
+            return a_raw == b_raw;
+        }
+        false
+    }
 
     fn no_gpu(message: impl Into<String>) -> Failure {
         Failure(EmberwaveStatus::NoGpu, message.into())
@@ -3902,6 +4055,17 @@ mod d3d12 {
         let found = description.Format;
         let format = match wrapping.holds {
             Holds::Plane(_) if found == DXGI_FORMAT_R8_UNORM => PLANE_FORMAT,
+            Holds::Plane(_) if !wrapping.read && found == DXGI_FORMAT_R16_UNORM => {
+                if !wrapping.r16_planes {
+                    return Err(Failure(
+                        EmberwaveStatus::Unsupported,
+                        "16-bit normalised plane textures require the TEXTURE_FORMAT_16BIT_NORM \
+                         GPU feature, which this device does not support"
+                            .into(),
+                    ));
+                }
+                PLANE_FORMAT_R16
+            }
             Holds::Chroma if found == DXGI_FORMAT_R8G8_UNORM => wgpu::TextureFormat::Rg8Unorm,
             Holds::Picture if found == DXGI_FORMAT_B8G8R8A8_UNORM => {
                 wgpu::TextureFormat::Bgra8Unorm
@@ -3910,10 +4074,18 @@ mod d3d12 {
                 wgpu::TextureFormat::Rgba8Unorm
             }
             Holds::Plane(_) => {
-                return Err(Failure::argument(format!(
-                    "the texture's format is {}, not DXGI_FORMAT_R8_UNORM",
-                    found.0
-                )));
+                return Err(Failure::argument(if wrapping.read {
+                    format!(
+                        "the texture's format is {}, not DXGI_FORMAT_R8_UNORM",
+                        found.0
+                    )
+                } else {
+                    format!(
+                        "the texture's format is {}, not DXGI_FORMAT_R8_UNORM or \
+                         DXGI_FORMAT_R16_UNORM",
+                        found.0
+                    )
+                }));
             }
             Holds::Chroma => {
                 return Err(Failure::argument(format!(
@@ -3965,21 +4137,58 @@ mod d3d12 {
         if has(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
             usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
         }
-        let fillable = match wrapping.holds {
-            Holds::Picture => {
-                (width * 4).is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-                    || usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
-            }
-            Holds::Plane(_) | Holds::Chroma => true,
-        };
-        // An encode only samples the texture (decision D62).
-        if !wrapping.read && !fillable {
-            return Err(Failure::argument(
-                "a draw fills the picture's texture where its width is not a multiple of 64 \
-                 pixels, and needs D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET \
-                 (D3D11_BIND_RENDER_TARGET)",
-            ));
+        if format == PLANE_FORMAT_R16 && has(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+            usage |= wgpu::TextureUsages::STORAGE_BINDING;
         }
+        // An encode only samples the texture (decision D62).
+        if !wrapping.read {
+            if matches!(wrapping.holds, Holds::Plane(_)) && format == PLANE_FORMAT_R16 {
+                if !usage.contains(wgpu::TextureUsages::STORAGE_BINDING) {
+                    return Err(Failure::argument(
+                        "a 16-bit normalised plane texture needs \
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS (D3D11_BIND_UNORDERED_ACCESS), \
+                         which the decoder stores into",
+                    ));
+                }
+            } else {
+                let fillable = match wrapping.holds {
+                    Holds::Picture => {
+                        (width * 4).is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+                            || usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+                    }
+                    Holds::Plane(_) | Holds::Chroma => true,
+                };
+                if !fillable {
+                    return Err(Failure::argument(
+                        "a draw fills the picture's texture where its width is not a multiple of \
+                         64 pixels, and needs D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET \
+                         (D3D11_BIND_RENDER_TARGET)",
+                    ));
+                }
+            }
+        }
+
+        let current_process = HANDLE(-1isize as *mut c_void);
+        let mut dup = HANDLE::default();
+        // SAFETY: `handle` opened a live resource in this process above, and `dup`
+        // receives a duplicated handle owned by `SharedHandle`.
+        unsafe {
+            DuplicateHandle(
+                current_process,
+                HANDLE(handle),
+                current_process,
+                &mut dup,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        }
+        .map_err(|error| {
+            Failure::argument(format!(
+                "failed to duplicate the shared texture handle: {error}"
+            ))
+        })?;
+        let shared_handle = SharedHandle(dup);
 
         let size = wgpu::Extent3d {
             width,
@@ -4021,6 +4230,7 @@ mod d3d12 {
         };
         let mut wrapped = EmberwaveTexture::wrap(wrapping, texture, true);
         wrapped.d3d12 = true;
+        wrapped.d3d12_handle = Some(shared_handle);
         Ok(wrapped)
     }
 
@@ -4180,6 +4390,11 @@ pub unsafe extern "C" fn emberwave_context_info(
                 EMBERWAVE_CONTEXT_KIND_D3D12
             } else {
                 EMBERWAVE_CONTEXT_KIND_OWN
+            },
+            features: if context.context.supports_plane_format(PLANE_FORMAT_R16) {
+                EMBERWAVE_CONTEXT_FEATURE_PLANE_R16
+            } else {
+                0
             },
             ..Default::default()
         };
@@ -4609,6 +4824,43 @@ pub unsafe extern "C" fn emberwave_texture_create_plane(
     plane: u32,
     texture: *mut *mut EmberwaveTexture,
 ) -> EmberwaveStatus {
+    // SAFETY: as the caller promises.
+    unsafe {
+        emberwave_texture_create_plane_with_format(
+            decoder,
+            plane,
+            EMBERWAVE_PLANE_FORMAT_R8,
+            texture,
+        )
+    }
+}
+
+/// Creates a texture that `emberwave_decoder_decode_plane_textures` puts one
+/// plane of the pictures of `decoder` into, on the decoder's GPU device, in
+/// `format`: `EMBERWAVE_PLANE_FORMAT_R8` (as `emberwave_texture_create_plane`
+/// makes) or `EMBERWAVE_PLANE_FORMAT_R16` (for 10-bit and higher-precision
+/// decoded planes).
+///
+/// `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
+/// `EMBERWAVE_PLANE_CR`, and the texture is of its size as
+/// `emberwave_decoder_info` gives it, which the GPU can sample and copy from
+/// but the CPU cannot read. `EMBERWAVE_PLANE_FORMAT_R16` requires the context
+/// to report `EMBERWAVE_CONTEXT_FEATURE_PLANE_R16`, and fails with
+/// `EMBERWAVE_STATUS_UNSUPPORTED` otherwise. All three textures passed to a
+/// plane-texture decode must share the same format.
+///
+/// # Safety
+///
+/// `decoder` is a live decoder that no other thread is using. `texture`
+/// points to where the new texture is stored; it is set to `NULL` when the
+/// call fails.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn emberwave_texture_create_plane_with_format(
+    decoder: *const EmberwaveDecoder,
+    plane: u32,
+    format: u32,
+    texture: *mut *mut EmberwaveTexture,
+) -> EmberwaveStatus {
     run_or_lost(
         || {
             // SAFETY: as the caller promises.
@@ -4616,7 +4868,10 @@ pub unsafe extern "C" fn emberwave_texture_create_plane(
             // SAFETY: as the caller promises.
             let decoder = unsafe { live(decoder) }?;
             let component = plane_component(plane)?;
-            let created = decoder.decoder.create_plane_texture(component)?;
+            let format = plane_format(format)?;
+            let created = decoder
+                .decoder
+                .create_plane_texture_with_format(component, format)?;
             // SAFETY: checked by the first output() above.
             unsafe { texture.write(EmberwaveTexture::boxed(decoder, created, Some(component))) };
             Ok(())
@@ -4624,6 +4879,17 @@ pub unsafe extern "C" fn emberwave_texture_create_plane(
         // SAFETY: as the caller promises.
         || unsafe { lost(decoder) },
     )
+}
+
+/// The GPU texture format an `EMBERWAVE_PLANE_FORMAT_*` value names.
+fn plane_format(format: u32) -> Result<wgpu::TextureFormat, Failure> {
+    match format {
+        EMBERWAVE_PLANE_FORMAT_R8 => Ok(PLANE_FORMAT),
+        EMBERWAVE_PLANE_FORMAT_R16 => Ok(PLANE_FORMAT_R16),
+        other => Err(Failure::argument(format!(
+            "format is {other}, not EMBERWAVE_PLANE_FORMAT_R8 or EMBERWAVE_PLANE_FORMAT_R16"
+        ))),
+    }
 }
 
 /// Wraps the caller's own Metal texture, `metal`, an `id<MTLTexture>`, for
@@ -4684,15 +4950,18 @@ pub unsafe extern "C" fn emberwave_texture_from_metal(
 }
 
 /// Wraps the caller's own Metal texture, `metal`, for the Y, Cb or Cr plane
-/// of the pictures of `decoder`, as `emberwave_texture_create_plane` makes
-/// one: `plane` is `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or
-/// `EMBERWAVE_PLANE_CR`. As for `emberwave_texture_from_metal`, but the
-/// texture is `MTLPixelFormatR8Unorm` of the plane's size, and as a decode
-/// copies a plane, not framebuffer-only. When all three textures of a decode
-/// have `MTLTextureUsageShaderWrite`, the decode stores the planes into them
-/// from its shaders instead, which takes less time (decision D52). A Metal
-/// texture can be wrapped for more than one plane, but a decode refuses it in
-/// two of them.
+/// of the pictures of `decoder`, as `emberwave_texture_create_plane` or
+/// `emberwave_texture_create_plane_with_format` makes one: `plane` is
+/// `EMBERWAVE_PLANE_Y`, `EMBERWAVE_PLANE_CB` or `EMBERWAVE_PLANE_CR`. As for
+/// `emberwave_texture_from_metal`, of the plane's size, in
+/// `MTLPixelFormatR8Unorm` (not framebuffer-only; when all three textures of
+/// a decode have `MTLTextureUsageShaderWrite`, the decode stores the planes
+/// into them from its shaders instead, decision D52) or
+/// `MTLPixelFormatR16Unorm` with `MTLTextureUsageShaderWrite` (the decode
+/// stores the 16-bit normalised plane into it; requires
+/// `EMBERWAVE_CONTEXT_FEATURE_PLANE_R16`, else
+/// `EMBERWAVE_STATUS_UNSUPPORTED`). A Metal texture can be wrapped for more
+/// than one plane, but a decode refuses it in two of them.
 ///
 /// # Safety
 ///
@@ -4848,15 +5117,34 @@ unsafe fn metal_import(
     let (width, height) = wrapping.size();
     let format = metal.pixelFormat();
     let format = match wrapping.holds {
-        Holds::Plane(_) if format == MTLPixelFormat::R8Unorm => emberwave_core::gpu::PLANE_FORMAT,
+        Holds::Plane(_) if format == MTLPixelFormat::R8Unorm => PLANE_FORMAT,
+        Holds::Plane(_) if !wrapping.read && format == MTLPixelFormat::R16Unorm => {
+            if !wrapping.r16_planes {
+                return Err(Failure(
+                    EmberwaveStatus::Unsupported,
+                    "16-bit normalised plane textures require the TEXTURE_FORMAT_16BIT_NORM \
+                     GPU feature, which this device does not support"
+                        .into(),
+                ));
+            }
+            PLANE_FORMAT_R16
+        }
         Holds::Chroma if format == MTLPixelFormat::RG8Unorm => wgpu::TextureFormat::Rg8Unorm,
         Holds::Picture if format == MTLPixelFormat::RGBA8Unorm => wgpu::TextureFormat::Rgba8Unorm,
         Holds::Picture if format == MTLPixelFormat::BGRA8Unorm => wgpu::TextureFormat::Bgra8Unorm,
         Holds::Plane(_) => {
-            return Err(Failure::argument(format!(
-                "the texture's pixel format is {}, not MTLPixelFormatR8Unorm",
-                format.0
-            )));
+            return Err(Failure::argument(if wrapping.read {
+                format!(
+                    "the texture's pixel format is {}, not MTLPixelFormatR8Unorm",
+                    format.0
+                )
+            } else {
+                format!(
+                    "the texture's pixel format is {}, not MTLPixelFormatR8Unorm or \
+                     MTLPixelFormatR16Unorm",
+                    format.0
+                )
+            }));
         }
         Holds::Chroma => {
             return Err(Failure::argument(format!(
@@ -4915,7 +5203,8 @@ unsafe fn metal_import(
         usage |= wgpu::TextureUsages::TEXTURE_BINDING;
     }
     if matches!(wrapping.holds, Holds::Plane(_))
-        && wrapping.stores_planes
+        && ((format == PLANE_FORMAT && wrapping.stores_planes)
+            || (format == PLANE_FORMAT_R16 && wrapping.r16_planes))
         && metal.usage().contains(MTLTextureUsage::ShaderWrite)
     {
         usage |= wgpu::TextureUsages::STORAGE_BINDING;
@@ -4925,6 +5214,13 @@ unsafe fn metal_import(
         if !usage.contains(wgpu::TextureUsages::TEXTURE_BINDING) {
             return Err(Failure::argument(
                 "the texture lacks MTLTextureUsageShaderRead, which an encode reads it with",
+            ));
+        }
+    } else if matches!(wrapping.holds, Holds::Plane(_)) && format == PLANE_FORMAT_R16 {
+        if !usage.contains(wgpu::TextureUsages::STORAGE_BINDING) {
+            return Err(Failure::argument(
+                "a 16-bit normalised plane texture needs MTLTextureUsageShaderWrite, \
+                 which the decoder stores into",
             ));
         }
     } else {
@@ -5004,11 +5300,12 @@ unsafe fn metal_import(
 /// # Safety
 ///
 /// `texture` is `NULL`, or a texture from `emberwave_texture_create`,
-/// `emberwave_texture_create_plane`, or one of the functions that wrap a
-/// texture or an image of the caller's (`emberwave_texture_from_*`) that has
-/// not been destroyed and that no other thread is using. A Metal texture of one emberwave made goes with
-/// it unless the caller retained it; of one that wraps a texture of the
-/// caller's, only emberwave's reference goes.
+/// `emberwave_texture_create_plane`,
+/// `emberwave_texture_create_plane_with_format`, or one of the functions that
+/// wrap a texture or an image of the caller's (`emberwave_texture_from_*`) that
+/// has not been destroyed and that no other thread is using. A Metal texture of
+/// one emberwave made goes with it unless the caller retained it; of one that
+/// wraps a texture of the caller's, only emberwave's reference goes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn emberwave_texture_destroy(texture: *mut EmberwaveTexture) {
     if !texture.is_null() {
@@ -5247,22 +5544,28 @@ fn require_shared_queue(decoder: &EmberwaveDecoder) -> Result<(), Failure> {
 /// Decodes the frame received so far into its Y, Cb and Cr planes in `y`,
 /// `cb` and `cr` on the GPU, then waits for the GPU: when this returns,
 /// the textures hold the planes, for the caller's graphics API to read on any
-/// queue of the device. They hold the samples of the stream, as
-/// `emberwave_decoder_decode_yuv` writes them, which the caller converts to
-/// colours itself, with the matrix, range and chroma siting the stream
-/// signals (`emberwave_probe_packet`) or that it knows better. In 4:2:0 a
-/// chroma sample sits vertically halfway between two rows of luma, and
-/// horizontally halfway between two luma samples with
-/// `EMBERWAVE_SITING_CENTER`, on the left one with `EMBERWAVE_SITING_LEFT`.
-/// The planes never go through CPU memory: on Metal the decode stores them
-/// into the textures from its shaders when all three allow it, and copies
-/// them in otherwise (decision D52). Blocks that did not arrive decode as
-/// zeros, or are concealed (`emberwave_decoder_set_concealment`).
+/// queue of the device. With `EMBERWAVE_PLANE_FORMAT_R8`, the textures hold
+/// the 8-bit samples of the stream as `emberwave_decoder_decode_yuv` writes
+/// them; with `EMBERWAVE_PLANE_FORMAT_R16`, the shader stores `[0, 1]` sample
+/// values rounded ties-to-even over 65535 directly into the textures on all
+/// supported backends. The caller converts the planes to colours itself, with
+/// the matrix, range and chroma siting the stream signals
+/// (`emberwave_probe_packet`) or that it knows better. In 4:2:0 a chroma sample
+/// sits vertically halfway between two rows of luma, and horizontally halfway
+/// between two luma samples with `EMBERWAVE_SITING_CENTER`, on the left one
+/// with `EMBERWAVE_SITING_LEFT`. The planes never go through CPU memory: on
+/// Metal 8-bit decodes store them into the textures from their shaders when all
+/// three allow it, and copy them in otherwise (decision D52), while 16-bit
+/// decodes always store directly from the shader. Blocks that did not arrive
+/// decode as zeros, or are concealed (`emberwave_decoder_set_concealment`).
 ///
 /// Each texture is one for that plane, from `emberwave_texture_create_plane`,
+/// `emberwave_texture_create_plane_with_format`,
 /// `emberwave_texture_from_metal_plane` or
 /// `emberwave_texture_from_vulkan_plane`, on a decoder of the same context,
-/// picture size and chroma format, and no Metal texture serves two planes.
+/// picture size and chroma format. All three textures must share one plane
+/// format (`EMBERWAVE_PLANE_FORMAT_R8` or `EMBERWAVE_PLANE_FORMAT_R16`), and
+/// no Vulkan image, Metal texture or Direct3D resource may serve two planes.
 /// Another, a texture of the RGB picture included, gives
 /// `EMBERWAVE_STATUS_INVALID_ARGUMENT` and leaves the frame to decode, as
 /// does a texture shared from Direct3D, which takes
@@ -5301,6 +5604,7 @@ pub unsafe extern "C" fn emberwave_decoder_decode_plane_textures(
                 ]
             };
             distinct_metal(&textures)?;
+            distinct_images(&textures)?;
             refuse_d3d12(&textures)?;
             let targets = textures.map(|texture| &texture.view);
             decoder
@@ -5673,10 +5977,13 @@ fn rgb_order(format: u32) -> Result<RgbOrder, Failure> {
 /// picture in CPU memory and into the same bytes (decision D65). The
 /// textures are on the encoder's context, with the sizes of what they hold:
 /// the caller's, from `emberwave_texture_from_metal_source` or
-/// `emberwave_texture_from_vulkan_source`, or textures that decodes put
-/// planes or pictures into. Others give `EMBERWAVE_STATUS_INVALID_ARGUMENT`
-/// before any work on the GPU, textures shared from Direct3D included, which
-/// take `emberwave_encoder_encode_textures_d3d12`. A budget too small gives
+/// `emberwave_texture_from_vulkan_source`, textures of pictures from
+/// `emberwave_decoder_decode_texture`, or 8-bit (`EMBERWAVE_PLANE_FORMAT_R8`
+/// / `R8Unorm`) plane textures from decodes (16-bit
+/// `EMBERWAVE_PLANE_FORMAT_R16` plane textures are not accepted). Others give
+/// `EMBERWAVE_STATUS_INVALID_ARGUMENT` before any work on the GPU, textures
+/// shared from Direct3D included, which take
+/// `emberwave_encoder_encode_textures_d3d12`. A budget too small gives
 /// `EMBERWAVE_STATUS_BUFFER_TOO_SMALL`, as for `emberwave_encoder_encode`,
 /// once the GPU has encoded the picture: no frame then, and the sequence
 /// number does not move.
@@ -6163,6 +6470,87 @@ mod tests {
                 }
                 emberwave_decoder_destroy(decoder);
             }
+            emberwave_context_destroy(context);
+        }
+    }
+
+    #[test]
+    fn strict_webgpu_context_reports_r16_unsupported_while_r8_succeeds() {
+        let mut options = GpuOptions::from_env().unwrap_or_default();
+        options.strict_webgpu = true;
+        let gpu_context = match GpuContext::new(&options) {
+            Ok(context) => context,
+            Err(_) => {
+                assert!(
+                    std::env::var_os("EMBERWAVE_REQUIRE_GPU").is_none_or(|value| value.is_empty()),
+                    "no GPU"
+                );
+                return;
+            }
+        };
+        let context = EmberwaveContext::boxed(gpu_context, false, false, false);
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/noise_192x136_420.pwv1");
+        let bytes = std::fs::read(&path).expect("testdata");
+        let file = emberwave_core::bitstream::Pwv1File::parse(&bytes).expect("pwv1");
+        let frame = file.frames().next().expect("frame").expect("valid frame");
+
+        // SAFETY: `context` is a live boxed context and all pointers are valid.
+        unsafe {
+            let mut info = EmberwaveContextInfo::default();
+            assert_eq!(
+                emberwave_context_info(context, &mut info),
+                EmberwaveStatus::Ok
+            );
+            assert_eq!(info.features & EMBERWAVE_CONTEXT_FEATURE_PLANE_R16, 0);
+
+            let mut decoder = std::ptr::null_mut();
+            assert_eq!(
+                emberwave_decoder_create(context, 192, 136, EMBERWAVE_CHROMA_420, &mut decoder),
+                EmberwaveStatus::Ok
+            );
+
+            let mut marker = 0u8;
+            let mut r16_tex = std::ptr::from_mut(&mut marker).cast::<EmberwaveTexture>();
+            assert_eq!(
+                emberwave_texture_create_plane_with_format(
+                    decoder,
+                    EMBERWAVE_PLANE_Y,
+                    EMBERWAVE_PLANE_FORMAT_R16,
+                    &mut r16_tex
+                ),
+                EmberwaveStatus::Unsupported
+            );
+            assert!(r16_tex.is_null());
+
+            let r8 = [EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR].map(|plane| {
+                let mut tex = std::ptr::null_mut();
+                assert_eq!(
+                    emberwave_texture_create_plane_with_format(
+                        decoder,
+                        plane,
+                        EMBERWAVE_PLANE_FORMAT_R8,
+                        &mut tex
+                    ),
+                    EmberwaveStatus::Ok
+                );
+                tex
+            });
+
+            assert_eq!(
+                emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                EmberwaveStatus::Ok
+            );
+            assert_eq!(
+                emberwave_decoder_decode_plane_textures(decoder, r8[0], r8[1], r8[2]),
+                EmberwaveStatus::Ok
+            );
+
+            for tex in r8 {
+                emberwave_texture_destroy(tex);
+            }
+            emberwave_decoder_destroy(decoder);
             emberwave_context_destroy(context);
         }
     }
