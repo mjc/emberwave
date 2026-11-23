@@ -955,25 +955,8 @@ int main(int argc, char **argv)
 
 cleanup:
     free(cpu_yuv);
-    if (probe_tex != NULL) {
-        emberwave_texture_destroy(probe_tex);
-    }
-    for (i = 0; i < 3; i++) {
-        emberwave_texture_destroy(wrapped_tex[i]);
-        emberwave_texture_destroy(owned_tex[i]);
-    }
     if (reqs != NULL) {
         emberwave_vulkan_requirements_destroy(reqs);
-    }
-    if (decoder != NULL) {
-        emberwave_decoder_destroy(decoder);
-    }
-    if (context != NULL) {
-        emberwave_context_destroy(context);
-    }
-    if (check_released && g_released_count != 3) {
-        fprintf(stderr, "expected 3 image release callbacks, got %u\n", g_released_count);
-        exit_code = 1;
     }
     {
         int can_destroy_device = 1;
@@ -988,6 +971,23 @@ cleanup:
             }
         }
         if (can_destroy_device) {
+            if (probe_tex != NULL) {
+                emberwave_texture_destroy(probe_tex);
+            }
+            for (i = 0; i < 3; i++) {
+                emberwave_texture_destroy(wrapped_tex[i]);
+                emberwave_texture_destroy(owned_tex[i]);
+            }
+            if (decoder != NULL) {
+                emberwave_decoder_destroy(decoder);
+            }
+            if (context != NULL) {
+                emberwave_context_destroy(context);
+            }
+            if (check_released && g_released_count != 3) {
+                fprintf(stderr, "expected 3 image release callbacks, got %u\n", g_released_count);
+                exit_code = 1;
+            }
             destroy_plane_image(&vk, &probe_img);
             for (i = 0; i < 3; i++) {
                 destroy_plane_image(&vk, &plane_imgs[i]);
