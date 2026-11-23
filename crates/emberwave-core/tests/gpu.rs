@@ -1821,6 +1821,119 @@ fn synthetic_frames_dequantise_identically_on_gpu_and_cpu() {
     );
 }
 
+fn hand_block(
+    block_index: u32,
+    ballot: u16,
+    controls: &[u16],
+    qscales: &[u8],
+    planes: &[u8],
+    signs: &[u8],
+) -> Vec<u8> {
+    assert_eq!(controls.len(), ballot.count_ones() as usize);
+    assert_eq!(qscales.len(), ballot.count_ones() as usize);
+    let mut body = Vec::new();
+    for &c in controls {
+        body.extend_from_slice(&c.to_le_bytes());
+    }
+    body.extend_from_slice(qscales);
+    body.extend_from_slice(planes);
+    body.extend_from_slice(signs);
+    while (8 + body.len()) % 4 != 0 {
+        body.push(0);
+    }
+    let words = (8 + body.len()) / 4;
+    let word0 = u32::from(ballot) | ((words as u32) << 16) | (1 << 28);
+    let word1 = 8u32 | (block_index << 8);
+    [word0.to_le_bytes().as_slice(), &word1.to_le_bytes(), &body].concat()
+}
+
+fn wrap_frame(layout: &FrameLayout, blocks: &[Vec<u8>]) -> Vec<u8> {
+    let word0 = (layout.width() - 1) | ((layout.height() - 1) << 14) | (1 << 28) | (1 << 31);
+    let chroma_bit = u32::from(layout.chroma() == ChromaSubsampling::Yuv444) << 26;
+    let word1 = (blocks.len() as u32) | chroma_bit;
+    let mut out = [word0.to_le_bytes().as_slice(), &word1.to_le_bytes()].concat();
+    for block in blocks {
+        out.extend_from_slice(block);
+    }
+    out
+}
+
+#[test]
+fn sparse_dirty_ballots_and_missing_blocks_clear_bit_exactly() {
+    let context = gpu_or_return!();
+    let layout = FrameLayout::new(128, 128, ChromaSubsampling::Yuv420).unwrap();
+    let mut decoder = decoder_for(context, &layout);
+
+    // Frame 0: block 0 sets all 16 8x8 blocks; block 12 (level 3 detail) sets 4 8x8 blocks.
+    let f0 = wrap_frame(
+        &layout,
+        &[
+            hand_block(
+                0,
+                0xFFFF,
+                &[0x0001; 16],
+                &[0x40; 16],
+                &[0xFF; 16],
+                &[0xAA; 16],
+            ),
+            hand_block(
+                12,
+                0b1010_0101,
+                &[0x0001; 4],
+                &[0x40; 4],
+                &[0xFF; 4],
+                &[0x55; 4],
+            ),
+        ],
+    );
+    // Frame 1: block 0 shrinks to only 8x8 #0; block 12 goes missing (must clear);
+    // block 13 arrives for the first time with a sparse ballot.
+    let f1 = wrap_frame(
+        &layout,
+        &[
+            hand_block(0, 0x0001, &[0x0001], &[0x40], &[0x0F], &[0x03]),
+            hand_block(13, 0x8000, &[0x0001], &[0x40], &[0xF0], &[0x0C]),
+        ],
+    );
+    // Frame 2: block 0 keeps ballot bit 0 set but sets control_word = 0 (must zero 8x8 #0);
+    // block 13 shrinks to ballot = 0.
+    let f2 = wrap_frame(
+        &layout,
+        &[
+            hand_block(0, 0x0001, &[0x0000], &[0x40], &[], &[]),
+            hand_block(13, 0x0000, &[], &[], &[], &[]),
+        ],
+    );
+    // Frame 3 & 4: completely empty frames (clear_blocks on frame 3, zero work on frame 4).
+    let f3 = wrap_frame(&layout, &[]);
+    let f4 = wrap_frame(&layout, &[]);
+    // Frame 5: re-activate block 12 after clearing.
+    let f5 = wrap_frame(
+        &layout,
+        &[hand_block(12, 0x0001, &[0x0001], &[0x40], &[0x01], &[0x01])],
+    );
+
+    for (step, bytes) in [f0, f1, f2, f3, f4, f5].iter().enumerate() {
+        decoder.clear();
+        decoder.push_packet(bytes).unwrap();
+        decoder.decode_assembled().unwrap();
+
+        let assembler = assembled(&layout, bytes);
+        let bands = cpu::dequant::dequantize(&assembler.frame()).unwrap();
+        for (component, level, band, _) in layout.bands() {
+            let expected = bands.plane(component, level, band).unwrap();
+            let actual = decoder.read_band(component, level, band).unwrap().unwrap();
+            for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    e.to_bits(),
+                    "step {step} {component:?} level {level} {band:?} sample {i}: {a} vs {e}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn a_large_payload_grows_the_buffer_and_still_decodes() {
     let context = gpu_or_return!();

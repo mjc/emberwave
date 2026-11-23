@@ -79,12 +79,9 @@ fn the_workgroup_variables_are_the_ones_checked_for_writes_before_reads() {
     // writes and reads again, then update the list.
     type Variable = (&'static str, u32); // name, size in bytes
     let dequant: &[Variable] = &[
-        ("shared_offset", 4),
-        ("control_words", 64),
-        ("qscales", 64),
-        ("plane_costs", 64),
-        ("sign_counts", 512),
-        ("block_sign_totals", 64),
+        ("shared_prev_ballot", 4),
+        ("block8_meta", 64),
+        ("block8_packed_counts", 64),
     ];
     let idwt: &[Variable] = &[("horizontal", 5120), ("levels", 4096)];
     let fdwt: &[Variable] = &[("horizontal", 5120)];

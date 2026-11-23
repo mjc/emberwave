@@ -289,6 +289,7 @@ impl FrameAssembler {
         FrameView {
             layout: &self.layout,
             block_offsets: &self.block_offsets,
+            filled: &self.filled,
             payload: &self.payload,
             start_of_frame: self.start_of_frame.as_ref(),
         }
@@ -378,6 +379,7 @@ impl FrameAssembler {
 pub struct FrameView<'a> {
     layout: &'a FrameLayout,
     block_offsets: &'a [u32],
+    filled: &'a [u32],
     payload: &'a [u32],
     start_of_frame: Option<&'a SequenceHeader>,
 }
@@ -392,6 +394,11 @@ impl<'a> FrameView<'a> {
     /// block index; [`MISSING_BLOCK`] for blocks that were not received.
     pub fn block_offsets(&self) -> &'a [u32] {
         self.block_offsets
+    }
+
+    /// Distinct block indices received for this frame, in arrival order.
+    pub fn filled(&self) -> &'a [u32] {
+        self.filled
     }
 
     /// The received blocks back to back, headers included.
@@ -466,6 +473,7 @@ mod tests {
         assert!(a.is_ready(false));
 
         let frame = a.frame();
+        assert_eq!(frame.filled(), [0, 5, 40]);
         assert_eq!(frame.block(0).map(<[u32]>::len), Some(2));
         assert_eq!(frame.block(5).map(<[u32]>::len), Some(5));
         assert_eq!(frame.block(40).map(<[u32]>::len), Some(3));

@@ -22,6 +22,7 @@ pub(crate) struct Stage {
 #[derive(Debug)]
 pub(crate) struct Pipelines {
     pub dequant: Stage,
+    pub dequant_clear: Stage,
     pub idwt: Stage,
     /// The inverse transform that stores the planes into textures, on a
     /// device that can (decision D52).
@@ -35,39 +36,45 @@ impl Pipelines {
     /// [`PLANE_FORMAT`] as a storage texture. A device that fails to build
     /// it decodes with the copies.
     pub(crate) fn new(device: &wgpu::Device, plane_stores: bool) -> Result<Self, GpuError> {
-        let mut pipelines = with_error_scope(device, || Self {
-            dequant: create_stage(
+        let mut pipelines = with_error_scope(device, || {
+            let [dequant, dequant_clear] = create_stages(
                 device,
                 "dequant",
                 shader_sources::DEQUANT,
+                ["main", "clear_blocks"],
                 &[
                     storage_entry(0, true),
                     storage_entry(1, true),
                     storage_entry(2, false),
                     uniform_entry(3),
+                    storage_entry(4, false),
                 ],
-            ),
-            idwt: create_stage(
-                device,
-                "idwt",
-                shader_sources::IDWT,
-                &[
-                    storage_entry(0, false),
-                    storage_entry(1, false),
-                    uniform_entry(2),
-                ],
-            ),
-            idwt_planes: None,
-            yuv2rgb: create_stage(
-                device,
-                "yuv2rgb",
-                shader_sources::YUV2RGB,
-                &[
-                    storage_entry(0, true),
-                    storage_entry(1, false),
-                    uniform_entry(2),
-                ],
-            ),
+            );
+            Self {
+                dequant,
+                dequant_clear,
+                idwt: create_stage(
+                    device,
+                    "idwt",
+                    shader_sources::IDWT,
+                    &[
+                        storage_entry(0, false),
+                        storage_entry(1, false),
+                        uniform_entry(2),
+                    ],
+                ),
+                idwt_planes: None,
+                yuv2rgb: create_stage(
+                    device,
+                    "yuv2rgb",
+                    shader_sources::YUV2RGB,
+                    &[
+                        storage_entry(0, true),
+                        storage_entry(1, false),
+                        uniform_entry(2),
+                    ],
+                ),
+            }
         })?;
         if plane_stores {
             pipelines.idwt_planes = with_error_scope(device, || {
