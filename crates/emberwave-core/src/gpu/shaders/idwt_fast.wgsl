@@ -163,33 +163,54 @@ fn horiz_segment(
     let raw_y = tile_y + i32(row) - APRON;
     let y = select(mirror(raw_y, out_height), raw_y, raw_y >= 0 && raw_y < out_height);
     let x0 = tile_x + i32(8u * segment) - APRON;
+    let row_bands = u32(y & 1) << 1u;
+    let by = u32(y >> 1u);
+    let band_row = by * band_width;
+    let odd = comp.band_offset[row_bands | 1u] + band_row;
+    let even = comp.band_offset[row_bands] + band_row;
+    let packed_even = row_bands == 0u && mode == 1u;
     var v: array<f32, 16>;
     if (x0 >= 0 && x0 + 15 < out_width) {
         let bx = u32(x0) >> 1u;
-        let p0 = sample_at(comp, band_width, y, bx + 0u, mode);
-        let p1 = sample_at(comp, band_width, y, bx + 1u, mode);
-        let p2 = sample_at(comp, band_width, y, bx + 2u, mode);
-        let p3 = sample_at(comp, band_width, y, bx + 3u, mode);
-        let p4 = sample_at(comp, band_width, y, bx + 4u, mode);
-        let p5 = sample_at(comp, band_width, y, bx + 5u, mode);
-        let p6 = sample_at(comp, band_width, y, bx + 6u, mode);
-        let p7 = sample_at(comp, band_width, y, bx + 7u, mode);
-        v[0] = p0.x;
-        v[1] = p0.y;
-        v[2] = p1.x;
-        v[3] = p1.y;
-        v[4] = p2.x;
-        v[5] = p2.y;
-        v[6] = p3.x;
-        v[7] = p3.y;
-        v[8] = p4.x;
-        v[9] = p4.y;
-        v[10] = p5.x;
-        v[11] = p5.y;
-        v[12] = p6.x;
-        v[13] = p6.y;
-        v[14] = p7.x;
-        v[15] = p7.y;
+        // Eight band pairs, the same addressing as idwt.wgsl. A plane's even
+        // lowpass samples come from the packed word instead of the pyramid.
+        v[1] = pyramid[odd + bx + 0u];
+        v[3] = pyramid[odd + bx + 1u];
+        v[5] = pyramid[odd + bx + 2u];
+        v[7] = pyramid[odd + bx + 3u];
+        v[9] = pyramid[odd + bx + 4u];
+        v[11] = pyramid[odd + bx + 5u];
+        v[13] = pyramid[odd + bx + 6u];
+        v[15] = pyramid[odd + bx + 7u];
+        if (packed_even) {
+            let base = (comp.pad0 >> 1u) + (by >> 1u) * band_width + bx;
+            let p0 = unpack2x16float(ll_packed[base + 0u]);
+            let p1 = unpack2x16float(ll_packed[base + 1u]);
+            let p2 = unpack2x16float(ll_packed[base + 2u]);
+            let p3 = unpack2x16float(ll_packed[base + 3u]);
+            let p4 = unpack2x16float(ll_packed[base + 4u]);
+            let p5 = unpack2x16float(ll_packed[base + 5u]);
+            let p6 = unpack2x16float(ll_packed[base + 6u]);
+            let p7 = unpack2x16float(ll_packed[base + 7u]);
+            let low = (by & 1u) == 0u;
+            v[0] = select(p0.y, p0.x, low);
+            v[2] = select(p1.y, p1.x, low);
+            v[4] = select(p2.y, p2.x, low);
+            v[6] = select(p3.y, p3.x, low);
+            v[8] = select(p4.y, p4.x, low);
+            v[10] = select(p5.y, p5.x, low);
+            v[12] = select(p6.y, p6.x, low);
+            v[14] = select(p7.y, p7.x, low);
+        } else {
+            v[0] = pyramid[even + bx + 0u];
+            v[2] = pyramid[even + bx + 1u];
+            v[4] = pyramid[even + bx + 2u];
+            v[6] = pyramid[even + bx + 3u];
+            v[8] = pyramid[even + bx + 4u];
+            v[10] = pyramid[even + bx + 5u];
+            v[12] = pyramid[even + bx + 6u];
+            v[14] = pyramid[even + bx + 7u];
+        }
     } else {
         v[0] = coeff_at(comp, band_width, y, x0 + 0, out_width, mode);
         v[1] = coeff_at(comp, band_width, y, x0 + 1, out_width, mode);
