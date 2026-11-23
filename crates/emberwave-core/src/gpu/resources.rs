@@ -258,13 +258,25 @@ impl StageQueries {
         queue: &wgpu::Queue,
         turns: Option<&QueueTurns>,
     ) -> Result<Option<Vec<Option<Duration>>>, GpuError> {
-        let bytes = u64::from(2 * self.stages) * 8;
+        self.read_count(device, queue, turns, self.stages)
+    }
+
+    /// Reads the timestamps for the first `stages` stages.
+    pub(crate) fn read_count(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        turns: Option<&QueueTurns>,
+        stages: u32,
+    ) -> Result<Option<Vec<Option<Duration>>>, GpuError> {
+        let stages = stages.min(self.stages);
+        let bytes = u64::from(2 * stages) * 8;
         let mut recording = take_turn(turns, device, queue);
         with_error_scope(device, || {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("timestamps"),
             });
-            encoder.resolve_query_set(&self.query_set, 0..2 * self.stages, &self.resolve, 0);
+            encoder.resolve_query_set(&self.query_set, 0..2 * stages, &self.resolve, 0);
             encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, bytes);
             submit(queue, turns, [encoder.finish()]);
         })?;

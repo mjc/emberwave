@@ -24,17 +24,19 @@ mod bench_encode;
 mod compare;
 mod decode;
 mod encode;
+mod gen_stream;
 mod info;
 mod quality;
 mod stats;
 mod y4m;
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use emberwave_core::bitstream::{ChromaSiting, SequenceHeader, YcbcrRange};
 use emberwave_core::color::{ColorMatrix, ColorParams};
-use emberwave_core::gpu::{GpuContext, GpuOptions, parse_backends};
+use emberwave_core::gpu::{GpuContext, GpuOptions, QueueTurns, parse_backends};
 
 /// The error type of the command line tool: anything that can be printed.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -61,6 +63,8 @@ enum Command {
     Decode(decode::Args),
     /// Encode a Y4M video to a file, each frame within a byte budget
     Encode(encode::Args),
+    /// Generate a deterministic synthetic PWV1 stream for benchmarks
+    GenStream(gen_stream::Args),
     /// Measure decode time per frame
     Bench(bench::Args),
     /// Measure encode time per frame
@@ -97,11 +101,28 @@ pub struct GpuArgs {
     /// Insist on a software adapter (lavapipe, WARP)
     #[arg(long)]
     pub software: bool,
+
+    /// Prefer a low-power / integrated GPU adapter
+    #[arg(long)]
+    pub low_power: bool,
+
+    /// Select the first GPU adapter whose name contains this substring
+    #[arg(long)]
+    pub adapter: Option<String>,
 }
 
 impl GpuArgs {
     /// Creates the GPU context, printing which adapter was chosen to stderr.
     pub fn create_context(&self, timestamps: bool) -> Result<GpuContext> {
+        self.create_context_with_turns(timestamps, false)
+    }
+
+    /// Creates the GPU context, optionally attaching [`QueueTurns`].
+    pub fn create_context_with_turns(
+        &self,
+        timestamps: bool,
+        queue_turns: bool,
+    ) -> Result<GpuContext> {
         // An EMBERWAVE_BACKEND that names no backend is an error here.
         let mut options = GpuOptions::from_env()?;
         let name = match self.backend {
@@ -114,9 +135,15 @@ impl GpuArgs {
             options.backends = backends;
         }
         options.force_fallback_adapter = self.software;
+        if self.low_power {
+            options.power_preference = wgpu::PowerPreference::LowPower;
+        }
         options.timestamps = timestamps;
 
-        let context = GpuContext::new(&options)?;
+        let mut context = GpuContext::new_matching(&options, self.adapter.as_deref())?;
+        if queue_turns {
+            context = context.with_queue_turns(Arc::new(QueueTurns::new()));
+        }
         let info = context.adapter_info();
         err!(
             "adapter: {} ({:?}, {:?})",
@@ -204,6 +231,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Decode(args) => decode::run(&args),
         Command::Encode(args) => encode::run(&args),
+        Command::GenStream(args) => gen_stream::run(&args),
         Command::Bench(args) => bench::run(&args),
         Command::BenchEncode(args) => bench_encode::run(&args),
         Command::Info(args) => info::run(&args),

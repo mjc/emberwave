@@ -30,7 +30,7 @@ pub use context::{
 };
 pub use decoder::{
     Decoder, Frame, FramePlane, PLANE_FORMAT, PLANE_FORMAT_R16, PLANE_FORMATS, RgbFrame,
-    StageTimings, TEXTURE_FORMATS, TimedOutput, Timings,
+    StageTimings, TEXTURE_FORMATS, TimedOutput, TimedUpload, TimingOptions, Timings,
 };
 pub use encoder::{EncodeStageTimings, EncodeTimings, Encoder, TexturePicture};
 pub use error::GpuError;

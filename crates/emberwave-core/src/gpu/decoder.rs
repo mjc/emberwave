@@ -74,6 +74,29 @@ pub struct RgbFrame {
     pub data: Vec<u8>,
 }
 
+/// How frame data is uploaded in [`Decoder::time_frame_with`] and
+/// [`Decoder::time_plane_textures`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum TimedUpload {
+    /// Persistent mapped upload buffer (or shared-memory in-place write on
+    /// Apple silicon).
+    #[default]
+    Mapped,
+    /// `Queue::write_buffer`, matching the non-blocking FFI `submit_*` paths.
+    QueueWrite,
+}
+
+/// Options for [`Decoder::time_frame_with`] and [`Decoder::time_plane_textures`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct TimingOptions {
+    /// Time each of the five inverse transform levels in its own compute pass.
+    pub per_level_idwt: bool,
+    /// How the frame's block table and payload are uploaded.
+    pub upload: TimedUpload,
+}
+
 /// What [`Decoder::time_frame`] decodes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -86,16 +109,20 @@ pub enum TimedOutput {
 
 /// GPU time of each stage, measured with timestamp queries.
 ///
-/// Only available on devices that support them, and then only at the
-/// granularity of a pass: all five inverse transform levels are one pass.
+/// Only available on devices that support them. By default the five inverse
+/// transform levels run in one pass; setting `per_level_idwt` in
+/// [`TimingOptions`] splits them into five passes so each level is timed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StageTimings {
     /// Coefficient decoding and dequantisation.
     pub dequant: Duration,
     /// The inverse transform, all levels, including the conversion of the
-    /// planes to 8 bits at the last one.
+    /// planes to 8 bits (or 16-bit normalised planes) at the last one.
     pub idwt: Duration,
+    /// Per-level inverse transform times from coarsest (level 4) to finest
+    /// (level 0), when `per_level_idwt` was requested.
+    pub idwt_levels: Option<[Duration; DECOMPOSITION_LEVELS]>,
     /// Colour conversion, if it was part of the decode.
     pub yuv2rgb: Option<Duration>,
 }
@@ -111,8 +138,16 @@ impl StageTimings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct Timings {
-    /// CPU time to assemble the packets and hand the data to the GPU.
+    /// CPU time to assemble the packets and prepare the GPU submission.
     pub prepare: Duration,
+    /// CPU time spent assembling the frame's packets (`FrameAssembler`).
+    pub assemble: Duration,
+    /// CPU time spent writing the block table and payload into upload/staging memory.
+    pub upload: Duration,
+    /// CPU time spent waiting to acquire `QueueTurns`.
+    pub queue_turn: Duration,
+    /// CPU time spent preparing output bind groups, encoding commands, and submitting.
+    pub submit: Duration,
     /// Wall-clock time from encoding the GPU work until it was done. When the
     /// picture is read back this includes that.
     pub gpu_wall: Duration,
@@ -141,9 +176,9 @@ struct ColorResources {
     grid: (u32, u32),
 }
 
-/// Stages that are timed: dequantisation, the inverse transform and the
-/// colour conversion, one pass each.
-const TIMED_STAGES: u32 = 3;
+/// Maximum number of timed stages: dequantisation, up to five inverse transform
+/// passes (one per level), and the colour conversion.
+const TIMED_STAGES: u32 = 2 + DECOMPOSITION_LEVELS as u32;
 
 /// Where the CPU writes a frame's block table and payload for the GPU to
 /// copy, in the decodes that wait for their frame (decision D34): kept from
@@ -508,6 +543,18 @@ impl Decoder {
     /// supports them.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn time_frame(&mut self, frame: &[u8], output: TimedOutput) -> Result<Timings, GpuError> {
+        self.time_frame_with(frame, output, TimingOptions::default())
+    }
+
+    /// Like [`time_frame`](Self::time_frame), with explicit [`TimingOptions`]
+    /// for per-level `idwt` timestamps and upload mode selection.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn time_frame_with(
+        &mut self,
+        frame: &[u8],
+        output: TimedOutput,
+        options: TimingOptions,
+    ) -> Result<Timings, GpuError> {
         let start = Instant::now();
         self.assemble_complete(frame)?;
         let assembled = start.elapsed();
@@ -520,7 +567,33 @@ impl Decoder {
             color.as_ref(),
             Read::Nothing,
             None,
-            true,
+            Some(options),
+            assembled,
+            &mut |_| {},
+        )
+    }
+
+    /// Decodes one complete frame into caller-provided Y, Cb and Cr plane
+    /// textures (`R8Unorm` or `R16Unorm`) and waits for the GPU, returning
+    /// per-stage CPU and GPU timings.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn time_plane_textures(
+        &mut self,
+        frame: &[u8],
+        targets: [&wgpu::TextureView; 3],
+        options: TimingOptions,
+    ) -> Result<Timings, GpuError> {
+        self.check_device()?;
+        self.check_plane_targets(targets)?;
+        let start = Instant::now();
+        self.assemble_complete(frame)?;
+        let assembled = start.elapsed();
+
+        self.run_gpu(
+            None,
+            Read::Planes(targets),
+            None,
+            Some(options),
             assembled,
             &mut |_| {},
         )
@@ -612,7 +685,7 @@ impl Decoder {
             Some(color),
             Read::Texture(target),
             None,
-            false,
+            None,
             Duration::ZERO,
             &mut |_| {},
         )?;
@@ -729,7 +802,7 @@ impl Decoder {
             None,
             Read::Planes(targets),
             Some(fill),
-            false,
+            None,
             Duration::ZERO,
             &mut |_| {},
         )?;
@@ -1114,7 +1187,7 @@ impl Decoder {
             Some(color),
             Read::Rgb,
             None,
-            false,
+            None,
             Duration::ZERO,
             &mut |rgba| {
                 rgba_to_rgb(rgba, &mut data);
@@ -1141,20 +1214,13 @@ impl Decoder {
         mut row: impl FnMut(Component, u32, &[u8]),
     ) -> Result<(), GpuError> {
         let planes = self.packed_planes();
-        self.run_gpu(
-            None,
-            Read::Yuv,
-            None,
-            false,
-            Duration::ZERO,
-            &mut |packed| {
-                for (component, plane) in Component::ALL.into_iter().zip(&planes) {
-                    for (index, samples) in plane.rows(packed).enumerate() {
-                        row(component, index as u32, samples);
-                    }
+        self.run_gpu(None, Read::Yuv, None, None, Duration::ZERO, &mut |packed| {
+            for (component, plane) in Component::ALL.into_iter().zip(&planes) {
+                for (index, samples) in plane.rows(packed).enumerate() {
+                    row(component, index as u32, samples);
                 }
-            },
-        )?;
+            }
+        })?;
         Ok(())
     }
 
@@ -1173,7 +1239,7 @@ impl Decoder {
             Some(color),
             Read::Rgb,
             None,
-            false,
+            None,
             Duration::ZERO,
             &mut |rgba| {
                 for (index, pixels) in rgba.chunks_exact(width * 4).enumerate() {
@@ -1211,13 +1277,13 @@ impl Decoder {
         color: Option<&ColorParams>,
         read: Read<'_>,
         prepared_planes: Option<PlaneFill>,
-        timed: bool,
+        timing: Option<TimingOptions>,
         assembled_in: Duration,
         consume: &mut dyn FnMut(&[u8]),
     ) -> Result<Timings, GpuError> {
         self.check_device()?;
         let outcome =
-            self.run_gpu_on_device(color, read, prepared_planes, timed, assembled_in, consume);
+            self.run_gpu_on_device(color, read, prepared_planes, timing, assembled_in, consume);
         // The device can be lost while the frame is on it, and wgpu tells
         // during the wait, or for a destroyed device when it is next polled.
         // Whatever failed then is the loss, and whatever came back is not to
@@ -1236,21 +1302,43 @@ impl Decoder {
         color: Option<&ColorParams>,
         read: Read<'_>,
         prepared_planes: Option<PlaneFill>,
-        timed: bool,
+        timing: Option<TimingOptions>,
         assembled_in: Duration,
         consume: &mut dyn FnMut(&[u8]),
     ) -> Result<Timings, GpuError> {
+        let timing_opts = timing.unwrap_or_default();
         let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
         self.compile_concealment()?;
-        let (table_bytes, payload_bytes) = self.upload_mapped()?;
-        // The decode makes command buffers from here to its submission, and
-        // takes its turn at them (decision D60); the upload above waits for
-        // the GPU to map its buffer, so it comes first.
         let turns = self.turns.clone();
-        let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
+        let (table_bytes, payload_bytes, upload, queue_turn, mut recording) =
+            match timing_opts.upload {
+                TimedUpload::Mapped => {
+                    let upload_start = Instant::now();
+                    let (table_bytes, payload_bytes) = self.upload_mapped()?;
+                    let upload = upload_start.elapsed();
+                    // The decode makes command buffers from here to its submission, and
+                    // takes its turn at them (decision D60); the upload above waits for
+                    // the GPU to map its buffer, so it comes first.
+                    let turn_start = Instant::now();
+                    let recording = take_turn(turns.as_deref(), &self.device, &self.queue);
+                    let queue_turn = turn_start.elapsed();
+                    (table_bytes, payload_bytes, upload, queue_turn, recording)
+                }
+                TimedUpload::QueueWrite => {
+                    let turn_start = Instant::now();
+                    let recording = take_turn(turns.as_deref(), &self.device, &self.queue);
+                    let queue_turn = turn_start.elapsed();
+                    let upload_start = Instant::now();
+                    with_error_scope(&self.device, || self.upload())?;
+                    let upload = upload_start.elapsed();
+                    (0, 0, upload, queue_turn, recording)
+                }
+            };
+        let submit_prep_start = Instant::now();
         let output = self.prepare_output(color, read, prepared_planes)?;
         let conceal = self.prepare_concealment()?;
+        let submit_prep = submit_prep_start.elapsed();
         let prepare = assembled_in + prepare_start.elapsed();
 
         self.make_readback(read)?;
@@ -1268,8 +1356,9 @@ impl Decoder {
             }),
         };
 
-        let queries = self.timestamps.as_ref().filter(|_| timed);
+        let queries = self.timestamps.as_ref().filter(|_| timing.is_some());
         let gpu_start = Instant::now();
+        let encode_start = Instant::now();
         with_error_scope(&self.device, || {
             let mut encoder = self
                 .device
@@ -1277,7 +1366,9 @@ impl Decoder {
                     label: Some("decode"),
                 });
 
-            if let Some(upload) = &self.upload {
+            if timing_opts.upload == TimedUpload::Mapped
+                && let Some(upload) = &self.upload
+            {
                 let payload_start = self.table_capacity_bytes();
                 encoder.copy_buffer_to_buffer(
                     &upload.buffer,
@@ -1294,7 +1385,14 @@ impl Decoder {
                     payload_bytes,
                 );
             }
-            self.encode_passes(&mut encoder, color.is_some(), conceal, queries, &output);
+            self.encode_passes(
+                &mut encoder,
+                color.is_some(),
+                conceal,
+                queries,
+                timing_opts.per_level_idwt,
+                &output,
+            );
             self.encode_output(&mut encoder, read, &output);
             if let Some((source, target, bytes)) = copy_back {
                 encoder.copy_buffer_to_buffer(source, 0, target, 0, bytes);
@@ -1303,6 +1401,7 @@ impl Decoder {
         })?;
         recording.submitted();
         drop(recording);
+        let submit_dur = submit_prep + encode_start.elapsed();
 
         // The wait for the frame polls the device, which records a loss. A
         // device lost by then ran the frame in part or not at all, and its
@@ -1324,13 +1423,17 @@ impl Decoder {
         let gpu_wall = gpu_start.elapsed();
 
         let stages = match queries {
-            Some(q) => self.read_stage_timings(q, color.is_some())?,
+            Some(q) => self.read_stage_timings(q, color.is_some(), timing_opts.per_level_idwt)?,
             None => None,
         };
 
         self.assembler.mark_frame_decoded();
         Ok(Timings {
             prepare,
+            assemble: assembled_in,
+            upload,
+            queue_turn,
+            submit: submit_dur,
             gpu_wall,
             stages,
         })
@@ -1478,7 +1581,7 @@ impl Decoder {
         with_error_scope(&self.device, || self.upload())?;
         let output = self.prepare_output(color, read, prepared_planes)?;
         let conceal = self.prepare_concealment()?;
-        self.encode_passes(encoder, color.is_some(), conceal, None, &output);
+        self.encode_passes(encoder, color.is_some(), conceal, None, false, &output);
         self.encode_output(encoder, read, &output);
         Ok(())
     }
@@ -1765,6 +1868,7 @@ impl Decoder {
         rgb: bool,
         conceal: bool,
         queries: Option<&StageQueries>,
+        per_level_idwt: bool,
         output: &Output,
     ) {
         // Each pass is a stage of its own.
@@ -1790,18 +1894,37 @@ impl Decoder {
             }
         }
 
-        {
+        let (plane_pipeline, stores) = match output {
+            Output::Planes(PlaneFill::Store {
+                pipeline,
+                bind_groups,
+            }) => (Some(pipeline), bind_groups.as_slice()),
+            _ => (None, &[][..]),
+        };
+
+        if per_level_idwt {
+            for (index, stage) in self.idwt_stages.iter().enumerate() {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("idwt level"),
+                    timestamp_writes: writes(1 + index as u32),
+                });
+                match (stores.get(index), plane_pipeline) {
+                    (Some(Some(bind_group)), Some(pipeline)) => {
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, bind_group, &[]);
+                    }
+                    _ => {
+                        pass.set_pipeline(&self.pipelines.idwt.pipeline);
+                        pass.set_bind_group(0, &stage.bind_group, &[]);
+                    }
+                }
+                pass.dispatch_workgroups(stage.grid.0, stage.grid.1, stage.grid.2);
+            }
+        } else {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("idwt"),
                 timestamp_writes: writes(1),
             });
-            let (plane_pipeline, stores) = match output {
-                Output::Planes(PlaneFill::Store {
-                    pipeline,
-                    bind_groups,
-                }) => (Some(pipeline), bind_groups.as_slice()),
-                _ => (None, &[][..]),
-            };
             for (index, stage) in self.idwt_stages.iter().enumerate() {
                 match (stores.get(index), plane_pipeline) {
                     (Some(Some(bind_group)), Some(pipeline)) => {
@@ -1818,9 +1941,14 @@ impl Decoder {
         }
 
         if let (true, Some(resources)) = (rgb, self.color.as_ref()) {
+            let rgb_slot = if per_level_idwt {
+                1 + DECOMPOSITION_LEVELS as u32
+            } else {
+                2
+            };
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("yuv2rgb"),
-                timestamp_writes: writes(2),
+                timestamp_writes: writes(rgb_slot),
             });
             pass.set_pipeline(&self.pipelines.yuv2rgb.pipeline);
             pass.set_bind_group(0, &resources.bind_group, &[]);
@@ -1887,18 +2015,49 @@ impl Decoder {
         &self,
         queries: &StageQueries,
         with_rgb: bool,
+        per_level_idwt: bool,
     ) -> Result<Option<StageTimings>, GpuError> {
-        let Some(stages) = queries.read(&self.device, &self.queue, self.turns.as_deref())? else {
+        let count = if per_level_idwt {
+            1 + DECOMPOSITION_LEVELS as u32 + u32::from(with_rgb)
+        } else {
+            2 + u32::from(with_rgb)
+        };
+        let Some(stages) =
+            queries.read_count(&self.device, &self.queue, self.turns.as_deref(), count)?
+        else {
             return Ok(None);
         };
-        Ok(match (stages[0], stages[1]) {
-            (Some(dequant), Some(idwt)) => Some(StageTimings {
+        let Some(dequant) = stages[0] else {
+            return Ok(None);
+        };
+        if per_level_idwt {
+            let mut levels = [Duration::ZERO; DECOMPOSITION_LEVELS];
+            for (slot, level_dur) in levels.iter_mut().enumerate() {
+                let Some(dur) = stages[1 + slot] else {
+                    return Ok(None);
+                };
+                *level_dur = dur;
+            }
+            let idwt = levels.iter().copied().sum();
+            let yuv2rgb = if with_rgb {
+                stages[1 + DECOMPOSITION_LEVELS]
+            } else {
+                None
+            };
+            Ok(Some(StageTimings {
                 dequant,
                 idwt,
+                idwt_levels: Some(levels),
+                yuv2rgb,
+            }))
+        } else {
+            Ok(stages[1].map(|idwt| StageTimings {
+                dequant,
+                idwt,
+                idwt_levels: None,
                 yuv2rgb: if with_rgb { stages[2] } else { None },
-            }),
-            _ => None,
-        })
+            }))
+        }
     }
 
     /// Reads one band of the wavelet pyramid back, row-major with the width
@@ -2584,7 +2743,7 @@ mod tests {
                 .unwrap();
             let mut packed = Vec::new();
             decoder
-                .run_gpu(None, Read::Yuv, None, false, Duration::ZERO, &mut |bytes| {
+                .run_gpu(None, Read::Yuv, None, None, Duration::ZERO, &mut |bytes| {
                     packed = bytes.to_vec();
                 })
                 .unwrap();
@@ -2643,7 +2802,7 @@ mod tests {
                     color.as_ref(),
                     read,
                     None,
-                    false,
+                    None,
                     Duration::ZERO,
                     &mut |_| {
                         handed_out += 1;

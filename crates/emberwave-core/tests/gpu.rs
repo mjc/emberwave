@@ -1984,6 +1984,7 @@ fn timing_a_frame_reports_where_the_time_goes() {
                 assert!(stages.total() > std::time::Duration::ZERO);
                 let rgb = matches!(output, emberwave_core::gpu::TimedOutput::Rgb(_));
                 assert_eq!(stages.yuv2rgb.is_some(), rgb);
+                assert!(stages.idwt_levels.is_none());
                 // The GPU cannot take longer than the wall clock around it.
                 assert!(stages.total() <= timings.gpu_wall + timings.prepare);
             }
@@ -1994,6 +1995,38 @@ fn timing_a_frame_reports_where_the_time_goes() {
                 !context.supports_timestamps(),
                 "the device supports timestamp queries but returned no stage times"
             ),
+        }
+    }
+
+    let mut detailed = emberwave_core::gpu::TimingOptions::default();
+    detailed.per_level_idwt = true;
+    detailed.upload = emberwave_core::gpu::TimedUpload::QueueWrite;
+    let timings = decoder
+        .time_frame_with(&frames[0], emberwave_core::gpu::TimedOutput::Yuv, detailed)
+        .unwrap();
+    assert!(timings.assemble > std::time::Duration::ZERO);
+    assert!(timings.gpu_wall > std::time::Duration::ZERO);
+    if let Some(stages) = timings.stages {
+        let levels = stages.idwt_levels.expect("per_level_idwt requested");
+        let sum: std::time::Duration = levels.iter().copied().sum();
+        assert_eq!(stages.idwt, sum);
+    }
+
+    if context.supports_plane_format(PLANE_FORMAT_R16) {
+        let r16_textures = Component::ALL.map(|component| {
+            decoder
+                .create_plane_texture_with_format(component, PLANE_FORMAT_R16)
+                .unwrap()
+        });
+        let r16_views = r16_textures
+            .each_ref()
+            .map(|t| t.create_view(&Default::default()));
+        let r16_timings = decoder
+            .time_plane_textures(&frames[0], r16_views.each_ref(), detailed)
+            .unwrap();
+        assert!(r16_timings.gpu_wall > std::time::Duration::ZERO);
+        if let Some(stages) = r16_timings.stages {
+            assert!(stages.idwt_levels.is_some());
         }
     }
 }
