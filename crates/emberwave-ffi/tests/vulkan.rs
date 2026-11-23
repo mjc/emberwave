@@ -3521,3 +3521,104 @@ fn duplicate_vulkan_plane_images_are_refused() {
         device.destroy_device(None);
     }
 }
+
+#[test]
+fn pipelined_submit_plane_textures_vulkan_cycles_ring_past_three_frames() {
+    let Some(client) = Client::new() else {
+        return;
+    };
+    let (names, device) = client.device();
+    let context = client.context(&device, &names, 0, None);
+    let mut decoder = ptr::null_mut();
+    // SAFETY: a live context and a pointer to store the decoder in.
+    let status =
+        unsafe { emberwave_decoder_create(context, 192, 136, EMBERWAVE_CHROMA_420, &mut decoder) };
+    assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+
+    let usage = vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::TRANSFER_DST
+        | vk::ImageUsageFlags::TRANSFER_SRC;
+    let stream_frames = frames();
+    const IN_FLIGHT: usize = 8;
+
+    let semaphore = client.timeline(&device);
+    let mut sets = Vec::with_capacity(IN_FLIGHT);
+    let mut expected_yuv = Vec::with_capacity(IN_FLIGHT);
+
+    for (index, frame) in stream_frames.iter().cycle().take(IN_FLIGHT).enumerate() {
+        let (_, yuv) = expected(decoder, frame);
+        expected_yuv.push(yuv);
+
+        let planes = [(192, 136), (96, 68), (96, 68)]
+            .map(|size| client.image(&device, vk::Format::R8_UNORM, size, usage));
+        let wrapped_planes: Vec<*mut EmberwaveTexture> = planes
+            .iter()
+            .zip([EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR])
+            .map(|(image, plane)| {
+                wrapped(decoder, image, vk::Format::R8_UNORM, usage, Some(plane)).unwrap()
+            })
+            .collect();
+
+        let signal = EmberwaveVulkanSync {
+            signal_semaphore: semaphore.as_raw(),
+            signal_value: index as u64 + 1,
+            flags: EMBERWAVE_SYNC_SIGNAL_TIMELINE,
+            ..Default::default()
+        };
+
+        // SAFETY: live decoder, assembled packet, live textures, and a timeline semaphore.
+        unsafe {
+            emberwave_decoder_clear(decoder);
+            assert_eq!(
+                emberwave_decoder_push_packet(decoder, frame.as_ptr(), frame.len()),
+                EmberwaveStatus::Ok,
+                "{}",
+                last_error()
+            );
+            assert_eq!(
+                emberwave_decoder_submit_plane_textures_vulkan(
+                    decoder,
+                    wrapped_planes[0],
+                    wrapped_planes[1],
+                    wrapped_planes[2],
+                    &signal
+                ),
+                EmberwaveStatus::Ok,
+                "{}",
+                last_error()
+            );
+        }
+        sets.push((planes, wrapped_planes));
+    }
+
+    for (index, ((planes, _), yuv)) in sets.iter().zip(&expected_yuv).enumerate() {
+        for (component, (image, plane)) in planes.iter().zip(yuv).enumerate() {
+            let read = client.read(
+                &device,
+                image.image,
+                (image.width, image.height, image.texel),
+                Some((semaphore, index as u64 + 1)),
+            );
+            assert_eq!(read, *plane, "frame {index}: plane {component}");
+        }
+    }
+
+    // SAFETY: live objects destroyed after all submissions complete.
+    unsafe {
+        for (_, wrapped_planes) in &sets {
+            for &texture in wrapped_planes {
+                emberwave_texture_destroy(texture);
+            }
+        }
+        emberwave_decoder_destroy(decoder);
+        emberwave_context_destroy(context);
+        device.destroy_semaphore(semaphore, None);
+        for (planes, _) in sets {
+            for image in planes {
+                device.destroy_image(image.image, None);
+                device.free_memory(image.memory, None);
+            }
+        }
+        device.destroy_device(None);
+    }
+}

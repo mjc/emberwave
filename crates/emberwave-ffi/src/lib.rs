@@ -577,9 +577,9 @@ pub struct EmberwaveTexture {
     /// not wait need (decision D43). Those emberwave makes are tracked, and
     /// a caller's texture from a heap usually is not.
     tracked: bool,
-    /// Whether the texture is on the caller's own Vulkan device
-    /// (`emberwave_context_create_vulkan`), whose image the caller may use.
-    /// Read only where there are such devices.
+    /// Cached `VkImage` handle for textures on the caller's Vulkan device
+    /// (`emberwave_context_create_vulkan`), or 0 otherwise, avoiding per-frame
+    /// HAL lock lookups.
     #[cfg_attr(
         not(any(
             target_os = "linux",
@@ -588,7 +588,7 @@ pub struct EmberwaveTexture {
         )),
         allow(dead_code)
     )]
-    vulkan: bool,
+    vulkan_image_handle: u64,
     /// Whether the texture is the caller's, shared with its Direct3D 12 or
     /// Direct3D 11 device: only the `_d3d12` calls take it, which leave it in
     /// `D3D12_RESOURCE_STATE_COMMON` (decision D63).
@@ -614,13 +614,18 @@ impl EmberwaveTexture {
     /// `texture`, on the device of `wrapping` and for what it holds.
     fn wrap(wrapping: &Wrapping<'_>, texture: wgpu::Texture, tracked: bool) -> Self {
         let view = texture.create_view(&Default::default());
+        let vulkan_image_handle = if wrapping.vulkan {
+            vulkan_raw_image(&texture)
+        } else {
+            0
+        };
         Self {
             texture,
             view,
             context_id: wrapping.context_id,
             holds: wrapping.holds,
             tracked,
-            vulkan: wrapping.vulkan,
+            vulkan_image_handle,
             d3d12: false,
             #[cfg(windows)]
             d3d12_handle: None,
@@ -3106,7 +3111,7 @@ fn distinct_images(textures: &[&EmberwaveTexture; 3]) -> Result<(), Failure> {
     all(windows, target_pointer_width = "64")
 ))]
 fn vulkan_image(texture: &EmberwaveTexture) -> u64 {
-    vulkan::image(texture)
+    texture.vulkan_image_handle
 }
 
 #[cfg(not(any(
@@ -3115,6 +3120,24 @@ fn vulkan_image(texture: &EmberwaveTexture) -> u64 {
     all(windows, target_pointer_width = "64")
 )))]
 fn vulkan_image(_texture: &EmberwaveTexture) -> u64 {
+    0
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+))]
+fn vulkan_raw_image(texture: &wgpu::Texture) -> u64 {
+    vulkan::raw_image(texture)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    all(windows, target_pointer_width = "64")
+)))]
+fn vulkan_raw_image(_texture: &wgpu::Texture) -> u64 {
     0
 }
 
@@ -3416,6 +3439,38 @@ mod vulkan {
         Ok(unsafe { wgpu_instance.create_adapter_from_hal(exposed) })
     }
 
+    /// Verifies that a Vulkan integrated GPU exposes at least one host-visible,
+    /// host-coherent, device-local memory heap large enough for primary frame
+    /// buffers (>= 128 MiB) before enabling `MAPPABLE_PRIMARY_BUFFERS`.
+    fn vulkan_options(adapter: &wgpu::Adapter) -> GpuOptions {
+        let mut options = GpuOptions::default();
+        if adapter.get_info().device_type != wgpu::DeviceType::IntegratedGpu {
+            options.shared_uploads = false;
+            return options;
+        }
+        // SAFETY: only read.
+        let verified_uma = unsafe { adapter.as_hal::<Vulkan>() }.is_some_and(|hal| {
+            let instance = hal.shared_instance().raw_instance();
+            // SAFETY: `hal.raw_physical_device()` belongs to `instance`.
+            let mem_props = unsafe {
+                instance.get_physical_device_memory_properties(hal.raw_physical_device())
+            };
+            let wanted = vk::MemoryPropertyFlags::DEVICE_LOCAL
+                | vk::MemoryPropertyFlags::HOST_VISIBLE
+                | vk::MemoryPropertyFlags::HOST_COHERENT;
+            const MIN_UMA_HEAP_BYTES: u64 = 128 * 1024 * 1024;
+            mem_props.memory_types_as_slice().iter().any(|mem_ty| {
+                mem_ty.property_flags.contains(wanted)
+                    && mem_props
+                        .memory_heaps_as_slice()
+                        .get(mem_ty.heap_index as usize)
+                        .is_some_and(|heap| heap.size >= MIN_UMA_HEAP_BYTES)
+            })
+        });
+        options.shared_uploads = verified_uma;
+        options
+    }
+
     /// See `emberwave_vulkan_requirements_create`.
     ///
     /// # Safety
@@ -3427,7 +3482,8 @@ mod vulkan {
     ) -> Result<EmberwaveVulkanRequirements, Failure> {
         // SAFETY: as the caller promises.
         let adapter = unsafe { adapter(instance, physical_device) }?;
-        let descriptor = GpuContext::device_descriptor(&adapter, &GpuOptions::default());
+        let options = vulkan_options(&adapter);
+        let descriptor = GpuContext::device_descriptor(&adapter, &options);
         // SAFETY: only read.
         let hal =
             unsafe { adapter.as_hal::<Vulkan>() }.ok_or_else(|| no_gpu("not a Vulkan adapter"))?;
@@ -3509,7 +3565,8 @@ mod vulkan {
         let instance = unsafe { read_given(device.instance, "device.instance") }?;
         // SAFETY: as the caller promises.
         let adapter = unsafe { adapter(&instance, device.physical_device) }?;
-        let descriptor = GpuContext::device_descriptor(&adapter, &GpuOptions::default());
+        let options = vulkan_options(&adapter);
+        let descriptor = GpuContext::device_descriptor(&adapter, &options);
         let (open, turns) = {
             // SAFETY: only read.
             let hal = unsafe { adapter.as_hal::<Vulkan>() }
@@ -3594,12 +3651,9 @@ mod vulkan {
 
     /// The `VkImage` of `texture`, or 0 if it is not on the caller's own
     /// Vulkan device.
-    pub(super) fn image(texture: &EmberwaveTexture) -> u64 {
-        if !texture.vulkan {
-            return 0;
-        }
+    pub(super) fn raw_image(texture: &wgpu::Texture) -> u64 {
         // SAFETY: only read.
-        unsafe { texture.texture.as_hal::<Vulkan>() }
+        unsafe { texture.as_hal::<Vulkan>() }
             // SAFETY: the image of a live texture.
             .map_or(0, |hal| unsafe { hal.raw_handle() }.as_raw())
     }
@@ -3854,6 +3908,9 @@ mod vulkan {
 
     impl SubmissionHooks for Semaphores {
         fn before_submit(&mut self, queue: &wgpu::Queue) {
+            if self.wait.is_none() && self.signal.is_none() {
+                return;
+            }
             // SAFETY: only adds to the next submission, the decode's.
             if let Some(hal) = unsafe { queue.as_hal::<Vulkan>() } {
                 if let Some((semaphore, value)) = self.wait {
@@ -3866,6 +3923,9 @@ mod vulkan {
         }
 
         fn after_submit(&mut self, queue: &wgpu::Queue, _submitted: bool) {
+            if self.wait.is_none() && self.signal.is_none() {
+                return;
+            }
             // Whatever the call says: a submission that took them leaves
             // nothing to take back, and one that did not, as on a device lost
             // meanwhile, must not hand them to another.
