@@ -95,8 +95,15 @@ pub fn run(args: &Args) -> Result<()> {
     if args.frames == Some(0) {
         return Err("--frames 0 leaves nothing to encode".into());
     }
-    if !args.gpu && (args.gpu_args.backend != Backend::Auto || args.gpu_args.software) {
-        return Err("--backend and --software choose the GPU of --gpu".into());
+    if !args.gpu
+        && (args.gpu_args.backend != Backend::Auto
+            || args.gpu_args.software
+            || args.gpu_args.low_power
+            || args.gpu_args.adapter.is_some())
+    {
+        return Err(
+            "--backend, --software, --low-power and --adapter choose the GPU of --gpu".into(),
+        );
     }
     let mut video = y4m::open(&args.input)?;
     let header = *video.header();

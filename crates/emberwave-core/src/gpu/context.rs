@@ -199,12 +199,29 @@ impl GpuContext {
     /// way while another thread makes a context.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new(options: &GpuOptions) -> Result<Self, GpuError> {
+        Self::new_matching(options, None)
+    }
+
+    /// Creates a context, selecting the first adapter whose name contains
+    /// `adapter_filter` (case-insensitive) when provided.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_matching(
+        options: &GpuOptions,
+        adapter_filter: Option<&str>,
+    ) -> Result<Self, GpuError> {
         let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
-        pollster::block_on(Self::new_async(options))
+        pollster::block_on(Self::new_matching_async(options, adapter_filter))
     }
 
     /// Creates a context.
     pub async fn new_async(options: &GpuOptions) -> Result<Self, GpuError> {
+        Self::new_matching_async(options, None).await
+    }
+
+    async fn new_matching_async(
+        options: &GpuOptions,
+        adapter_filter: Option<&str>,
+    ) -> Result<Self, GpuError> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = options.backends;
         if options.strict_webgpu {
@@ -212,14 +229,36 @@ impl GpuContext {
         }
         let instance = wgpu::Instance::new(descriptor);
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: options.power_preference,
-                force_fallback_adapter: options.force_fallback_adapter,
-                compatible_surface: None,
-                ..Default::default()
-            })
-            .await?;
+        let adapter = if let Some(filter) = adapter_filter {
+            let needle = filter.to_ascii_lowercase();
+            let adapters = instance.enumerate_adapters(options.backends).await;
+            let names: Vec<String> = adapters
+                .iter()
+                .map(|a| format!("{} ({:?})", a.get_info().name, a.get_info().backend))
+                .collect();
+            adapters
+                .into_iter()
+                .find(|a| a.get_info().name.to_ascii_lowercase().contains(&needle))
+                .ok_or_else(|| {
+                    GpuError::Device(format!(
+                        "no GPU adapter matching {filter:?}; available: {}",
+                        if names.is_empty() {
+                            "<none>".to_owned()
+                        } else {
+                            names.join(", ")
+                        }
+                    ))
+                })?
+        } else {
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: options.power_preference,
+                    force_fallback_adapter: options.force_fallback_adapter,
+                    compatible_surface: None,
+                    ..Default::default()
+                })
+                .await?
+        };
         Self::from_adapter(adapter, options).await
     }
 

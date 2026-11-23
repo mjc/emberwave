@@ -454,14 +454,97 @@ fn bench_reports_per_frame_times_as_text_and_as_json() {
     assert_eq!(json["readback"], false);
     assert_eq!(json["unit"], "ms");
     let total = &json["series"]["total"];
-    for key in ["mean", "p50", "p99", "min", "max"] {
+    for key in ["mean", "p50", "p95", "p99", "min", "max"] {
         assert!(
             total[key].as_f64().is_some_and(|v| v > 0.0),
             "{key}: {total}"
         );
     }
     assert!(total["min"].as_f64() <= total["p50"].as_f64());
-    assert!(total["p50"].as_f64() <= total["max"].as_f64());
+    assert!(total["p50"].as_f64() <= total["p95"].as_f64());
+    assert!(total["p95"].as_f64() <= total["p99"].as_f64());
+    assert!(total["p99"].as_f64() <= total["max"].as_f64());
+
+    // Per-stage breakdown, queue upload, QueueTurns, per-level idwt, and R8/R16 planes.
+    let dir = scratch("gen-stream-bench");
+    let stream = dir.join("hdr10_test.pwv1");
+    let gen_out = cli()
+        .arg("gen-stream")
+        .arg("--out")
+        .arg(&stream)
+        .args([
+            "--width",
+            "192",
+            "--height",
+            "136",
+            "--pattern",
+            "scene",
+            "--frames",
+            "2",
+            "--bitrate-mbps",
+            "25",
+            "--matrix",
+            "bt2020",
+            "--bit-depth",
+            "10",
+        ])
+        .output()
+        .unwrap();
+    assert!(gen_out.status.success(), "{}", stderr(&gen_out));
+
+    let r8_out = run_on_gpu(cli().arg("bench").arg(&stream).args([
+        "--frames",
+        "2",
+        "--warmup",
+        "0",
+        "--warmup-seconds",
+        "0",
+        "--output",
+        "r8",
+        "--upload",
+        "queue",
+        "--queue-turns",
+        "--per-level",
+        "--json",
+    ]))
+    .unwrap();
+    assert!(r8_out.status.success(), "{}", stderr(&r8_out));
+    let r8_json: serde_json::Value = serde_json::from_slice(&r8_out.stdout).expect("valid JSON");
+    assert_eq!(r8_json["upload_mode"], "queue");
+    assert_eq!(r8_json["queue_turns"], true);
+    assert_eq!(r8_json["per_level"], true);
+    for series in ["cpu assemble", "cpu upload", "queue turn", "cpu submit"] {
+        assert!(
+            r8_json["series"][series]["mean"]
+                .as_f64()
+                .is_some_and(|v| v >= 0.0),
+            "missing {series} in {r8_json}"
+        );
+    }
+    if r8_json["r16_planes"] == true {
+        let r16_out = run_on_gpu(cli().arg("bench").arg(&stream).args([
+            "--frames",
+            "2",
+            "--warmup",
+            "0",
+            "--warmup-seconds",
+            "0",
+            "--output",
+            "r16",
+            "--upload",
+            "queue",
+            "--per-level",
+            "--json",
+        ]))
+        .unwrap();
+        assert!(r16_out.status.success(), "{}", stderr(&r16_out));
+        let r16_json: serde_json::Value =
+            serde_json::from_slice(&r16_out.stdout).expect("valid JSON");
+        if r16_json["series"].get("idwt").is_some() {
+            assert!(r16_json["series"].get("idwt L4").is_some());
+            assert!(r16_json["series"].get("idwt L0").is_some());
+        }
+    }
 
     // With a read-back there is only the total.
     let output = run_on_gpu(cli().arg("bench").arg(&vector).args([
