@@ -848,7 +848,9 @@ fn gathering_rgb_writes_the_words_of_its_converted_planes() {
             // In CPU memory too, with bytes between the rows.
             let stride = 4 * width as usize + 12;
             let padded = rgb_picture(width, height, stride, RgbOrder::Bgra, seed);
-            let uploaded_rgb = gpu.upload_rgb(&padded, stride, RgbOrder::Bgra).unwrap();
+            let uploaded_rgb = gpu
+                .upload_rgb(&padded, stride, RgbOrder::Bgra.into())
+                .unwrap();
             gpu.run(|this, encoder| this.encode_rgb_upload(encoder));
             let views: Vec<(&str, wgpu::TextureView)> = textures
                 .iter()
@@ -872,6 +874,243 @@ fn gathering_rgb_writes_the_words_of_its_converted_planes() {
                         .count()
                 );
             }
+        }
+    }
+}
+
+fn rgb10a2_picture(width: u32, height: u32, stride: usize, seed: u32) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+    let mut random = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let mut bytes = vec![0x5Au8; stride * (h - 1) + 4 * w];
+    for y in 0..h {
+        for x in 0..w {
+            let n = random();
+            let [r, g, b] = match x % 4 {
+                0 => [0, 0, 0],
+                1 => [1023, 1023, 1023],
+                2 => [
+                    (x * 1023 / w.max(1)) as u32,
+                    (y * 1023 / h.max(1)) as u32,
+                    512,
+                ],
+                _ => [n & 0x3ff, (n >> 10) & 0x3ff, (n >> 20) & 0x3ff],
+            };
+            let word = r | (g << 10) | (b << 20) | (((n >> 30) & 3) << 30);
+            bytes[y * stride + 4 * x..][..4].copy_from_slice(&word.to_le_bytes());
+        }
+    }
+    bytes
+}
+
+fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let frac = bits & 0x007f_ffff;
+    if exp == 0xff {
+        let payload = if frac != 0 { (frac >> 13).max(1) } else { 0 };
+        return sign | 0x7c00 | (payload as u16);
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        return sign | 0x7c00;
+    }
+    if new_exp <= 0 {
+        if new_exp < -10 {
+            return sign;
+        }
+        let mant = (frac | 0x0080_0000) >> (1 - new_exp + 13);
+        return sign | (mant as u16);
+    }
+    sign | ((new_exp as u16) << 10) | ((frac >> 13) as u16)
+}
+
+fn rgba16f_picture(width: u32, height: u32, stride: usize) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let mut bytes = vec![0x5Au8; stride * (h - 1) + 8 * w];
+    for y in 0..h {
+        for x in 0..w {
+            let rgba = match (x + y * 3) % 7 {
+                0 => [0.0_f32, 0.0, 0.0, 1.0],
+                1 => [-0.25, 0.5, -1.0, 0.5],
+                2 => [1.0, 1.0, 1.0, 1.0],       // 80 nits SDR white
+                3 => [12.5, 6.25, 3.125, 1.0],   // 1000 nits
+                4 => [125.0, 125.0, 125.0, 1.0], // 10000 nits peak
+                5 => [0.003_130_8, 0.25, 0.5, 1.0],
+                _ => [
+                    (x as f32 / w.max(1) as f32) * 4.0,
+                    (y as f32 / h.max(1) as f32) * 2.0,
+                    0.5,
+                    1.0,
+                ],
+            };
+            let at = y * stride + 8 * x;
+            for (c, val) in rgba.into_iter().enumerate() {
+                bytes[at + 2 * c..][..2].copy_from_slice(&f32_to_f16_bits(val).to_le_bytes());
+            }
+        }
+    }
+    bytes
+}
+
+#[test]
+fn gathering_rgb10_and_rgba16f_matches_cpu_16bit_planes() {
+    let Some(context) = test_context() else {
+        return;
+    };
+    use crate::bitstream::{
+        ChromaSiting, ColorPrimaries, TransferFunction, YcbcrRange, YcbcrTransform,
+    };
+    let signallings = [
+        Signalling {
+            color_primaries: ColorPrimaries::Bt2020,
+            transfer_function: TransferFunction::Pq,
+            ycbcr_transform: YcbcrTransform::Bt2020,
+            ycbcr_range: YcbcrRange::Limited,
+            chroma_siting: ChromaSiting::Center,
+        },
+        Signalling {
+            color_primaries: ColorPrimaries::Srgb,
+            transfer_function: TransferFunction::Srgb,
+            ycbcr_transform: YcbcrTransform::Bt709,
+            ycbcr_range: YcbcrRange::Full,
+            chroma_siting: ChromaSiting::Left,
+        },
+    ];
+    for signalling in signallings {
+        for (width, height, chroma, seed) in
+            [(18u32, 10u32, Yuv420, 1u32), (17u32, 11u32, Yuv444, 2u32)]
+        {
+            let layout = FrameLayout::new(width, height, chroma).unwrap();
+            let size = (width, height);
+
+            // Rgb10a2Unorm: CPU reference vs texture + CPU upload.
+            let stride10 = 4 * width as usize + 8;
+            let rgb10 = rgb10a2_picture(width, height, stride10, seed);
+            let cpu10 = crate::color::rgb10a2_to_ycbcr16(
+                &rgb10,
+                stride10,
+                width,
+                height,
+                chroma,
+                &signalling.color_params(),
+            )
+            .unwrap();
+            let mut ref_gpu = Encoder::new(context, width, height, chroma, signalling).unwrap();
+            ref_gpu
+                .upload_planes_u16([&cpu10[0], &cpu10[1], &cpu10[2]], None)
+                .unwrap();
+            ref_gpu.run(|this, enc| this.encode_upload(enc, true));
+            let p16 = ref_gpu.planes16.as_ref().unwrap();
+            let bytes = p16.layout.packed_words * 4;
+            let expected10 = ref_gpu.read_buffer(&p16.planes, 0, bytes);
+
+            let tight10 = rgb10a2_picture(width, height, 4 * width as usize, seed);
+            let tex10 = texture_of(&ref_gpu, wgpu::TextureFormat::Rgb10a2Unorm, size, &tight10);
+            let view10 = tex10.create_view(&Default::default());
+            let mut gpu = Encoder::new(context, width, height, chroma, signalling).unwrap();
+            let up10 = gpu
+                .upload_rgb(&rgb10, stride10, RgbFormat::Rgb10a2)
+                .unwrap();
+            gpu.run(|this, enc| this.encode_rgb_upload(enc));
+            for (name, view) in [("rgb10 texture", view10), ("rgb10 cpu", up10)] {
+                let (gather, is_16bit) = gpu.gather(TexturePicture::Rgb(&view)).unwrap();
+                assert!(is_16bit);
+                let planes_buf_bytes = gpu.planes16.as_ref().unwrap().layout.packed_words * 4;
+                gpu.queue.write_buffer(
+                    &gpu.planes16.as_ref().unwrap().planes,
+                    0,
+                    &vec![0xab; planes_buf_bytes as usize],
+                );
+                gpu.run(|this, enc| this.encode_transform(enc, Some(&gather), true, None));
+                let got =
+                    gpu.read_buffer(&gpu.planes16.as_ref().unwrap().planes, 0, planes_buf_bytes);
+                let got_u16: Vec<u16> = got
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let exp_u16: Vec<u16> = expected10
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let max_diff = got_u16
+                    .iter()
+                    .zip(&exp_u16)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    max_diff <= 2,
+                    "{width}x{height} {chroma:?} {signalling:?} {name}: max_diff={max_diff}"
+                );
+            }
+
+            // Rgba16Float: CPU reference vs texture + CPU upload.
+            let stride16f = 8 * width as usize + 16;
+            let fp16 = rgba16f_picture(width, height, stride16f);
+            let cpu16f = crate::color::rgba16f_to_ycbcr16(
+                &fp16,
+                stride16f,
+                width,
+                height,
+                chroma,
+                signalling.color_primaries,
+                signalling.transfer_function,
+                &signalling.color_params(),
+            )
+            .unwrap();
+            ref_gpu
+                .upload_planes_u16([&cpu16f[0], &cpu16f[1], &cpu16f[2]], None)
+                .unwrap();
+            ref_gpu.run(|this, enc| this.encode_upload(enc, true));
+            let expected16f =
+                ref_gpu.read_buffer(&ref_gpu.planes16.as_ref().unwrap().planes, 0, bytes);
+
+            let tight16f = rgba16f_picture(width, height, 8 * width as usize);
+            let tex16f = texture_of(&ref_gpu, wgpu::TextureFormat::Rgba16Float, size, &tight16f);
+            let view16f = tex16f.create_view(&Default::default());
+            let up16f = gpu
+                .upload_rgb(&fp16, stride16f, RgbFormat::Rgba16Float)
+                .unwrap();
+            gpu.run(|this, enc| this.encode_rgb_upload(enc));
+            for (name, view) in [("rgba16f texture", view16f), ("rgba16f cpu", up16f)] {
+                let (gather, is_16bit) = gpu.gather(TexturePicture::Rgb(&view)).unwrap();
+                assert!(is_16bit);
+                let planes_buf_bytes = gpu.planes16.as_ref().unwrap().layout.packed_words * 4;
+                gpu.queue.write_buffer(
+                    &gpu.planes16.as_ref().unwrap().planes,
+                    0,
+                    &vec![0xab; planes_buf_bytes as usize],
+                );
+                gpu.run(|this, enc| this.encode_transform(enc, Some(&gather), true, None));
+                let got =
+                    gpu.read_buffer(&gpu.planes16.as_ref().unwrap().planes, 0, planes_buf_bytes);
+                let got_u16: Vec<u16> = got
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let exp_u16: Vec<u16> = expected16f
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let max_diff = got_u16
+                    .iter()
+                    .zip(&exp_u16)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    max_diff <= 2,
+                    "{width}x{height} {chroma:?} {signalling:?} {name}: max_diff={max_diff}"
+                );
+            }
+            let _ = layout;
         }
     }
 }

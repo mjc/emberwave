@@ -465,8 +465,9 @@ impl GpuContext {
 
     /// Whether encoders on this context can read source textures of `format`.
     ///
-    /// `R8Unorm`, `Rg8Unorm`, `Rgba8Unorm` and `Bgra8Unorm` are always
-    /// supported. [`PLANE_FORMAT_R16`] and [`CHROMA_FORMAT_RG16`] require
+    /// `R8Unorm`, `Rg8Unorm`, `Rgba8Unorm`, `Bgra8Unorm`, `Rgb10a2Unorm` and
+    /// `Rgba16Float` are always supported. [`PLANE_FORMAT_R16`] and
+    /// [`CHROMA_FORMAT_RG16`] require
     /// [`wgpu::Features::TEXTURE_FORMAT_16BIT_NORM`] and `TEXTURE_BINDING`
     /// support on the device (decision D77).
     pub fn supports_source_format(&self, format: wgpu::TextureFormat) -> bool {
@@ -474,7 +475,9 @@ impl GpuContext {
             wgpu::TextureFormat::R8Unorm
             | wgpu::TextureFormat::Rg8Unorm
             | wgpu::TextureFormat::Rgba8Unorm
-            | wgpu::TextureFormat::Bgra8Unorm => true,
+            | wgpu::TextureFormat::Bgra8Unorm
+            | wgpu::TextureFormat::Rgb10a2Unorm
+            | wgpu::TextureFormat::Rgba16Float => true,
             wgpu::TextureFormat::R16Unorm => self.r16_source,
             wgpu::TextureFormat::Rg16Unorm => self.rg16_source,
             _ => false,

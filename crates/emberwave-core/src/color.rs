@@ -17,7 +17,8 @@
 //! up to the few float operations that follow.
 
 use crate::bitstream::{
-    ChromaSiting, ChromaSubsampling, SequenceHeader, YcbcrRange, YcbcrTransform,
+    ChromaSiting, ChromaSubsampling, ColorPrimaries, SequenceHeader, TransferFunction, YcbcrRange,
+    YcbcrTransform,
 };
 
 /// Reciprocal of 255, so 8-bit samples are scaled by a multiplication (a
@@ -182,7 +183,7 @@ pub enum ColorError {
     StrideTooSmall {
         /// Bytes from the start of one row to the start of the next.
         stride: usize,
-        /// Bytes of a row's pixels, four each.
+        /// Bytes of a row's pixels.
         row: u64,
     },
 }
@@ -309,6 +310,103 @@ pub enum RgbOrder {
     Bgra,
 }
 
+/// Pixel format of an RGB capture image passed to the encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RgbFormat {
+    /// Four 8-bit normalized channels: R', G', B', alpha.
+    Rgba8,
+    /// Four 8-bit normalized channels: B', G', R', alpha.
+    Bgra8,
+    /// Packed 32-bit unsigned normalized pixel: 10-bit R', G', B' and 2-bit alpha.
+    Rgb10a2,
+    /// Four IEEE 754 binary16 channels in linear scRGB light: R, G, B, alpha.
+    Rgba16Float,
+}
+
+impl RgbFormat {
+    /// Bytes per pixel in host memory.
+    pub const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Rgba8 | Self::Bgra8 | Self::Rgb10a2 => 4,
+            Self::Rgba16Float => 8,
+        }
+    }
+}
+
+impl From<RgbOrder> for RgbFormat {
+    fn from(order: RgbOrder) -> Self {
+        match order {
+            RgbOrder::Rgba => Self::Rgba8,
+            RgbOrder::Bgra => Self::Bgra8,
+        }
+    }
+}
+
+/// Linear ITU-R BT.709 / sRGB to ITU-R BT.2020 3x3 primary conversion matrix,
+/// derived from the CIE 1931 chromaticity coordinates of both standards with D65 white.
+#[doc(hidden)]
+pub const BT709_TO_BT2020: [[f32; 3]; 3] = [
+    [0.627_403_9, 0.329_283_04, 0.043_313_066],
+    [0.069_097_29, 0.919_540_4, 0.011_362_316],
+    [0.016_391_44, 0.088_013_31, 0.895_595_25],
+];
+
+/// Converts a single linear scRGB component (where negative values and values
+/// above 1.0 are already handled as needed by the caller) with the sRGB OETF.
+#[doc(hidden)]
+pub fn linear_to_srgb(linear: f32) -> f32 {
+    let x = linear.clamp(0.0, 1.0);
+    if x <= 0.003_130_8 {
+        12.92 * x
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Converts a single linear light component in scRGB units (`1.0` = 80 nits)
+/// with the SMPTE ST 2084 PQ OETF (`10_000` nits peak).
+#[doc(hidden)]
+pub fn scrgb_to_pq(scrgb: f32) -> f32 {
+    const M1: f32 = 2610.0 / 16384.0;
+    const M2: f32 = (2523.0 / 4096.0) * 128.0;
+    const C1: f32 = 3424.0 / 4096.0;
+    const C2: f32 = (2413.0 / 4096.0) * 32.0;
+    const C3: f32 = (2392.0 / 4096.0) * 32.0;
+
+    let v = (scrgb * (80.0 / 10_000.0)).clamp(0.0, 1.0);
+    if v <= 0.0 {
+        return 0.0;
+    }
+    let l = v.powf(M1);
+    ((C1 + C2 * l) / (1.0 + C3 * l)).powf(M2)
+}
+
+/// Decodes an IEEE 754 binary16 bit pattern to `f32`.
+#[doc(hidden)]
+pub fn f16_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exp = u32::from((bits >> 10) & 0x1f);
+    let frac = u32::from(bits & 0x03ff);
+    let out = if exp == 0 {
+        if frac == 0 {
+            sign
+        } else {
+            // Subnormal: normalise mantissa until bit 10 is set.
+            let shift = frac.leading_zeros() - 21;
+            let norm_frac = (frac << shift) & 0x03ff;
+            let norm_exp = 127 - 15 + 1 - shift;
+            sign | (norm_exp << 23) | (norm_frac << 13)
+        }
+    } else if exp == 0x1f {
+        // Infinity or NaN (preserve quiet/signaling payload in high bits).
+        sign | 0x7f80_0000 | (frac << 13)
+    } else {
+        sign | ((exp + (127 - 15)) << 23) | (frac << 13)
+    };
+    f32::from_bits(out)
+}
+
 /// Fractional bits of [`ForwardMatrix`]'s factors.
 #[doc(hidden)]
 pub const FORWARD_BITS: u32 = 16;
@@ -386,15 +484,16 @@ impl ForwardMatrix {
     }
 }
 
-/// An error if `bytes` of an RGB picture of `width` x `height` pixels, four
+/// An error if `bytes` of an RGB picture of `width` x `height` pixels, `bpp`
 /// bytes each, with rows `stride` bytes apart, do not hold it.
-pub(crate) fn check_rgb(
+pub(crate) fn check_rgb_stride(
     bytes: usize,
     stride: usize,
     width: u32,
     height: u32,
+    bpp: usize,
 ) -> Result<(), ColorError> {
-    let row = u64::from(width) * 4;
+    let row = u64::from(width) * (bpp as u64);
     if (stride as u64) < row && height > 1 {
         return Err(ColorError::StrideTooSmall { stride, row });
     }
@@ -413,6 +512,17 @@ pub(crate) fn check_rgb(
         });
     }
     Ok(())
+}
+
+/// An error if `bytes` of an RGB picture of `width` x `height` pixels, four
+/// bytes each, with rows `stride` bytes apart, do not hold it.
+pub(crate) fn check_rgb(
+    bytes: usize,
+    stride: usize,
+    width: u32,
+    height: u32,
+) -> Result<(), ColorError> {
+    check_rgb_stride(bytes, stride, width, height, 4)
 }
 
 /// Converts an RGB picture to 8-bit Y, Cb and Cr planes, as the GPU encoder
@@ -501,6 +611,168 @@ pub fn rgb_to_ycbcr8(
         }
     }
     Ok(planes)
+}
+
+/// Converts normalized non-linear R', G', B' (`[0.0, 1.0]`) sampled by `pixel`
+/// into 16-bit unsigned normalized Y, Cb and Cr planes matching
+/// `gather_rgb.wgsl`'s 16-bit path.
+fn float_rgb_to_ycbcr16(
+    width: usize,
+    height: usize,
+    chroma: ChromaSubsampling,
+    params: &ColorParams,
+    pixel: impl Fn(isize, usize) -> [f32; 3],
+) -> [Vec<u16>; 3] {
+    let (kr, kb) = params.matrix.luma_weights();
+    let (kr, kb) = (kr as f32, kb as f32);
+    let inv_cb = (0.5 / (1.0 - f64::from(kb))) as f32;
+    let inv_cr = (0.5 / (1.0 - f64::from(kr))) as f32;
+    let [luma_offset, luma_scale, chroma_offset, chroma_scale] = match params.range {
+        YcbcrRange::Limited => [4096.0_f32, 56064.0, 32768.0, 57344.0],
+        YcbcrRange::Full => [0.0_f32, 65535.0, 32768.0, 65535.0],
+    };
+    let luma_of =
+        |rgb: [f32; 3]| -> f32 { rgb[1] + kr * (rgb[0] - rgb[1]) + kb * (rgb[2] - rgb[1]) };
+    let to_u16 = |val: f32| -> u16 { val.round_ties_even().clamp(0.0, 65535.0) as u16 };
+    let luma_sample = |rgb: [f32; 3]| -> u16 {
+        let y_n = luma_of(rgb);
+        to_u16(luma_offset + y_n * luma_scale)
+    };
+    let chroma_samples = |rgb: [f32; 3]| -> (u16, u16) {
+        let y_n = luma_of(rgb);
+        let cb_n = (rgb[2] - y_n) * inv_cb;
+        let cr_n = (rgb[0] - y_n) * inv_cr;
+        (
+            to_u16(chroma_offset + cb_n * chroma_scale),
+            to_u16(chroma_offset + cr_n * chroma_scale),
+        )
+    };
+
+    let mut luma = Vec::with_capacity(width * height);
+    for y in 0..height {
+        for x in 0..width {
+            luma.push(luma_sample(pixel(x as isize, y)));
+        }
+    }
+    let (cb, cr) = match chroma {
+        ChromaSubsampling::Yuv444 => {
+            let mut cb = Vec::with_capacity(width * height);
+            let mut cr = Vec::with_capacity(width * height);
+            for y in 0..height {
+                for x in 0..width {
+                    let (u, v) = chroma_samples(pixel(x as isize, y));
+                    cb.push(u);
+                    cr.push(v);
+                }
+            }
+            (cb, cr)
+        }
+        ChromaSubsampling::Yuv420 => {
+            let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+            let mut cb = Vec::with_capacity(chroma_width * chroma_height);
+            let mut cr = Vec::with_capacity(chroma_width * chroma_height);
+            let left = params.chroma_siting == ChromaSiting::Left;
+            let inv_weight = if left { 0.125_f32 } else { 0.25_f32 };
+            for cy in 0..chroma_height {
+                for cx in 0..chroma_width {
+                    let mut sum = [0.0_f32; 3];
+                    for y in [2 * cy, 2 * cy + 1] {
+                        let base_x = 2 * cx as isize;
+                        let row_sum: [f32; 3] = if left {
+                            let m1 = pixel(base_x - 1, y);
+                            let p0 = pixel(base_x, y);
+                            let p1 = pixel(base_x + 1, y);
+                            std::array::from_fn(|i| m1[i] + 2.0 * p0[i] + p1[i])
+                        } else {
+                            let p0 = pixel(base_x, y);
+                            let p1 = pixel(base_x + 1, y);
+                            std::array::from_fn(|i| p0[i] + p1[i])
+                        };
+                        for i in 0..3 {
+                            sum[i] += row_sum[i];
+                        }
+                    }
+                    let avg = sum.map(|s| s * inv_weight);
+                    let (u, v) = chroma_samples(avg);
+                    cb.push(u);
+                    cr.push(v);
+                }
+            }
+            (cb, cr)
+        }
+    };
+    [luma, cb, cr]
+}
+
+/// Converts a packed little-endian `Rgb10a2Unorm` picture to 16-bit UNORM
+/// Y, Cb and Cr planes, matching `gather_rgb.wgsl`'s 16-bit path.
+pub fn rgb10a2_to_ycbcr16(
+    rgb: &[u8],
+    stride: usize,
+    width: u32,
+    height: u32,
+    chroma: ChromaSubsampling,
+    params: &ColorParams,
+) -> Result<[Vec<u16>; 3], ColorError> {
+    check_rgb_stride(rgb.len(), stride, width, height, 4)?;
+    let (w, h) = (width as usize, height as usize);
+    let inv_1023 = 1.0_f32 / 1023.0;
+    Ok(float_rgb_to_ycbcr16(w, h, chroma, params, |x, y| {
+        let x = x.clamp(0, w as isize - 1) as usize;
+        let at = y.min(h - 1) * stride + 4 * x;
+        let word = u32::from_le_bytes([rgb[at], rgb[at + 1], rgb[at + 2], rgb[at + 3]]);
+        [
+            (word & 0x3ff) as f32 * inv_1023,
+            ((word >> 10) & 0x3ff) as f32 * inv_1023,
+            ((word >> 20) & 0x3ff) as f32 * inv_1023,
+        ]
+    }))
+}
+
+/// Converts a linear scRGB `Rgba16Float` picture (4 little-endian IEEE 754
+/// binary16 channels per pixel) to 16-bit UNORM Y, Cb and Cr planes, applying
+/// `BT709_TO_BT2020` when `primaries == ColorPrimaries::Bt2020`, clamping
+/// negative and NaN components to zero, and applying PQ or sRGB OETF.
+#[allow(clippy::too_many_arguments)]
+pub fn rgba16f_to_ycbcr16(
+    rgb: &[u8],
+    stride: usize,
+    width: u32,
+    height: u32,
+    chroma: ChromaSubsampling,
+    primaries: ColorPrimaries,
+    transfer: TransferFunction,
+    params: &ColorParams,
+) -> Result<[Vec<u16>; 3], ColorError> {
+    check_rgb_stride(rgb.len(), stride, width, height, 8)?;
+    let (w, h) = (width as usize, height as usize);
+    let bt2020 = primaries == ColorPrimaries::Bt2020;
+    let pq = transfer == TransferFunction::Pq;
+    Ok(float_rgb_to_ycbcr16(w, h, chroma, params, |x, y| {
+        let x = x.clamp(0, w as isize - 1) as usize;
+        let at = y.min(h - 1) * stride + 8 * x;
+        let ch = |offset: usize| -> f32 {
+            f16_to_f32(u16::from_le_bytes([rgb[at + offset], rgb[at + offset + 1]]))
+        };
+        // Replace non-finite values with zero before BT.2020 conversion so one
+        // NaN/Inf channel does not poison finite channels, while preserving
+        // negative wide-gamut scRGB values until after primary conversion.
+        let mut c = [ch(0), ch(2), ch(4)].map(|v| if v.is_finite() { v } else { 0.0 });
+        if bt2020 {
+            let [r, g, b] = c;
+            c = [
+                BT709_TO_BT2020[0][0] * r + BT709_TO_BT2020[0][1] * g + BT709_TO_BT2020[0][2] * b,
+                BT709_TO_BT2020[1][0] * r + BT709_TO_BT2020[1][1] * g + BT709_TO_BT2020[1][2] * b,
+                BT709_TO_BT2020[2][0] * r + BT709_TO_BT2020[2][1] * g + BT709_TO_BT2020[2][2] * b,
+            ];
+        }
+        c = c.map(|v| v.max(0.0));
+        if pq {
+            c.map(scrgb_to_pq)
+        } else {
+            c.map(linear_to_srgb)
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -1107,6 +1379,138 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    fn f32_to_f16(value: f32) -> u16 {
+        let bits = value.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = ((bits >> 23) & 0xff) as i32;
+        let frac = bits & 0x007f_ffff;
+        if exp == 0xff {
+            // Preserve NaN vs Inf cleanly.
+            let payload = if frac != 0 { (frac >> 13).max(1) } else { 0 };
+            return sign | 0x7c00 | (payload as u16);
+        }
+        let new_exp = exp - 127 + 15;
+        if new_exp >= 31 {
+            return sign | 0x7c00;
+        }
+        if new_exp <= 0 {
+            if new_exp < -10 {
+                return sign;
+            }
+            let mant = (frac | 0x0080_0000) >> (1 - new_exp + 13);
+            return sign | (mant as u16);
+        }
+        sign | ((new_exp as u16) << 10) | ((frac >> 13) as u16)
+    }
+
+    #[test]
+    fn bt709_to_bt2020_preserves_white_and_primaries_are_exact() {
+        for (i, row) in BT709_TO_BT2020.iter().enumerate() {
+            let sum: f32 = row.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-6, "row {i} sum = {sum}");
+        }
+        // Negative / out-of-709 values produce positive BT.2020 components,
+        // and pure BT.709 red remains within BT.2020 gamut.
+        let r_709 = [
+            BT709_TO_BT2020[0][0],
+            BT709_TO_BT2020[1][0],
+            BT709_TO_BT2020[2][0],
+        ];
+        assert!(r_709.iter().all(|&v| v > 0.0));
+    }
+
+    #[test]
+    fn pq_and_srgb_transfer_endpoints_and_f16_decoding_hold() {
+        assert_eq!(scrgb_to_pq(0.0), 0.0);
+        assert_eq!(scrgb_to_pq(-5.0), 0.0);
+        assert!((scrgb_to_pq(125.0) - 1.0).abs() < 1e-6);
+        // 80 nits SDR reference white (scRGB 1.0) maps to ~0.4859 PQ signal.
+        let pq_80 = scrgb_to_pq(1.0);
+        assert!((pq_80 - 0.485_857).abs() < 1e-4, "pq_80 = {pq_80}");
+
+        assert_eq!(linear_to_srgb(0.0), 0.0);
+        assert_eq!(linear_to_srgb(-1.0), 0.0);
+        assert!((linear_to_srgb(1.0) - 1.0).abs() < 1e-6);
+        assert!((linear_to_srgb(5.0) - 1.0).abs() < 1e-6);
+
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+        assert_eq!(f16_to_f32(0xbc00), -1.0);
+        // Subnormal 2^-24 (0x0001)
+        assert!((f16_to_f32(0x0001) - 2.0_f32.powi(-24)).abs() < 1e-12);
+        assert!(f16_to_f32(0x7c00).is_infinite() && f16_to_f32(0x7c00).is_sign_positive());
+        assert!(f16_to_f32(0x7e00).is_nan());
+    }
+
+    #[test]
+    fn rgb10a2_and_rgba16f_cpu_reference_match_expected_levels() {
+        let pack10 = |r: u32, g: u32, b: u32| -> [u8; 4] {
+            (r | (g << 10) | (b << 20) | (3 << 30)).to_le_bytes()
+        };
+        let mut rgb10 = Vec::new();
+        // 4x2 frame where top-left 2x2 is neutral greys, right 2x2 has primaries.
+        for [r, g, b] in [
+            [0, 0, 0],
+            [1023, 1023, 1023],
+            [1023, 0, 0],
+            [0, 1023, 0],
+            [512, 512, 512],
+            [256, 256, 256],
+            [0, 0, 1023],
+            [256, 512, 768],
+        ] {
+            rgb10.extend_from_slice(&pack10(r, g, b));
+        }
+        let limited_2020 = ColorParams::new(
+            ColorMatrix::Bt2020,
+            YcbcrRange::Limited,
+            ChromaSiting::Center,
+        );
+        let [y, cb, cr] =
+            rgb10a2_to_ycbcr16(&rgb10, 16, 4, 2, ChromaSubsampling::Yuv420, &limited_2020).unwrap();
+        assert_eq!(y[0], 4096); // 64 << 6 black
+        assert_eq!(y[1], 60160); // 940 << 6 white
+        assert_eq!((cb[0], cr[0]), (32768, 32768));
+        let [y444, cb444, cr444] =
+            rgb10a2_to_ycbcr16(&rgb10, 16, 4, 2, ChromaSubsampling::Yuv444, &limited_2020).unwrap();
+        for i in [0, 1, 4, 5] {
+            assert_eq!((cb444[i], cr444[i]), (32768, 32768), "pixel {i}");
+        }
+        assert!(y444[2] > 4096 && y444[2] < 60160);
+
+        // FP16 with negative, NaN (with non-zero sibling channels), SDR white, and 10,000 nit peak.
+        let mut fp16 = Vec::new();
+        for px in [
+            [0.0_f32, 0.0, 0.0, 1.0],
+            [-2.0, 0.0, 0.0, 1.0],
+            [f32::NAN, 125.0, 125.0, 1.0],
+            [125.0, 125.0, 125.0, 1.0],
+        ] {
+            for c in px {
+                fp16.extend_from_slice(&f32_to_f16(c).to_le_bytes());
+            }
+        }
+        let [yf, cbf, crf] = rgba16f_to_ycbcr16(
+            &fp16,
+            32,
+            4,
+            1,
+            ChromaSubsampling::Yuv444,
+            ColorPrimaries::Bt2020,
+            TransferFunction::Pq,
+            &limited_2020,
+        )
+        .unwrap();
+        assert_eq!(yf[0], 4096);
+        assert_eq!(yf[1], 4096); // negative clamps to 0 -> black
+        // One NaN channel is sanitized to 0 before BT.2020 conversion without zeroing finite channels.
+        assert!(yf[2] > 4096 && yf[2] < 60160);
+        assert_eq!(yf[3], 60160); // 10000 nits peak -> 60160
+        for i in [0, 1, 3] {
+            assert_eq!((cbf[i], crf[i]), (32768, 32768), "fp16 pixel {i}");
         }
     }
 }

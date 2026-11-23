@@ -116,7 +116,11 @@ pub mod shader_sources {
         ("yuv2rgb", YUV2RGB, &["main"]),
         ("gather", GATHER, &["main"]),
         ("gather_r16", GATHER_R16, &["main"]),
-        ("gather_rgb", GATHER_RGB, &["yuv444", "yuv420"]),
+        (
+            "gather_rgb",
+            GATHER_RGB,
+            &["yuv444", "yuv420", "yuv444_16", "yuv420_16"],
+        ),
         ("fdwt", FDWT, &["main"]),
         ("equant", EQUANT, &["main"]),
         ("rate", RATE, &["analyse", "cutoff", "ties", "choose"]),
