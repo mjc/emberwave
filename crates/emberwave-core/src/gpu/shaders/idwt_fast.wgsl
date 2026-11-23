@@ -149,39 +149,84 @@ fn store_horizontal(row: u32, segment: u32, v: ptr<function, array<f32, 16>>) {
     horizontal[out + 7u] = (*v)[11];
 }
 
-fn horiz_segment(
+// Eight samples starting at an even x, written at v[8]..v[15].
+fn fill_tail8(
     comp: CompParams,
     band_width: u32,
-    tile_x: i32,
-    tile_y: i32,
+    y: i32,
+    x: i32,
     out_width: i32,
-    out_height: i32,
-    row: u32,
-    segment: u32,
     mode: u32,
+    v: ptr<function, array<f32, 16>>,
 ) {
-    let raw_y = tile_y + i32(row) - APRON;
-    let y = select(mirror(raw_y, out_height), raw_y, raw_y >= 0 && raw_y < out_height);
-    let x0 = tile_x + i32(8u * segment) - APRON;
     let row_bands = u32(y & 1) << 1u;
     let by = u32(y >> 1u);
     let band_row = by * band_width;
     let odd = comp.band_offset[row_bands | 1u] + band_row;
     let even = comp.band_offset[row_bands] + band_row;
     let packed_even = row_bands == 0u && mode == 1u;
-    var v: array<f32, 16>;
+    if (x >= 0 && x + 7 < out_width) {
+        let bx = u32(x) >> 1u;
+        (*v)[9] = pyramid[odd + bx + 0u];
+        (*v)[11] = pyramid[odd + bx + 1u];
+        (*v)[13] = pyramid[odd + bx + 2u];
+        (*v)[15] = pyramid[odd + bx + 3u];
+        if (packed_even) {
+            let base = (comp.pad0 >> 1u) + (by >> 1u) * band_width + bx;
+            let p0 = unpack2x16float(ll_packed[base + 0u]);
+            let p1 = unpack2x16float(ll_packed[base + 1u]);
+            let p2 = unpack2x16float(ll_packed[base + 2u]);
+            let p3 = unpack2x16float(ll_packed[base + 3u]);
+            let low = (by & 1u) == 0u;
+            (*v)[8] = select(p0.y, p0.x, low);
+            (*v)[10] = select(p1.y, p1.x, low);
+            (*v)[12] = select(p2.y, p2.x, low);
+            (*v)[14] = select(p3.y, p3.x, low);
+        } else {
+            (*v)[8] = pyramid[even + bx + 0u];
+            (*v)[10] = pyramid[even + bx + 1u];
+            (*v)[12] = pyramid[even + bx + 2u];
+            (*v)[14] = pyramid[even + bx + 3u];
+        }
+    } else {
+        (*v)[8] = coeff_at(comp, band_width, y, x + 0, out_width, mode);
+        (*v)[9] = coeff_at(comp, band_width, y, x + 1, out_width, mode);
+        (*v)[10] = coeff_at(comp, band_width, y, x + 2, out_width, mode);
+        (*v)[11] = coeff_at(comp, band_width, y, x + 3, out_width, mode);
+        (*v)[12] = coeff_at(comp, band_width, y, x + 4, out_width, mode);
+        (*v)[13] = coeff_at(comp, band_width, y, x + 5, out_width, mode);
+        (*v)[14] = coeff_at(comp, band_width, y, x + 6, out_width, mode);
+        (*v)[15] = coeff_at(comp, band_width, y, x + 7, out_width, mode);
+    }
+}
+
+fn fill_16(
+    comp: CompParams,
+    band_width: u32,
+    y: i32,
+    x0: i32,
+    out_width: i32,
+    mode: u32,
+    v: ptr<function, array<f32, 16>>,
+) {
+    let row_bands = u32(y & 1) << 1u;
+    let by = u32(y >> 1u);
+    let band_row = by * band_width;
+    let odd = comp.band_offset[row_bands | 1u] + band_row;
+    let even = comp.band_offset[row_bands] + band_row;
+    let packed_even = row_bands == 0u && mode == 1u;
     if (x0 >= 0 && x0 + 15 < out_width) {
         let bx = u32(x0) >> 1u;
         // Eight band pairs, the same addressing as idwt.wgsl. A plane's even
         // lowpass samples come from the packed word instead of the pyramid.
-        v[1] = pyramid[odd + bx + 0u];
-        v[3] = pyramid[odd + bx + 1u];
-        v[5] = pyramid[odd + bx + 2u];
-        v[7] = pyramid[odd + bx + 3u];
-        v[9] = pyramid[odd + bx + 4u];
-        v[11] = pyramid[odd + bx + 5u];
-        v[13] = pyramid[odd + bx + 6u];
-        v[15] = pyramid[odd + bx + 7u];
+        (*v)[1] = pyramid[odd + bx + 0u];
+        (*v)[3] = pyramid[odd + bx + 1u];
+        (*v)[5] = pyramid[odd + bx + 2u];
+        (*v)[7] = pyramid[odd + bx + 3u];
+        (*v)[9] = pyramid[odd + bx + 4u];
+        (*v)[11] = pyramid[odd + bx + 5u];
+        (*v)[13] = pyramid[odd + bx + 6u];
+        (*v)[15] = pyramid[odd + bx + 7u];
         if (packed_even) {
             let base = (comp.pad0 >> 1u) + (by >> 1u) * band_width + bx;
             let p0 = unpack2x16float(ll_packed[base + 0u]);
@@ -193,44 +238,83 @@ fn horiz_segment(
             let p6 = unpack2x16float(ll_packed[base + 6u]);
             let p7 = unpack2x16float(ll_packed[base + 7u]);
             let low = (by & 1u) == 0u;
-            v[0] = select(p0.y, p0.x, low);
-            v[2] = select(p1.y, p1.x, low);
-            v[4] = select(p2.y, p2.x, low);
-            v[6] = select(p3.y, p3.x, low);
-            v[8] = select(p4.y, p4.x, low);
-            v[10] = select(p5.y, p5.x, low);
-            v[12] = select(p6.y, p6.x, low);
-            v[14] = select(p7.y, p7.x, low);
+            (*v)[0] = select(p0.y, p0.x, low);
+            (*v)[2] = select(p1.y, p1.x, low);
+            (*v)[4] = select(p2.y, p2.x, low);
+            (*v)[6] = select(p3.y, p3.x, low);
+            (*v)[8] = select(p4.y, p4.x, low);
+            (*v)[10] = select(p5.y, p5.x, low);
+            (*v)[12] = select(p6.y, p6.x, low);
+            (*v)[14] = select(p7.y, p7.x, low);
         } else {
-            v[0] = pyramid[even + bx + 0u];
-            v[2] = pyramid[even + bx + 1u];
-            v[4] = pyramid[even + bx + 2u];
-            v[6] = pyramid[even + bx + 3u];
-            v[8] = pyramid[even + bx + 4u];
-            v[10] = pyramid[even + bx + 5u];
-            v[12] = pyramid[even + bx + 6u];
-            v[14] = pyramid[even + bx + 7u];
+            (*v)[0] = pyramid[even + bx + 0u];
+            (*v)[2] = pyramid[even + bx + 1u];
+            (*v)[4] = pyramid[even + bx + 2u];
+            (*v)[6] = pyramid[even + bx + 3u];
+            (*v)[8] = pyramid[even + bx + 4u];
+            (*v)[10] = pyramid[even + bx + 5u];
+            (*v)[12] = pyramid[even + bx + 6u];
+            (*v)[14] = pyramid[even + bx + 7u];
         }
     } else {
-        v[0] = coeff_at(comp, band_width, y, x0 + 0, out_width, mode);
-        v[1] = coeff_at(comp, band_width, y, x0 + 1, out_width, mode);
-        v[2] = coeff_at(comp, band_width, y, x0 + 2, out_width, mode);
-        v[3] = coeff_at(comp, band_width, y, x0 + 3, out_width, mode);
-        v[4] = coeff_at(comp, band_width, y, x0 + 4, out_width, mode);
-        v[5] = coeff_at(comp, band_width, y, x0 + 5, out_width, mode);
-        v[6] = coeff_at(comp, band_width, y, x0 + 6, out_width, mode);
-        v[7] = coeff_at(comp, band_width, y, x0 + 7, out_width, mode);
-        v[8] = coeff_at(comp, band_width, y, x0 + 8, out_width, mode);
-        v[9] = coeff_at(comp, band_width, y, x0 + 9, out_width, mode);
-        v[10] = coeff_at(comp, band_width, y, x0 + 10, out_width, mode);
-        v[11] = coeff_at(comp, band_width, y, x0 + 11, out_width, mode);
-        v[12] = coeff_at(comp, band_width, y, x0 + 12, out_width, mode);
-        v[13] = coeff_at(comp, band_width, y, x0 + 13, out_width, mode);
-        v[14] = coeff_at(comp, band_width, y, x0 + 14, out_width, mode);
-        v[15] = coeff_at(comp, band_width, y, x0 + 15, out_width, mode);
+        (*v)[0] = coeff_at(comp, band_width, y, x0 + 0, out_width, mode);
+        (*v)[1] = coeff_at(comp, band_width, y, x0 + 1, out_width, mode);
+        (*v)[2] = coeff_at(comp, band_width, y, x0 + 2, out_width, mode);
+        (*v)[3] = coeff_at(comp, band_width, y, x0 + 3, out_width, mode);
+        (*v)[4] = coeff_at(comp, band_width, y, x0 + 4, out_width, mode);
+        (*v)[5] = coeff_at(comp, band_width, y, x0 + 5, out_width, mode);
+        (*v)[6] = coeff_at(comp, band_width, y, x0 + 6, out_width, mode);
+        (*v)[7] = coeff_at(comp, band_width, y, x0 + 7, out_width, mode);
+        (*v)[8] = coeff_at(comp, band_width, y, x0 + 8, out_width, mode);
+        (*v)[9] = coeff_at(comp, band_width, y, x0 + 9, out_width, mode);
+        (*v)[10] = coeff_at(comp, band_width, y, x0 + 10, out_width, mode);
+        (*v)[11] = coeff_at(comp, band_width, y, x0 + 11, out_width, mode);
+        (*v)[12] = coeff_at(comp, band_width, y, x0 + 12, out_width, mode);
+        (*v)[13] = coeff_at(comp, band_width, y, x0 + 13, out_width, mode);
+        (*v)[14] = coeff_at(comp, band_width, y, x0 + 14, out_width, mode);
+        (*v)[15] = coeff_at(comp, band_width, y, x0 + 15, out_width, mode);
     }
+}
+
+// Two adjacent segments. The second window starts eight samples later, so
+// those eight are kept and the lift runs again on the extended window.
+fn horiz_pair(
+    comp: CompParams,
+    band_width: u32,
+    tile_x: i32,
+    tile_y: i32,
+    out_width: i32,
+    out_height: i32,
+    row: u32,
+    pair: u32,
+    mode: u32,
+) {
+    let raw_y = tile_y + i32(row) - APRON;
+    let y = select(mirror(raw_y, out_height), raw_y, raw_y >= 0 && raw_y < out_height);
+    let x0 = tile_x + i32(16u * pair) - APRON;
+    var v: array<f32, 16>;
+    fill_16(comp, band_width, y, x0, out_width, mode, &v);
+    let s0 = v[8];
+    let s1 = v[9];
+    let s2 = v[10];
+    let s3 = v[11];
+    let s4 = v[12];
+    let s5 = v[13];
+    let s6 = v[14];
+    let s7 = v[15];
     lift(&v);
-    store_horizontal(row, segment, &v);
+    store_horizontal(row, 2u * pair, &v);
+    v[0] = s0;
+    v[1] = s1;
+    v[2] = s2;
+    v[3] = s3;
+    v[4] = s4;
+    v[5] = s5;
+    v[6] = s6;
+    v[7] = s7;
+    fill_tail8(comp, band_width, y, x0 + 16, out_width, mode, &v);
+    lift(&v);
+    store_horizontal(row, 2u * pair + 1u, &v);
 }
 
 fn store_packed_8(
@@ -277,12 +361,19 @@ fn run_scalar_rows(
     tid: u32,
     mode: u32,
 ) {
-    let h_seg = tid % 8u;
-    let row0 = 2u * ((tid % 128u) / 8u) + (tid / 128u);
-    horiz_segment(comp, band_width, tile_x, tile_y, out_width, out_height, row0, h_seg, mode);
-    if (tid < 64u) {
-        let row1 = 32u + 2u * ((tid % 32u) / 8u) + (tid / 32u);
-        horiz_segment(comp, band_width, tile_x, tile_y, out_width, out_height, row1, h_seg, mode);
+    // 40 rows, four pairs of segments. Threads past that wait for the barrier.
+    if (tid < 160u) {
+        horiz_pair(
+            comp,
+            band_width,
+            tile_x,
+            tile_y,
+            out_width,
+            out_height,
+            tid / 4u,
+            tid % 4u,
+            mode,
+        );
     }
 }
 
