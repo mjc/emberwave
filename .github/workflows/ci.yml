@@ -148,7 +148,6 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy -p emberwave-ffi -p emberwave-core --target aarch64-linux-android --all-targets -- -D warnings
       - name: Build Android cdylib, staticlib, and Vulkan R16 smoke binary
-        if: ${{ env.ANDROID_NDK_LATEST_HOME != '' || env.ANDROID_NDK_HOME != '' }}
         run: scripts/check_android_vulkan.sh --build-only
 
   build-test:

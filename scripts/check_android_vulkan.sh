@@ -72,9 +72,10 @@ export CC_aarch64_linux_android="$CLANG"
 export AR_aarch64_linux_android="$AR"
 
 echo "== Building emberwave-ffi cdylib ($TARGET, $PROFILE)"
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | python3 -c "import json,sys; print(json.load(sys.stdin)['target_directory'])")
 cargo build "${CARGO_PROFILE_ARGS[@]}" --locked -p emberwave-ffi --target "$TARGET"
 
-CARGO_OUT="target/$TARGET/$PROFILE"
+CARGO_OUT="$TARGET_DIR/$TARGET/$PROFILE"
 "$READELF" -d "$CARGO_OUT/libemberwave_ffi.so" | grep -q "Library soname: \[libemberwave_ffi.so\]" || {
     echo "expected DT_SONAME libemberwave_ffi.so on $CARGO_OUT/libemberwave_ffi.so" >&2
     exit 1
@@ -88,7 +89,7 @@ cargo rustc "${CARGO_PROFILE_ARGS[@]}" --locked --color never -p emberwave-ffi -
 STATIC_LIBS=$(sed -n 's/.*native-static-libs: //p' "$STATIC_LOG" | tail -n 1)
 [ -n "$STATIC_LIBS" ] || { echo "failed to read native-static-libs from rustc" >&2; exit 1; }
 
-OUT="target/android-smoke"
+OUT="$TARGET_DIR/android-smoke"
 mkdir -p "$OUT"
 
 echo "== Compiling Android Vulkan R16 C smoke binaries"
@@ -137,8 +138,8 @@ trap cleanup_device EXIT
 
 for vec in noise_192x136_420.pwv1 gradient_200x120_420.pwv1 noise_131x67_444.pwv1; do
     echo "== Running shared smoke on $vec"
-    "${ADB[@]}" shell "LD_LIBRARY_PATH='$DEVICE_DIR' '$DEVICE_DIR/emberwave_vulkan_r16_shared' '$DEVICE_DIR/$vec'"
+    "${ADB[@]}" shell "LD_LIBRARY_PATH='$DEVICE_DIR' '$DEVICE_DIR/emberwave_vulkan_r16_shared' '$DEVICE_DIR/$vec' --require-sub8"
 done
 
 echo "== Running static smoke on noise_192x136_420.pwv1"
-"${ADB[@]}" shell "'$DEVICE_DIR/emberwave_vulkan_r16_static' '$DEVICE_DIR/noise_192x136_420.pwv1'"
+"${ADB[@]}" shell "'$DEVICE_DIR/emberwave_vulkan_r16_static' '$DEVICE_DIR/noise_192x136_420.pwv1' --require-sub8"

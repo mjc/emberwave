@@ -213,12 +213,14 @@ static int readback_image(const VulkanContext *vk,
     VkCommandBufferBeginInfo begin_info = {0};
     VkImageMemoryBarrier to_src = {0};
     VkImageMemoryBarrier to_read = {0};
+    VkBufferMemoryBarrier buf_barrier = {0};
     VkBufferImageCopy region = {0};
     VkSubmitInfo submit = {0};
     VkFenceCreateInfo fence_info = {0};
     VkFence fence = VK_NULL_HANDLE;
     void *mapped = NULL;
     VkResult res;
+    int gpu_busy = 0;
     int rc = 1;
 
     buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -298,8 +300,19 @@ static int readback_image(const VulkanContext *vk,
     to_read.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
     to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         0, 0, NULL, 0, NULL, 1, &to_read);
+
+    buf_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    buf_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    buf_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    buf_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    buf_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    buf_barrier.buffer = buffer;
+    buf_barrier.offset = 0;
+    buf_barrier.size = VK_WHOLE_SIZE;
+
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL,
+                         1, &buf_barrier, 1, &to_read);
 
     res = vkEndCommandBuffer(cmd);
     if (res != VK_SUCCESS) {
@@ -322,11 +335,16 @@ static int readback_image(const VulkanContext *vk,
         fail_vk("vkQueueSubmit", res);
         goto cleanup;
     }
+    gpu_busy = 1;
     res = vkWaitForFences(vk->device, 1, &fence, VK_TRUE, 10000000000ULL);
     if (res != VK_SUCCESS) {
         fail_vk("vkWaitForFences", res);
+        if (vkDeviceWaitIdle(vk->device) == VK_SUCCESS) {
+            gpu_busy = 0;
+        }
         goto cleanup;
     }
+    gpu_busy = 0;
 
     res = vkMapMemory(vk->device, memory, 0, byte_size, 0, &mapped);
     if (res != VK_SUCCESS) {
@@ -338,17 +356,19 @@ static int readback_image(const VulkanContext *vk,
     rc = 0;
 
 cleanup:
-    if (fence != VK_NULL_HANDLE) {
-        vkDestroyFence(vk->device, fence, NULL);
-    }
-    if (cmd != VK_NULL_HANDLE) {
-        vkFreeCommandBuffers(vk->device, vk->command_pool, 1, &cmd);
-    }
-    if (buffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(vk->device, buffer, NULL);
-    }
-    if (memory != VK_NULL_HANDLE) {
-        vkFreeMemory(vk->device, memory, NULL);
+    if (!gpu_busy) {
+        if (fence != VK_NULL_HANDLE) {
+            vkDestroyFence(vk->device, fence, NULL);
+        }
+        if (cmd != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(vk->device, vk->command_pool, 1, &cmd);
+        }
+        if (buffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(vk->device, buffer, NULL);
+        }
+        if (memory != VK_NULL_HANDLE) {
+            vkFreeMemory(vk->device, memory, NULL);
+        }
     }
     return rc;
 }
@@ -398,11 +418,21 @@ int main(int argc, char **argv)
     EmberwaveFrameInfo frame_info = {.struct_size = sizeof frame_info};
     VkFormatProperties r16_fmt_props = {0};
     int supports_r16 = 0;
+    int require_sub8 = 0;
+    int check_released = 0;
+    PlaneImage probe_img = {0};
+    PlaneImage plane_imgs[3] = {{0}};
+    EmberwaveTexture *probe_tex = NULL;
+    EmberwaveTexture *wrapped_tex[3] = {NULL, NULL, NULL};
+    EmberwaveTexture *owned_tex[3] = {NULL, NULL, NULL};
+    unsigned char *cpu_yuv = NULL;
     uint32_t i;
     int exit_code = 1;
 
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s INPUT.pwv1\n", argv[0]);
+    if (argc == 3 && strcmp(argv[2], "--require-sub8") == 0) {
+        require_sub8 = 1;
+    } else if (argc != 2) {
+        fprintf(stderr, "usage: %s INPUT.pwv1 [--require-sub8]\n", argv[0]);
         return 2;
     }
 
@@ -632,10 +662,6 @@ int main(int argc, char **argv)
     }
 
     if (!supports_r16) {
-        EmberwaveTexture *probe_tex = NULL;
-        PlaneImage r16_probe = {0};
-        PlaneImage r8_imgs[3] = {{0}};
-        EmberwaveTexture *r8_tex[3] = {NULL, NULL, NULL};
         uint32_t widths[3];
         uint32_t heights[3];
         uint32_t planes[3] = {EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR};
@@ -645,9 +671,6 @@ int main(int argc, char **argv)
         if (status != EMBERWAVE_STATUS_UNSUPPORTED || probe_tex != NULL) {
             fprintf(stderr, "expected EMBERWAVE_STATUS_UNSUPPORTED for owned R16, got %d\n",
                     (int)status);
-            if (probe_tex != NULL) {
-                emberwave_texture_destroy(probe_tex);
-            }
             goto cleanup;
         }
         printf("owned R16 plane creation cleanly returned EMBERWAVE_STATUS_UNSUPPORTED (%s)\n",
@@ -659,23 +682,19 @@ int main(int argc, char **argv)
             if (create_plane_image(&vk, VK_FORMAT_R16_UNORM,
                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                                   frame_info.width, frame_info.height, 2, &r16_probe) == 0) {
+                                   frame_info.width, frame_info.height, 2, &probe_img) == 0) {
                 EmberwaveVulkanImage desc = {.struct_size = sizeof desc};
-                desc.image = (uint64_t)(uintptr_t)r16_probe.image;
+                desc.image = (uint64_t)(uintptr_t)probe_img.image;
                 desc.format = VK_FORMAT_R16_UNORM;
                 desc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
                 desc.layout = VK_IMAGE_LAYOUT_UNDEFINED;
                 status = emberwave_texture_from_vulkan_plane(decoder, EMBERWAVE_PLANE_Y, &desc,
                                                              &probe_tex);
-                destroy_plane_image(&vk, &r16_probe);
                 if (status != EMBERWAVE_STATUS_UNSUPPORTED || probe_tex != NULL) {
                     fprintf(stderr,
                             "expected EMBERWAVE_STATUS_UNSUPPORTED for wrapped R16, got %d\n",
                             (int)status);
-                    if (probe_tex != NULL) {
-                        emberwave_texture_destroy(probe_tex);
-                    }
                     goto cleanup;
                 }
                 printf("wrapped R16 plane creation cleanly returned "
@@ -693,47 +712,32 @@ int main(int argc, char **argv)
             VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
             if (create_plane_image(&vk, VK_FORMAT_R8_UNORM, usage, widths[i], heights[i], 1,
-                                   &r8_imgs[i]) != 0) {
-                for (uint32_t j = 0; j < 3; j++) {
-                    emberwave_texture_destroy(r8_tex[j]);
-                    destroy_plane_image(&vk, &r8_imgs[j]);
-                }
+                                   &plane_imgs[i]) != 0) {
                 goto cleanup;
             }
-            desc.image = (uint64_t)(uintptr_t)r8_imgs[i].image;
+            desc.image = (uint64_t)(uintptr_t)plane_imgs[i].image;
             desc.format = VK_FORMAT_R8_UNORM;
             desc.usage = usage;
             desc.layout = VK_IMAGE_LAYOUT_UNDEFINED;
             desc.release = on_image_release;
-            status = emberwave_texture_from_vulkan_plane(decoder, planes[i], &desc, &r8_tex[i]);
+            status = emberwave_texture_from_vulkan_plane(decoder, planes[i], &desc, &wrapped_tex[i]);
             if (status != EMBERWAVE_STATUS_OK) {
                 fail_ew("emberwave_texture_from_vulkan_plane(R8)", status);
-                for (uint32_t j = 0; j < 3; j++) {
-                    emberwave_texture_destroy(r8_tex[j]);
-                    destroy_plane_image(&vk, &r8_imgs[j]);
-                }
                 goto cleanup;
             }
         }
-        status = emberwave_decoder_decode_plane_textures(decoder, r8_tex[0], r8_tex[1], r8_tex[2]);
+        status = emberwave_decoder_decode_plane_textures(decoder, wrapped_tex[0], wrapped_tex[1],
+                                                         wrapped_tex[2]);
         if (status != EMBERWAVE_STATUS_OK) {
             fail_ew("emberwave_decoder_decode_plane_textures(R8)", status);
-            for (i = 0; i < 3; i++) {
-                emberwave_texture_destroy(r8_tex[i]);
-                destroy_plane_image(&vk, &r8_imgs[i]);
-            }
             goto cleanup;
         }
         {
             size_t luma_px = (size_t)widths[0] * heights[0];
             size_t chroma_px = (size_t)widths[1] * heights[1];
-            unsigned char *cpu_yuv = malloc(luma_px + 2 * chroma_px);
             EmberwavePlane y_cpu, cb_cpu, cr_cpu;
+            cpu_yuv = malloc(luma_px + 2 * chroma_px);
             if (!cpu_yuv) {
-                for (i = 0; i < 3; i++) {
-                    emberwave_texture_destroy(r8_tex[i]);
-                    destroy_plane_image(&vk, &r8_imgs[i]);
-                }
                 goto cleanup;
             }
             y_cpu.data = cpu_yuv;
@@ -748,11 +752,6 @@ int main(int argc, char **argv)
             status = emberwave_decoder_decode_yuv(decoder, y_cpu, cb_cpu, cr_cpu);
             if (status != EMBERWAVE_STATUS_OK) {
                 fail_ew("emberwave_decoder_decode_yuv(R8 fallback)", status);
-                free(cpu_yuv);
-                for (i = 0; i < 3; i++) {
-                    emberwave_texture_destroy(r8_tex[i]);
-                    destroy_plane_image(&vk, &r8_imgs[i]);
-                }
                 goto cleanup;
             }
             for (i = 0; i < 3; i++) {
@@ -761,51 +760,29 @@ int main(int argc, char **argv)
                 const unsigned char *ref_u8 =
                     (i == 0) ? y_cpu.data : ((i == 1) ? cb_cpu.data : cr_cpu.data);
                 if (!gpu_u8 ||
-                    readback_image(&vk, r8_imgs[i].image, widths[i], heights[i], 1, gpu_u8) != 0 ||
+                    readback_image(&vk, plane_imgs[i].image, widths[i], heights[i], 1, gpu_u8) !=
+                        0 ||
                     memcmp(gpu_u8, ref_u8, count) != 0) {
                     fprintf(stderr, "plane %u: R8 fallback readback mismatch\n", i);
                     free(gpu_u8);
-                    free(cpu_yuv);
-                    for (uint32_t j = 0; j < 3; j++) {
-                        emberwave_texture_destroy(r8_tex[j]);
-                        destroy_plane_image(&vk, &r8_imgs[j]);
-                    }
                     goto cleanup;
                 }
                 free(gpu_u8);
             }
-            free(cpu_yuv);
-        }
-        for (i = 0; i < 3; i++) {
-            emberwave_texture_destroy(r8_tex[i]);
         }
         printf("R8 fallback decode + readback succeeded (PLANE_R16 unsupported on this device)\n");
-        emberwave_decoder_destroy(decoder);
-        decoder = NULL;
-        emberwave_context_destroy(context);
-        context = NULL;
-        for (i = 0; i < 3; i++) {
-            destroy_plane_image(&vk, &r8_imgs[i]);
-        }
-        if (g_released_count != 3) {
-            fprintf(stderr, "expected 3 image release callbacks, got %u\n", g_released_count);
-            goto cleanup;
-        }
+        check_released = 1;
         exit_code = 0;
         goto cleanup;
     }
 
     {
-        PlaneImage r16_imgs[3] = {{0}};
-        EmberwaveTexture *wrapped[3] = {NULL, NULL, NULL};
-        EmberwaveTexture *owned[3] = {NULL, NULL, NULL};
         uint32_t widths[3] = {frame_info.width, frame_info.chroma_width, frame_info.chroma_width};
         uint32_t heights[3] = {frame_info.height, frame_info.chroma_height,
                                frame_info.chroma_height};
         uint32_t planes[3] = {EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR};
         VkImageUsageFlags r16_usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        unsigned char *cpu_yuv = NULL;
         size_t luma_px = (size_t)widths[0] * heights[0];
         size_t chroma_px = (size_t)widths[1] * heights[1];
         EmberwavePlane y_cpu, cb_cpu, cr_cpu;
@@ -813,45 +790,46 @@ int main(int argc, char **argv)
         for (i = 0; i < 3; i++) {
             EmberwaveVulkanImage desc = {.struct_size = sizeof desc};
             if (create_plane_image(&vk, VK_FORMAT_R16_UNORM, r16_usage, widths[i], heights[i], 2,
-                                   &r16_imgs[i]) != 0) {
-                goto r16_cleanup;
+                                   &plane_imgs[i]) != 0) {
+                goto cleanup;
             }
-            desc.image = (uint64_t)(uintptr_t)r16_imgs[i].image;
+            desc.image = (uint64_t)(uintptr_t)plane_imgs[i].image;
             desc.format = VK_FORMAT_R16_UNORM;
             desc.usage = r16_usage;
             desc.layout = VK_IMAGE_LAYOUT_UNDEFINED;
             desc.release = on_image_release;
-            status = emberwave_texture_from_vulkan_plane(decoder, planes[i], &desc, &wrapped[i]);
+            status = emberwave_texture_from_vulkan_plane(decoder, planes[i], &desc, &wrapped_tex[i]);
             if (status != EMBERWAVE_STATUS_OK) {
                 fail_ew("emberwave_texture_from_vulkan_plane(R16)", status);
-                goto r16_cleanup;
+                goto cleanup;
             }
             status = emberwave_texture_create_plane_with_format(
-                decoder, planes[i], EMBERWAVE_PLANE_FORMAT_R16, &owned[i]);
+                decoder, planes[i], EMBERWAVE_PLANE_FORMAT_R16, &owned_tex[i]);
             if (status != EMBERWAVE_STATUS_OK) {
                 fail_ew("emberwave_texture_create_plane_with_format(R16)", status);
-                goto r16_cleanup;
+                goto cleanup;
             }
         }
 
-        status = emberwave_decoder_decode_plane_textures(decoder, wrapped[0], wrapped[1],
-                                                         wrapped[2]);
+        status = emberwave_decoder_decode_plane_textures(decoder, wrapped_tex[0], wrapped_tex[1],
+                                                         wrapped_tex[2]);
         if (status != EMBERWAVE_STATUS_OK) {
             fail_ew("emberwave_decoder_decode_plane_textures(wrapped R16)", status);
-            goto r16_cleanup;
+            goto cleanup;
         }
         printf("emberwave_decoder_decode_plane_textures(wrapped R16): OK\n");
 
-        status = emberwave_decoder_decode_plane_textures(decoder, owned[0], owned[1], owned[2]);
+        status = emberwave_decoder_decode_plane_textures(decoder, owned_tex[0], owned_tex[1],
+                                                         owned_tex[2]);
         if (status != EMBERWAVE_STATUS_OK) {
             fail_ew("emberwave_decoder_decode_plane_textures(owned R16)", status);
-            goto r16_cleanup;
+            goto cleanup;
         }
         printf("emberwave_decoder_decode_plane_textures(owned R16): OK\n");
 
         cpu_yuv = malloc(luma_px + 2 * chroma_px);
         if (!cpu_yuv) {
-            goto r16_cleanup;
+            goto cleanup;
         }
         y_cpu.data = cpu_yuv;
         y_cpu.stride = widths[0];
@@ -865,7 +843,7 @@ int main(int argc, char **argv)
         status = emberwave_decoder_decode_yuv(decoder, y_cpu, cb_cpu, cr_cpu);
         if (status != EMBERWAVE_STATUS_OK) {
             fail_ew("emberwave_decoder_decode_yuv", status);
-            goto r16_cleanup;
+            goto cleanup;
         }
 
         for (i = 0; i < 3; i++) {
@@ -873,33 +851,34 @@ int main(int argc, char **argv)
             size_t bytes = count * 2;
             uint16_t *wrapped_u16 = malloc(bytes);
             uint16_t *owned_u16 = malloc(bytes);
-            uint64_t owned_raw = emberwave_texture_vulkan(owned[i]);
+            uint64_t owned_raw = emberwave_texture_vulkan(owned_tex[i]);
             const unsigned char *ref_u8 =
                 (i == 0) ? y_cpu.data : ((i == 1) ? cb_cpu.data : cr_cpu.data);
             uint16_t min_v = UINT16_MAX;
             uint16_t max_v = 0;
             uint32_t max_u8_diff = 0;
             size_t non_u8_grid = 0;
+            size_t preview = count < 4 ? count : 4;
             size_t p;
 
             if (!wrapped_u16 || !owned_u16 || owned_raw == 0) {
                 free(wrapped_u16);
                 free(owned_u16);
-                goto r16_cleanup;
+                goto cleanup;
             }
-            if (readback_image(&vk, r16_imgs[i].image, widths[i], heights[i], 2,
+            if (readback_image(&vk, plane_imgs[i].image, widths[i], heights[i], 2,
                                (unsigned char *)wrapped_u16) != 0 ||
                 readback_image(&vk, (VkImage)(uintptr_t)owned_raw, widths[i], heights[i], 2,
                                (unsigned char *)owned_u16) != 0) {
                 free(wrapped_u16);
                 free(owned_u16);
-                goto r16_cleanup;
+                goto cleanup;
             }
             if (memcmp(wrapped_u16, owned_u16, bytes) != 0) {
                 fprintf(stderr, "plane %u: wrapped and owned R16 readbacks differ\n", i);
                 free(wrapped_u16);
                 free(owned_u16);
-                goto r16_cleanup;
+                goto cleanup;
             }
 
             for (p = 0; p < count; p++) {
@@ -921,39 +900,38 @@ int main(int argc, char **argv)
                 }
             }
             printf("plane %u (%ux%u R16): min=%u max=%u max_u8_diff=%u non_u8_grid=%zu/%zu "
-                   "first=[%u,%u,%u,%u]\n",
+                   "first=[",
                    i, widths[i], heights[i], (unsigned)min_v, (unsigned)max_v, max_u8_diff,
-                   non_u8_grid, count, (unsigned)wrapped_u16[0], (unsigned)wrapped_u16[1],
-                   (unsigned)wrapped_u16[2], (unsigned)wrapped_u16[3]);
+                   non_u8_grid, count);
+            for (p = 0; p < preview; p++) {
+                printf("%s%u", p == 0 ? "" : ",", (unsigned)wrapped_u16[p]);
+            }
+            printf("]\n");
             free(wrapped_u16);
             free(owned_u16);
             if (max_u8_diff > 1) {
                 fprintf(stderr, "plane %u: R16 vs 8-bit YUV diff %u > 1\n", i, max_u8_diff);
-                goto r16_cleanup;
+                goto cleanup;
+            }
+            if (require_sub8 && non_u8_grid == 0) {
+                fprintf(stderr, "plane %u: expected >8-bit R16 samples, got only 8-bit grid\n", i);
+                goto cleanup;
             }
         }
 
+        check_released = 1;
         exit_code = 0;
-    r16_cleanup:
-        free(cpu_yuv);
-        for (i = 0; i < 3; i++) {
-            emberwave_texture_destroy(wrapped[i]);
-            emberwave_texture_destroy(owned[i]);
-        }
-        emberwave_decoder_destroy(decoder);
-        decoder = NULL;
-        emberwave_context_destroy(context);
-        context = NULL;
-        for (i = 0; i < 3; i++) {
-            destroy_plane_image(&vk, &r16_imgs[i]);
-        }
-        if (exit_code == 0 && g_released_count != 3) {
-            fprintf(stderr, "expected 3 image release callbacks, got %u\n", g_released_count);
-            exit_code = 1;
-        }
     }
 
 cleanup:
+    free(cpu_yuv);
+    if (probe_tex != NULL) {
+        emberwave_texture_destroy(probe_tex);
+    }
+    for (i = 0; i < 3; i++) {
+        emberwave_texture_destroy(wrapped_tex[i]);
+        emberwave_texture_destroy(owned_tex[i]);
+    }
     if (reqs != NULL) {
         emberwave_vulkan_requirements_destroy(reqs);
     }
@@ -962,6 +940,17 @@ cleanup:
     }
     if (context != NULL) {
         emberwave_context_destroy(context);
+    }
+    if (check_released && g_released_count != 3) {
+        fprintf(stderr, "expected 3 image release callbacks, got %u\n", g_released_count);
+        exit_code = 1;
+    }
+    if (vk.device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(vk.device);
+    }
+    destroy_plane_image(&vk, &probe_img);
+    for (i = 0; i < 3; i++) {
+        destroy_plane_image(&vk, &plane_imgs[i]);
     }
     if (vk.command_pool != VK_NULL_HANDLE) {
         vkDestroyCommandPool(vk.device, vk.command_pool, NULL);
