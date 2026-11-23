@@ -14,6 +14,7 @@ categories = ["multimedia::video", "command-line-utilities"]
 emberwave-core.workspace = true
 clap.workspace = true
 png.workspace = true
+pollster.workspace = true
 # For pictures in textures (bench-encode --textures).
 wgpu.workspace = true
 

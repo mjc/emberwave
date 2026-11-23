@@ -651,3 +651,100 @@ fn frames_u16_support_p010_levels_and_check_errors() {
         })
     ));
 }
+
+#[test]
+fn ten_bit_planar_codes_roundtrip_via_pwv1_and_exceed_8bit_accuracy() {
+    use crate::bitstream::Pwv1File;
+
+    let psnr_u10 = |a: &[u16], b: &[u16]| -> f64 {
+        let sq: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2))
+            .sum();
+        if sq == 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (1023.0 * 1023.0 / (sq / a.len() as f64)).log10()
+        }
+    };
+
+    for (chroma, width, height, budget) in [
+        (ChromaSubsampling::Yuv420, 192, 136, 80_000),
+        (ChromaSubsampling::Yuv444, 131, 67, 80_000),
+    ] {
+        let layout = FrameLayout::new(width, height, chroma).unwrap();
+        let src_u10: [Vec<u16>; 3] = Component::ALL.map(|component| {
+            let (w, h) = layout.plane_size(component);
+            let offset = component.index() as u32 * 130;
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    ((64 + offset + x * 4 + y * 3) % 940) as u16
+                })
+                .collect()
+        });
+        let src_unorm16: [Vec<u16>; 3] = [0, 1, 2].map(|i| {
+            src_u10[i]
+                .iter()
+                .map(|&c| crate::cpu::unorm16(f32::from(c) / 1023.0))
+                .collect()
+        });
+        let src_u8: [Vec<u8>; 3] = [0, 1, 2].map(|i| {
+            src_u10[i]
+                .iter()
+                .map(|&c| ((u32::from(c) * 255 + 511) / 1023) as u8)
+                .collect()
+        });
+
+        let mut enc10 = Encoder::new(width, height, chroma, Signalling::default()).unwrap();
+        let frame10 = enc10
+            .encode_u16([&src_unorm16[0], &src_unorm16[1], &src_unorm16[2]], budget)
+            .unwrap();
+        let mut enc8 = Encoder::new(width, height, chroma, Signalling::default()).unwrap();
+        let frame8 = enc8
+            .encode([&src_u8[0], &src_u8[1], &src_u8[2]], budget)
+            .unwrap();
+
+        // Wrap in a PWV1 container with reference_bit_depth = 10 and parse back.
+        let header = crate::bitstream::Pwv1Header {
+            stream: enc10.stream(),
+            frame_rate_num: 30,
+            frame_rate_den: 1,
+            reference_bit_depth: 10,
+        };
+        let mut pwv1_bytes = header.to_bytes().to_vec();
+        pwv1_bytes.extend_from_slice(&(frame10.len() as u32).to_le_bytes());
+        pwv1_bytes.extend_from_slice(&frame10);
+        let parsed = Pwv1File::parse(&pwv1_bytes).unwrap();
+        assert_eq!(parsed.header().reference_bit_depth, 10);
+        let parsed_frame = parsed.frames().next().unwrap().unwrap();
+
+        let dec10_unorm = decode_u16(&layout, parsed_frame);
+        let dec10_u10: [Vec<u16>; 3] = [0, 1, 2].map(|i| {
+            dec10_unorm[i]
+                .iter()
+                .map(|&s| ((u32::from(s) * 1023 + 32_767) / 65_535) as u16)
+                .collect()
+        });
+
+        let dec8_unorm = decode_u16(&layout, &frame8);
+        let dec8_u10: [Vec<u16>; 3] = [0, 1, 2].map(|i| {
+            dec8_unorm[i]
+                .iter()
+                .map(|&s| ((u32::from(s) * 1023 + 32_767) / 65_535) as u16)
+                .collect()
+        });
+
+        let worst10 = (0..3)
+            .map(|i| psnr_u10(&src_u10[i], &dec10_u10[i]))
+            .fold(f64::INFINITY, f64::min);
+        let worst8 = (0..3)
+            .map(|i| psnr_u10(&src_u10[i], &dec8_u10[i]))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            worst10 > 60.0 && worst10 > worst8 + 5.0,
+            "{width}x{height} {chroma:?}: 10-bit PSNR {worst10:.2} dB vs 8-bit {worst8:.2} dB"
+        );
+    }
+}

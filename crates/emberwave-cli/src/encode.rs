@@ -28,7 +28,7 @@ pub enum SignalledMatrix {
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// The Y4M file to encode: 8-bit 4:2:0 or 4:4:4
+    /// The Y4M file to encode: 8-bit or 10-bit (`C420p10`, `C444p10`) 4:2:0 or 4:4:4
     input: PathBuf,
 
     /// The PWV1 file to write
@@ -79,6 +79,13 @@ impl Encoder {
         Ok(match self {
             Self::Cpu(encoder) => encoder.encode(planes, budget)?,
             Self::Gpu(encoder) => encoder.encode(planes, budget)?,
+        })
+    }
+
+    fn encode_u16(&mut self, planes: [&[u16]; 3], budget: usize) -> Result<Vec<u8>> {
+        Ok(match self {
+            Self::Cpu(encoder) => encoder.encode_u16(planes, budget)?,
+            Self::Gpu(encoder) => encoder.encode_u16(planes, budget)?,
         })
     }
 }
@@ -149,10 +156,11 @@ pub fn run(args: &Args) -> Result<()> {
         )?))
     };
     err!(
-        "{}x{} {}, {} chroma siting, {:?} range; {} bytes per frame at most, on the {}",
+        "{}x{} {} ({}-bit), {} chroma siting, {:?} range; {} bytes per frame at most, on the {}",
         width,
         height,
         chroma_name(header.chroma),
+        header.bit_depth.bits(),
         siting_name(header.siting),
         header.range,
         args.bytes_per_frame,
@@ -170,7 +178,7 @@ pub fn run(args: &Args) -> Result<()> {
         stream: encoder.stream(),
         frame_rate_num: frame_rate.0,
         frame_rate_den: frame_rate.1,
-        reference_bit_depth: 8,
+        reference_bit_depth: header.bit_depth.bits(),
     };
 
     // The file appears under its name only once it is complete; a failure
@@ -187,9 +195,21 @@ pub fn run(args: &Args) -> Result<()> {
             let Some([y, cb, cr]) = video.next_frame()? else {
                 break;
             };
-            let start = Instant::now();
-            let frame = encoder.encode([&y, &cb, &cr], args.bytes_per_frame)?;
-            let elapsed = start.elapsed().as_secs_f64();
+            let (frame, elapsed) = match header.bit_depth {
+                y4m::BitDepth::Eight => {
+                    let start = Instant::now();
+                    let frame = encoder.encode([&y, &cb, &cr], args.bytes_per_frame)?;
+                    (frame, start.elapsed().as_secs_f64())
+                }
+                y4m::BitDepth::Ten => {
+                    let y16 = y4m::u10_plane_to_unorm16(&y)?;
+                    let cb16 = y4m::u10_plane_to_unorm16(&cb)?;
+                    let cr16 = y4m::u10_plane_to_unorm16(&cr)?;
+                    let start = Instant::now();
+                    let frame = encoder.encode_u16([&y16, &cb16, &cr16], args.bytes_per_frame)?;
+                    (frame, start.elapsed().as_secs_f64())
+                }
+            };
             out.write_all(&u32::try_from(frame.len())?.to_le_bytes())?;
             out.write_all(&frame)?;
             err!(

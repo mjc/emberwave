@@ -1055,3 +1055,607 @@ fn quality_measures_the_first_frames_and_refuses_incomplete_ones() {
         stderr(&output)
     );
 }
+
+/// Writes a 10-bit planar Y4M file (`C420p10` or `C444p10`) from 10-bit
+/// code planes (`0..=1023`), stored as little-endian 16-bit words.
+fn write_y4m_10bit(
+    path: &Path,
+    width: usize,
+    height: usize,
+    chroma: ChromaSubsampling,
+    range: &str,
+    frames: &[[Vec<u16>; 3]],
+) {
+    let tag = match chroma {
+        ChromaSubsampling::Yuv420 => "C420p10",
+        ChromaSubsampling::Yuv444 => "C444p10",
+    };
+    let mut bytes =
+        format!("YUV4MPEG2 W{width} H{height} F30:1 Ip A1:1 XCOLORRANGE={range} {tag}\n")
+            .into_bytes();
+    for frame in frames {
+        bytes.extend_from_slice(b"FRAME\n");
+        for plane in frame {
+            for &sample in plane {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Generates synthetic 10-bit frames with single-step `1/1023` gradients so
+/// 10-bit round-tripping preserves steps that 8-bit quantisation collapses.
+fn synthetic_10bit_frames(
+    width: usize,
+    height: usize,
+    chroma: ChromaSubsampling,
+    count: usize,
+) -> Vec<[Vec<u16>; 3]> {
+    let (cw, ch) = match chroma {
+        ChromaSubsampling::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
+        ChromaSubsampling::Yuv444 => (width, height),
+    };
+    (0..count)
+        .map(|f| {
+            let plane = |pw: usize, ph: usize, offset: usize| -> Vec<u16> {
+                (0..pw * ph)
+                    .map(|i| {
+                        let (x, y) = (i % pw, i / pw);
+                        ((64 + offset + f * 17 + x * 4 + y * 3) % 940) as u16
+                    })
+                    .collect()
+            };
+            [
+                plane(width, height, 0),
+                plane(cw, ch, 120),
+                plane(cw, ch, 240),
+            ]
+        })
+        .collect()
+}
+
+/// Reads the header line and `u16` little-endian planes of every frame in a
+/// 10-bit Y4M file.
+fn read_y4m_10bit_frames(
+    path: &Path,
+    width: usize,
+    height: usize,
+    chroma: ChromaSubsampling,
+) -> (String, Vec<[Vec<u16>; 3]>) {
+    let data = std::fs::read(path).unwrap();
+    let newline = data.iter().position(|&b| b == b'\n').unwrap();
+    let header = String::from_utf8(data[..newline].to_vec()).unwrap();
+    let (cw, ch) = match chroma {
+        ChromaSubsampling::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
+        ChromaSubsampling::Yuv444 => (width, height),
+    };
+    let counts = [width * height, cw * ch, cw * ch];
+    let mut pos = newline + 1;
+    let mut frames = Vec::new();
+    while pos < data.len() {
+        assert_eq!(&data[pos..pos + 6], b"FRAME\n");
+        pos += 6;
+        let mut planes: [Vec<u16>; 3] = Default::default();
+        for (plane, count) in planes.iter_mut().zip(counts) {
+            let bytes = &data[pos..pos + count * 2];
+            *plane = bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            pos += count * 2;
+        }
+        frames.push(planes);
+    }
+    (header, frames)
+}
+
+fn psnr_u10(a: &[u16], b: &[u16]) -> f64 {
+    let sq: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2))
+        .sum();
+    if sq == 0.0 {
+        return f64::INFINITY;
+    }
+    10.0 * (1023.0 * 1023.0 / (sq / a.len() as f64)).log10()
+}
+
+#[test]
+fn encode_and_decode_10bit_y4m_roundtrip_and_beat_8bit_precision() {
+    let dir = scratch("y4m_10bit_roundtrip");
+
+    // 1. CPU encode, `info`, `quality`, and `bench-encode` run without a GPU.
+    let mut cpu_streams = Vec::new();
+    for (tag, width, height, chroma, range, budget) in [
+        (
+            "420_cpu",
+            192,
+            136,
+            ChromaSubsampling::Yuv420,
+            "LIMITED",
+            "80000",
+        ),
+        (
+            "444_cpu",
+            131,
+            67,
+            ChromaSubsampling::Yuv444,
+            "FULL",
+            "80000",
+        ),
+    ] {
+        let src_frames = synthetic_10bit_frames(width, height, chroma, 2);
+        let src_y4m = dir.join(format!("{tag}_src.y4m"));
+        write_y4m_10bit(&src_y4m, width, height, chroma, range, &src_frames);
+
+        let pwv1 = dir.join(format!("{tag}.pwv1"));
+        let output = cli()
+            .arg("encode")
+            .arg(&src_y4m)
+            .arg("--out")
+            .arg(&pwv1)
+            .args(["--bytes-per-frame", budget])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{tag}: {}", stderr(&output));
+        assert!(stderr(&output).contains("10-bit"), "{}", stderr(&output));
+
+        let info_out = cli().arg("info").arg(&pwv1).output().unwrap();
+        assert!(info_out.status.success(), "{}", stderr(&info_out));
+        assert!(
+            stdout(&info_out).contains("bit depth:     10"),
+            "{}",
+            stdout(&info_out)
+        );
+
+        let quality_out = cli()
+            .arg("quality")
+            .args([&src_y4m, &pwv1])
+            .output()
+            .unwrap();
+        assert!(
+            quality_out.status.success(),
+            "{tag} quality: {}",
+            stderr(&quality_out)
+        );
+        let quality_text = stdout(&quality_out);
+        let mean_line = quality_text
+            .lines()
+            .find(|line| line.starts_with("mean:"))
+            .unwrap_or_else(|| panic!("{tag}: missing mean line in:\n{quality_text}"));
+        for component in ["Y ", "Cb ", "Cr "] {
+            let (_, after) = mean_line.split_once(component).unwrap();
+            let db_str = after.split_whitespace().next().unwrap();
+            let db: f64 = db_str.parse().unwrap();
+            assert!(
+                db > 60.0,
+                "{tag} quality {component}mean PSNR {db:.2} dB <= 60"
+            );
+        }
+
+        cpu_streams.push((tag, width, height, chroma, range, src_y4m, pwv1, src_frames));
+    }
+
+    // CPU `bench-encode` on 10-bit Y4M also runs without a GPU.
+    let bench_cpu = cli()
+        .arg("bench-encode")
+        .arg(&cpu_streams[0].5)
+        .args([
+            "--bytes-per-frame",
+            "80000",
+            "--frames",
+            "2",
+            "--warmup",
+            "1",
+            "--warmup-seconds",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(bench_cpu.status.success(), "{}", stderr(&bench_cpu));
+
+    // 2. GPU encode, `bench-encode --gpu [--textures]`, and GPU 10-bit decode.
+    let mut cases = cpu_streams;
+    let gpu_src_frames = synthetic_10bit_frames(200, 120, ChromaSubsampling::Yuv420, 2);
+    let gpu_src_y4m = dir.join("420_gpu_src.y4m");
+    write_y4m_10bit(
+        &gpu_src_y4m,
+        200,
+        120,
+        ChromaSubsampling::Yuv420,
+        "LIMITED",
+        &gpu_src_frames,
+    );
+    let gpu_pwv1 = dir.join("420_gpu.pwv1");
+    let Some(gpu_enc_out) = run_on_gpu(
+        cli()
+            .arg("encode")
+            .arg(&gpu_src_y4m)
+            .arg("--out")
+            .arg(&gpu_pwv1)
+            .args(["--bytes-per-frame", "80000", "--gpu"]),
+    ) else {
+        return;
+    };
+    assert!(gpu_enc_out.status.success(), "{}", stderr(&gpu_enc_out));
+    assert!(
+        stderr(&gpu_enc_out).contains("10-bit"),
+        "{}",
+        stderr(&gpu_enc_out)
+    );
+    cases.push((
+        "420_gpu",
+        200,
+        120,
+        ChromaSubsampling::Yuv420,
+        "LIMITED",
+        gpu_src_y4m,
+        gpu_pwv1,
+        gpu_src_frames,
+    ));
+
+    let bench_gpu = run_on_gpu(cli().arg("bench-encode").arg(&cases[0].5).args([
+        "--bytes-per-frame",
+        "80000",
+        "--frames",
+        "2",
+        "--warmup",
+        "1",
+        "--warmup-seconds",
+        "0",
+        "--gpu",
+        "--json",
+    ]))
+    .unwrap();
+    assert!(bench_gpu.status.success(), "{}", stderr(&bench_gpu));
+
+    let bench_tex = run_on_gpu(cli().arg("bench-encode").arg(&cases[0].5).args([
+        "--bytes-per-frame",
+        "80000",
+        "--frames",
+        "2",
+        "--warmup",
+        "1",
+        "--warmup-seconds",
+        "0",
+        "--gpu",
+        "--textures",
+        "--json",
+    ]))
+    .unwrap();
+    if !bench_tex.status.success() && stderr(&bench_tex).contains("TEXTURE_FORMAT_16BIT_NORM") {
+        eprintln!("adapter lacks TEXTURE_FORMAT_16BIT_NORM, skipping 10-bit --textures bench");
+    } else {
+        assert!(bench_tex.status.success(), "{}", stderr(&bench_tex));
+    }
+
+    for (tag, width, height, chroma, range, src_y4m, pwv1, src_frames) in &cases {
+        let (width, height, chroma) = (*width, *height, *chroma);
+        let dec_dir = dir.join(format!("{tag}_dec"));
+        let Some(dec_out) = run_on_gpu(
+            cli()
+                .arg("decode")
+                .arg(pwv1)
+                .arg("--out-dir")
+                .arg(&dec_dir)
+                .args(["--format", "y4m"]),
+        ) else {
+            return;
+        };
+        if !dec_out.status.success() && stderr(&dec_out).contains("TEXTURE_FORMAT_16BIT_NORM") {
+            eprintln!("adapter lacks TEXTURE_FORMAT_16BIT_NORM, skipping GPU 10-bit decode");
+            return;
+        }
+        assert!(
+            dec_out.status.success(),
+            "{tag} decode: {}",
+            stderr(&dec_out)
+        );
+
+        let dec_y4m = dec_dir.join(format!("{tag}.y4m"));
+        let expected_c = match chroma {
+            ChromaSubsampling::Yuv420 => "C420p10",
+            ChromaSubsampling::Yuv444 => "C444p10",
+        };
+        let (hdr, dec_frames) = read_y4m_10bit_frames(&dec_y4m, width, height, chroma);
+        assert!(
+            hdr.contains(&format!("XCOLORRANGE={range}")) && hdr.ends_with(expected_c),
+            "{tag}: unexpected header {hdr}"
+        );
+        assert_eq!(dec_frames.len(), src_frames.len());
+
+        let cmp_out = cli()
+            .arg("compare")
+            .args([&dec_y4m, src_y4m])
+            .args(["--min-psnr", "60"])
+            .output()
+            .unwrap();
+        assert!(
+            cmp_out.status.success(),
+            "{tag} compare:\n{}\n{}",
+            stdout(&cmp_out),
+            stderr(&cmp_out)
+        );
+
+        let worst_10 = src_frames
+            .iter()
+            .zip(&dec_frames)
+            .flat_map(|(s, d)| (0..3).map(move |i| psnr_u10(&s[i], &d[i])))
+            .fold(f64::INFINITY, f64::min);
+        let worst_8_floor = src_frames
+            .iter()
+            .flat_map(|s| {
+                (0..3).map(move |i| {
+                    let q8_as_10: Vec<u16> = s[i]
+                        .iter()
+                        .map(|&v| {
+                            let u8_v = ((u32::from(v) * 255 + 511) / 1023) as u8;
+                            ((u32::from(u8_v) * 1023 + 127) / 255) as u16
+                        })
+                        .collect();
+                    psnr_u10(&s[i], &q8_as_10)
+                })
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            worst_10 > 60.0 && worst_10 > worst_8_floor + 5.0,
+            "{tag}: 10-bit PSNR {worst_10:.2} dB vs 8-bit ceiling {worst_8_floor:.2} dB"
+        );
+
+        // Explicit `--bit-depth 8` override on a 10-bit stream writes 8-bit Y4M.
+        let dec8_dir = dir.join(format!("{tag}_dec8"));
+        let dec8_out = run_on_gpu(
+            cli()
+                .arg("decode")
+                .arg(pwv1)
+                .arg("--out-dir")
+                .arg(&dec8_dir)
+                .args(["--format", "y4m", "--bit-depth", "8"]),
+        )
+        .unwrap();
+        assert!(dec8_out.status.success(), "{}", stderr(&dec8_out));
+        let dec8_bytes = std::fs::read(dec8_dir.join(format!("{tag}.y4m"))).unwrap();
+        let end8 = dec8_bytes.iter().position(|&b| b == b'\n').unwrap();
+        let hdr8 = std::str::from_utf8(&dec8_bytes[..end8]).unwrap();
+        assert!(!hdr8.ends_with("p10"), "{hdr8}");
+    }
+
+    // Left-sited 4:2:0 decoded to 10-bit Y4M warns that C420p10 cannot carry left siting.
+    let left_y4m = dir.join("left_420.y4m");
+    let mut left_bytes = b"YUV4MPEG2 W64 H64 F30:1 C420mpeg2\nFRAME\n".to_vec();
+    left_bytes.extend(std::iter::repeat_n(128u8, 64 * 64 + 32 * 32 * 2));
+    std::fs::write(&left_y4m, left_bytes).unwrap();
+    let left_pwv1 = dir.join("left_420.pwv1");
+    let enc_left = cli()
+        .arg("encode")
+        .arg(&left_y4m)
+        .arg("--out")
+        .arg(&left_pwv1)
+        .args(["--bytes-per-frame", "10000"])
+        .output()
+        .unwrap();
+    assert!(enc_left.status.success(), "{}", stderr(&enc_left));
+    let dec_left_dir = dir.join("left_dec10");
+    let dec_left = run_on_gpu(
+        cli()
+            .arg("decode")
+            .arg(&left_pwv1)
+            .arg("--out-dir")
+            .arg(&dec_left_dir)
+            .args(["--format", "y4m", "--bit-depth", "10"]),
+    )
+    .unwrap();
+    assert!(dec_left.status.success(), "{}", stderr(&dec_left));
+    assert!(
+        stderr(&dec_left).contains("cannot signal left chroma siting"),
+        "{}",
+        stderr(&dec_left)
+    );
+
+    // Cross-depth `--bit-depth 10` on limited-range 8-bit and `--bit-depth 8` on
+    // limited-range 10-bit preserve nominal BT.709 levels (16/128/235 <-> 64/512/940).
+    let flat8_y4m = dir.join("flat8_limited.y4m");
+    let mut flat8_bytes = b"YUV4MPEG2 W64 H64 F30:1 XCOLORRANGE=LIMITED C420jpeg\nFRAME\n".to_vec();
+    flat8_bytes.extend(std::iter::repeat_n(235u8, 64 * 64));
+    flat8_bytes.extend(std::iter::repeat_n(128u8, 32 * 32));
+    flat8_bytes.extend(std::iter::repeat_n(16u8, 32 * 32));
+    std::fs::write(&flat8_y4m, flat8_bytes).unwrap();
+    let flat8_pwv1 = dir.join("flat8_limited.pwv1");
+    let enc8_flat = cli()
+        .arg("encode")
+        .arg(&flat8_y4m)
+        .arg("--out")
+        .arg(&flat8_pwv1)
+        .args(["--bytes-per-frame", "10000"])
+        .output()
+        .unwrap();
+    assert!(enc8_flat.status.success(), "{}", stderr(&enc8_flat));
+    let dec8to10_dir = dir.join("flat8to10");
+    let dec8to10 = run_on_gpu(
+        cli()
+            .arg("decode")
+            .arg(&flat8_pwv1)
+            .arg("--out-dir")
+            .arg(&dec8to10_dir)
+            .args(["--format", "y4m", "--bit-depth", "10"]),
+    )
+    .unwrap();
+    assert!(dec8to10.status.success(), "{}", stderr(&dec8to10));
+    let (_, flat10_frames) = read_y4m_10bit_frames(
+        &dec8to10_dir.join("flat8_limited.y4m"),
+        64,
+        64,
+        ChromaSubsampling::Yuv420,
+    );
+    assert_eq!(flat10_frames[0][0][0], 940);
+    assert_eq!(flat10_frames[0][1][0], 512);
+    assert_eq!(flat10_frames[0][2][0], 64);
+
+    let flat10_y4m = dir.join("flat10_limited.y4m");
+    write_y4m_10bit(
+        &flat10_y4m,
+        64,
+        64,
+        ChromaSubsampling::Yuv420,
+        "LIMITED",
+        &[[
+            vec![940u16; 64 * 64],
+            vec![512u16; 32 * 32],
+            vec![64u16; 32 * 32],
+        ]],
+    );
+    let flat10_pwv1 = dir.join("flat10_limited.pwv1");
+    let enc10_flat = cli()
+        .arg("encode")
+        .arg(&flat10_y4m)
+        .arg("--out")
+        .arg(&flat10_pwv1)
+        .args(["--bytes-per-frame", "10000"])
+        .output()
+        .unwrap();
+    assert!(enc10_flat.status.success(), "{}", stderr(&enc10_flat));
+    let dec10to8_dir = dir.join("flat10to8");
+    let dec10to8 = run_on_gpu(
+        cli()
+            .arg("decode")
+            .arg(&flat10_pwv1)
+            .arg("--out-dir")
+            .arg(&dec10to8_dir)
+            .args(["--format", "y4m", "--bit-depth", "8"]),
+    )
+    .unwrap();
+    assert!(dec10to8.status.success(), "{}", stderr(&dec10to8));
+    let (_, _, [y8, cb8, cr8]) = first_frame(&dec10to8_dir.join("flat10_limited.y4m"));
+    assert_eq!(y8[0], 235);
+    assert_eq!(cb8[0], 128);
+    assert_eq!(cr8[0], 16);
+
+    // Incomplete 10-bit PWV1 frame is refused rather than decoded with zeroed blocks.
+    let valid_bytes = std::fs::read(&cases[0].6).unwrap();
+    let parsed = emberwave_core::bitstream::pwv1::Pwv1File::parse(&valid_bytes).unwrap();
+    let first_frame = parsed.frames().next().unwrap().unwrap();
+    let partial_first: Vec<u8> = emberwave_core::encode::packets(first_frame, 1000)
+        .into_iter()
+        .take(2)
+        .flatten()
+        .copied()
+        .collect();
+    let mut incomplete_pwv1 = parsed.header().to_bytes().to_vec();
+    incomplete_pwv1.extend_from_slice(&(partial_first.len() as u32).to_le_bytes());
+    incomplete_pwv1.extend_from_slice(&partial_first);
+    let incomplete_path = dir.join("incomplete_10bit.pwv1");
+    std::fs::write(&incomplete_path, incomplete_pwv1).unwrap();
+    let dec_inc = run_on_gpu(
+        cli()
+            .arg("decode")
+            .arg(&incomplete_path)
+            .arg("--out-dir")
+            .arg(dir.join("incomplete_out"))
+            .args(["--format", "y4m"]),
+    )
+    .unwrap();
+    assert!(!dec_inc.status.success());
+    assert!(
+        stderr(&dec_inc).contains("incomplete"),
+        "{}",
+        stderr(&dec_inc)
+    );
+}
+
+#[test]
+fn ten_bit_y4m_errors_are_reported_cleanly_without_partial_output() {
+    let dir = scratch("y4m_10bit_errors");
+
+    // Odd dimensions for C420p10 are refused before writing.
+    let odd_p10 = dir.join("odd_p10.y4m");
+    std::fs::write(&odd_p10, b"YUV4MPEG2 W5 H3 C420p10\nFRAME\n").unwrap();
+    let out = dir.join("out.pwv1");
+    let res = cli()
+        .arg("encode")
+        .arg(&odd_p10)
+        .arg("--out")
+        .arg(&out)
+        .args(["--bytes-per-frame", "1000"])
+        .output()
+        .unwrap();
+    assert!(!res.status.success());
+    assert!(stderr(&res).contains("even"), "{}", stderr(&res));
+    assert!(!out.exists());
+
+    // Sample > 1023 in C420p10 is rejected and leaves no output file.
+    let bad_sample = dir.join("bad_sample.y4m");
+    write_y4m_10bit(
+        &bad_sample,
+        4,
+        2,
+        ChromaSubsampling::Yuv420,
+        "LIMITED",
+        &[[vec![1024u16; 8], vec![512u16; 2], vec![512u16; 2]]],
+    );
+    let res = cli()
+        .arg("encode")
+        .arg(&bad_sample)
+        .arg("--out")
+        .arg(&out)
+        .args(["--bytes-per-frame", "1000"])
+        .output()
+        .unwrap();
+    assert!(!res.status.success());
+    assert!(stderr(&res).contains("1023"), "{}", stderr(&res));
+    assert!(!out.exists());
+    assert!(!dir.join("out.pwv1.partial").exists());
+
+    // `--bit-depth` is refused for `--format png` before creating `--out-dir`.
+    let never = dir.join("never_created");
+    let res = cli()
+        .arg("decode")
+        .arg(testdata(&format!("{VECTOR}.pwv1")))
+        .arg("--out-dir")
+        .arg(&never)
+        .args(["--format", "png", "--bit-depth", "10"])
+        .output()
+        .unwrap();
+    assert!(!res.status.success());
+    assert!(stderr(&res).contains("--bit-depth"), "{}", stderr(&res));
+    assert!(!never.exists());
+
+    // `compare` refuses comparing an 8-bit Y4M with a 10-bit Y4M.
+    let valid_p10 = dir.join("valid_p10.y4m");
+    let frames = synthetic_10bit_frames(200, 120, ChromaSubsampling::Yuv420, 1);
+    write_y4m_10bit(
+        &valid_p10,
+        200,
+        120,
+        ChromaSubsampling::Yuv420,
+        "LIMITED",
+        &frames,
+    );
+    let res = cli()
+        .arg("compare")
+        .arg(&valid_p10)
+        .arg(testdata(&format!("{VECTOR}.ref.y4m")))
+        .output()
+        .unwrap();
+    assert!(!res.status.success());
+    assert!(
+        stderr(&res).contains("differ in format"),
+        "{}",
+        stderr(&res)
+    );
+
+    // `quality` refuses pairing a 10-bit Y4M with an 8-bit PWV1 stream.
+    let res = cli()
+        .arg("quality")
+        .arg(&valid_p10)
+        .arg(testdata(&format!("{VECTOR}.pwv1")))
+        .output()
+        .unwrap();
+    assert!(!res.status.success());
+    assert!(
+        stderr(&res).contains("10-bit") && stderr(&res).contains("8-bit"),
+        "{}",
+        stderr(&res)
+    );
+}

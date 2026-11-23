@@ -14,8 +14,8 @@ use crate::{Backend, GpuArgs, Result, chroma_name, y4m};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// The Y4M video to encode, 8-bit 4:2:0 or 4:4:4; its frames are read
-    /// into memory first and then encoded in turn, as often as needed
+    /// The Y4M video to encode, 8-bit or 10-bit (C420p10, C444p10) 4:2:0 or 4:4:4;
+    /// its frames are read into memory first and then encoded in turn, as often as needed
     input: PathBuf,
 
     /// The most bytes a frame may take, its start of frame header included
@@ -70,14 +70,16 @@ enum Encoder {
 /// GPU.
 enum Picture<'a> {
     Planes([&'a [u8]; 3]),
+    Planes16([&'a [u16]; 3]),
     Bgra(&'a [u8]),
     Textures(gpu::TexturePicture<'a>),
 }
 
 /// The pictures of the video, taken in turn: in CPU memory, as planes or in
-/// BGRA, or in textures, an R8 texture per plane or a BGRA texture.
+/// BGRA, or in textures, an R8/R16 texture per plane or a BGRA texture.
 enum Pictures {
     Planes(Vec<[Vec<u8>; 3]>),
+    Planes16(Vec<[Vec<u16>; 3]>),
     Bgra(Vec<Vec<u8>>),
     Textures(Vec<[wgpu::TextureView; 3]>),
     BgraTextures(Vec<wgpu::TextureView>),
@@ -87,6 +89,7 @@ impl Pictures {
     fn len(&self) -> usize {
         match self {
             Self::Planes(frames) => frames.len(),
+            Self::Planes16(frames) => frames.len(),
             Self::Bgra(frames) => frames.len(),
             Self::Textures(textures) => textures.len(),
             Self::BgraTextures(textures) => textures.len(),
@@ -99,6 +102,10 @@ impl Pictures {
             Self::Planes(frames) => {
                 let frame = &frames[i % frames.len()];
                 Picture::Planes([&frame[0], &frame[1], &frame[2]])
+            }
+            Self::Planes16(frames) => {
+                let frame = &frames[i % frames.len()];
+                Picture::Planes16([&frame[0], &frame[1], &frame[2]])
             }
             Self::Bgra(frames) => Picture::Bgra(&frames[i % frames.len()]),
             Self::Textures(textures) => {
@@ -114,8 +121,12 @@ impl Pictures {
     /// The same pictures in BGRA, as the decode's conversion of the
     /// stream's colours gives them, one frame at a time.
     fn into_bgra(self, layout: &FrameLayout) -> Result<Self> {
-        let Self::Planes(frames) = self else {
-            return Ok(self);
+        let frames = match self {
+            Self::Planes(frames) => frames,
+            Self::Planes16(_) => {
+                return Err("--rgb is only supported for 8-bit Y4M inputs".into());
+            }
+            other => return Ok(other),
         };
         let color = Signalling::default().color_params();
         let mut pictures = Vec::with_capacity(frames.len());
@@ -166,6 +177,27 @@ impl Pictures {
                 }
                 Ok(Self::Textures(textures))
             }
+            Self::Planes16(frames) => {
+                if !context.supports_source_format(gpu::PLANE_FORMAT_R16) {
+                    return Err(
+                        "--textures on 10-bit Y4M inputs requires TEXTURE_FORMAT_16BIT_NORM, \
+                         which this GPU adapter does not support"
+                            .into(),
+                    );
+                }
+                let mut textures = Vec::with_capacity(frames.len());
+                for frame in frames {
+                    let bytes: [Vec<u8>; 3] = std::array::from_fn(|i| {
+                        frame[i].iter().flat_map(|s| s.to_le_bytes()).collect()
+                    });
+                    textures.push(std::array::from_fn(|i| {
+                        let size = layout.plane_size(Component::ALL[i]);
+                        texture_of(context, size, gpu::PLANE_FORMAT_R16, &bytes[i])
+                    }));
+                    uploaded()?;
+                }
+                Ok(Self::Textures(textures))
+            }
             Self::Bgra(frames) => {
                 let mut textures = Vec::with_capacity(frames.len());
                 for frame in frames {
@@ -187,7 +219,7 @@ impl Pictures {
     /// What the pictures are, for the description and the JSON.
     fn kind(&self) -> &'static str {
         match self {
-            Self::Planes(_) => "planes",
+            Self::Planes(_) | Self::Planes16(_) => "planes",
             Self::Bgra(_) => "bgra",
             Self::Textures(_) => "textures",
             Self::BgraTextures(_) => "bgra textures",
@@ -229,6 +261,11 @@ impl Measurement {
                 encoder.encode(planes, budget)?;
                 self.total.samples.push(ms(start.elapsed()));
             }
+            (Encoder::Cpu(encoder), Picture::Planes16(planes)) => {
+                let start = Instant::now();
+                encoder.encode_u16(planes, budget)?;
+                self.total.samples.push(ms(start.elapsed()));
+            }
             (Encoder::Cpu(encoder), Picture::Bgra(bgra)) => {
                 let start = Instant::now();
                 let stride = 4 * encoder.layout().width() as usize;
@@ -241,6 +278,7 @@ impl Measurement {
             (Encoder::Gpu(encoder), picture) => {
                 let (_, timings) = match picture {
                     Picture::Planes(planes) => encoder.encode_timed(planes, budget)?,
+                    Picture::Planes16(planes) => encoder.encode_u16_timed(planes, budget)?,
                     Picture::Bgra(bgra) => {
                         let stride = 4 * encoder.layout().width() as usize;
                         encoder.encode_rgb_timed(bgra, stride, RgbOrder::Bgra, budget)?
@@ -320,7 +358,20 @@ pub fn run(args: &Args) -> Result<()> {
         return Err("the Y4M file has no frames".into());
     }
 
-    let mut pictures = Pictures::Planes(frames);
+    let mut pictures = match header.bit_depth {
+        y4m::BitDepth::Eight => Pictures::Planes(frames),
+        y4m::BitDepth::Ten => {
+            let mut frames16 = Vec::with_capacity(frames.len());
+            for [y, cb, cr] in frames {
+                frames16.push([
+                    y4m::u10_plane_to_unorm16(&y)?,
+                    y4m::u10_plane_to_unorm16(&cb)?,
+                    y4m::u10_plane_to_unorm16(&cr)?,
+                ]);
+            }
+            Pictures::Planes16(frames16)
+        }
+    };
     if args.rgb {
         let layout = FrameLayout::new(width, height, header.chroma)?;
         pictures = pictures.into_bgra(&layout)?;
@@ -371,7 +422,7 @@ pub fn run(args: &Args) -> Result<()> {
         args.bytes_per_frame,
         if args.gpu { "GPU" } else { "CPU" },
         match pictures {
-            Pictures::Planes(_) => "",
+            Pictures::Planes(_) | Pictures::Planes16(_) => "",
             Pictures::Bgra(_) => " from BGRA in memory",
             Pictures::Textures(_) => " from textures",
             Pictures::BgraTextures(_) => " from BGRA textures",
