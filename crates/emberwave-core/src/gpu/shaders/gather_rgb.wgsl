@@ -31,6 +31,16 @@ struct RgbParams {
     // which weighs three columns 1, 2 and 1; 0 where it sits between them,
     // which weighs two alike.
     left: u32,
+    // 0 for non-linear 10-bit (Rgb10a2Unorm), 1 for linear scRGB (Rgba16Float).
+    mode: u32,
+    // 1 when linear scRGB input converts BT.709 primaries to BT.2020.
+    gamut_bt2020: u32,
+    // 1 when linear scRGB input uses SMPTE ST 2084 PQ OETF, 0 for sRGB OETF.
+    transfer_pq: u32,
+    // [kr, kb, 0.5 / (1 - kb), 0.5 / (1 - kr)] for 16-bit float conversion.
+    luma_chroma: vec4<f32>,
+    // [luma_offset, luma_scale, chroma_offset, chroma_scale] in [0, 65535].
+    range_16: vec4<f32>,
 }
 
 @group(0) @binding(0) var<storage, read_write> planes: array<u32>;
@@ -144,4 +154,175 @@ fn yuv420(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     planes[params.offset.y + chroma_row * params.stride.y + word] = pack(cb, 4u * word, params.width.y);
     planes[params.offset.z + chroma_row * params.stride.z + word] = pack(cr, 4u * word, params.width.z);
+}
+
+const PQ_M1: f32 = 0.1593017578125;
+const PQ_M2: f32 = 78.84375;
+const PQ_C1: f32 = 0.8359375;
+const PQ_C2: f32 = 18.8515625;
+const PQ_C3: f32 = 18.6875;
+
+fn bt709_to_bt2020(c: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        0.6274039 * c.r + 0.32928304 * c.g + 0.043313066 * c.b,
+        0.06909729 * c.r + 0.9195404 * c.g + 0.011362316 * c.b,
+        0.016391439 * c.r + 0.08801331 * c.g + 0.89559525 * c.b,
+    );
+}
+
+fn pq_channel(scrgb: f32) -> f32 {
+    let v = min(scrgb * (80.0 / 10000.0), 1.0);
+    if (v <= 0.0) {
+        return 0.0;
+    }
+    let l = pow(v, PQ_M1);
+    return pow((PQ_C1 + PQ_C2 * l) / (1.0 + PQ_C3 * l), PQ_M2);
+}
+
+fn srgb_channel(linear: f32) -> f32 {
+    let x = min(linear, 1.0);
+    if (x <= 0.0031308) {
+        return 12.92 * x;
+    }
+    return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+
+fn sanitize_finite(v: f32) -> f32 {
+    let is_finite = (bitcast<u32>(v) & 0x7f800000u) != 0x7f800000u;
+    return select(0.0, v, is_finite);
+}
+
+fn pixel_rgb(x: i32, y: u32) -> vec3<f32> {
+    let size = textureDimensions(picture);
+    let at = vec2<u32>(u32(clamp(x, 0, i32(size.x) - 1)), min(y, size.y - 1u));
+    let texel = textureLoad(picture, at, 0).rgb;
+    if (params.mode == 0u) {
+        return round(saturate(texel) * 1023.0) * (1.0 / 1023.0);
+    }
+    // Sanitize non-finite values before BT.2020 conversion so one NaN/Inf
+    // channel does not corrupt finite channels, while preserving negative
+    // wide-gamut scRGB values until after primary conversion.
+    var c = vec3<f32>(
+        sanitize_finite(texel.x),
+        sanitize_finite(texel.y),
+        sanitize_finite(texel.z),
+    );
+    if (params.gamut_bt2020 != 0u) {
+        c = bt709_to_bt2020(c);
+    }
+    c = max(c, vec3<f32>(0.0));
+    if (params.transfer_pq != 0u) {
+        return vec3<f32>(pq_channel(c.x), pq_channel(c.y), pq_channel(c.z));
+    }
+    return vec3<f32>(srgb_channel(c.x), srgb_channel(c.y), srgb_channel(c.z));
+}
+
+fn luma_n(rgb: vec3<f32>) -> f32 {
+    return rgb.g + params.luma_chroma.x * (rgb.r - rgb.g) + params.luma_chroma.y * (rgb.b - rgb.g);
+}
+
+fn luma_u16(rgb: vec3<f32>) -> u32 {
+    let v = params.range_16.x + luma_n(rgb) * params.range_16.y;
+    return u32(clamp(round(v), 0.0, 65535.0));
+}
+
+fn chroma_u16(rgb: vec3<f32>, is_cb: bool) -> u32 {
+    let y = luma_n(rgb);
+    let cn = select((rgb.r - y) * params.luma_chroma.w, (rgb.b - y) * params.luma_chroma.z, is_cb);
+    let v = params.range_16.z + cn * params.range_16.w;
+    return u32(clamp(round(v), 0.0, 65535.0));
+}
+
+fn pack16(s0: u32, s1: u32, x: u32, width: u32) -> u32 {
+    let low = select(0u, s0, x < width);
+    let high = select(0u, s1, x + 1u < width);
+    return low | (high << 16u);
+}
+
+struct Row420 {
+    luma_w0: u32,
+    luma_w1: u32,
+    c0: vec3<f32>,
+    c1: vec3<f32>,
+}
+
+fn row420(x: u32, y: u32, left: bool) -> Row420 {
+    let p_m1 = pixel_rgb(i32(x) - 1, y);
+    let p0 = pixel_rgb(i32(x), y);
+    let p1 = pixel_rgb(i32(x) + 1, y);
+    let p2 = pixel_rgb(i32(x) + 2, y);
+    let p3 = pixel_rgb(i32(x) + 3, y);
+    let luma_w0 = pack16(luma_u16(p0), luma_u16(p1), x, params.width.x);
+    let luma_w1 = pack16(luma_u16(p2), luma_u16(p3), x + 2u, params.width.x);
+    let c0 = select(p0 + p1, p_m1 + 2.0 * p0 + p1, left);
+    let c1 = select(p2 + p3, p1 + 2.0 * p2 + p3, left);
+    return Row420(luma_w0, luma_w1, c0, c1);
+}
+
+// 4:4:4 16-bit: one invocation per word (2 samples) of a row of Y, Cb and Cr.
+@compute @workgroup_size(16, 16)
+fn yuv444_16(@builtin(global_invocation_id) id: vec3<u32>) {
+    let word = id.x;
+    let row = id.y;
+    if (word >= params.stride.x || row >= params.height.x) {
+        return;
+    }
+    let x = 2u * word;
+    let rgb0 = pixel_rgb(i32(x), row);
+    let rgb1 = pixel_rgb(i32(x + 1u), row);
+    let width = params.width.x;
+    planes[params.offset.x + row * params.stride.x + word] =
+        pack16(luma_u16(rgb0), luma_u16(rgb1), x, width);
+    planes[params.offset.y + row * params.stride.y + word] =
+        pack16(chroma_u16(rgb0, true), chroma_u16(rgb1, true), x, width);
+    planes[params.offset.z + row * params.stride.z + word] =
+        pack16(chroma_u16(rgb0, false), chroma_u16(rgb1, false), x, width);
+}
+
+// 4:2:0 16-bit: one invocation per chroma word (2 chroma samples, covering 4x2 luma).
+@compute @workgroup_size(16, 16)
+fn yuv420_16(@builtin(global_invocation_id) id: vec3<u32>) {
+    let word = id.x;
+    let chroma_row = id.y;
+    if (word >= params.stride.y || chroma_row >= params.height.y) {
+        return;
+    }
+    let x = 4u * word;
+    let left = params.left == 1u;
+    let y0 = 2u * chroma_row;
+    let y1 = y0 + 1u;
+    let r0 = row420(x, y0, left);
+    let r1 = row420(x, y1, left);
+
+    let lw0 = 2u * word;
+    let lw1 = lw0 + 1u;
+    if (y0 < params.height.x) {
+        if (lw0 < params.stride.x) {
+            planes[params.offset.x + y0 * params.stride.x + lw0] = r0.luma_w0;
+        }
+        if (lw1 < params.stride.x) {
+            planes[params.offset.x + y0 * params.stride.x + lw1] = r0.luma_w1;
+        }
+    }
+    if (y1 < params.height.x) {
+        if (lw0 < params.stride.x) {
+            planes[params.offset.x + y1 * params.stride.x + lw0] = r1.luma_w0;
+        }
+        if (lw1 < params.stride.x) {
+            planes[params.offset.x + y1 * params.stride.x + lw1] = r1.luma_w1;
+        }
+    }
+
+    let inv_weight = select(0.25, 0.125, left);
+    let avg0 = (r0.c0 + r1.c0) * inv_weight;
+    let avg1 = (r0.c1 + r1.c1) * inv_weight;
+    let cb0 = chroma_u16(avg0, true);
+    let cb1 = chroma_u16(avg1, true);
+    let cr0 = chroma_u16(avg0, false);
+    let cr1 = chroma_u16(avg1, false);
+    let cx = 2u * word;
+    planes[params.offset.y + chroma_row * params.stride.y + word] =
+        pack16(cb0, cb1, cx, params.width.y);
+    planes[params.offset.z + chroma_row * params.stride.z + word] =
+        pack16(cr0, cr1, cx, params.width.z);
 }

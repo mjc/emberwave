@@ -1751,7 +1751,8 @@ fn the_apps_own_bgra_textures_are_encoded_as_rgb() {
     for (texture, says) in [
         (
             &srgb,
-            "not MTLPixelFormatBGRA8Unorm or MTLPixelFormatRGBA8Unorm",
+            "not MTLPixelFormatBGRA8Unorm, MTLPixelFormatRGBA8Unorm, \
+             MTLPixelFormatRGB10A2Unorm or MTLPixelFormatRGBA16Float",
         ),
         (&small, "rather than the picture's 192x136"),
     ] {

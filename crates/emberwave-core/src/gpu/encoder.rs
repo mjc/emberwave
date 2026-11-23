@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use crate::bitstream::consts::{DECOMPOSITION_LEVELS, HEADER_BYTES};
 use crate::bitstream::{ChromaSubsampling, Component, FrameLayout, SequenceHeader};
-use crate::color::{RgbOrder, check_rgb};
+use crate::color::{RgbFormat, RgbOrder, check_rgb_stride};
 use crate::encode::fdwt::sample_level;
 use crate::encode::{
     EncodeError, Signalling, check_planes, check_planes_u16, check_strided_planes,
@@ -124,16 +124,25 @@ pub enum TexturePicture<'a> {
         /// The Cb and Cr planes, interleaved.
         chroma: &'a wgpu::TextureView,
     },
-    /// The picture as R', G' and B', in one `Rgba8Unorm` or `Bgra8Unorm`
-    /// texture of the picture's size, as a screen capture holds it; alpha is
-    /// not read. The encoder converts it to Y'CbCr as it reads it, by the
-    /// matrix, range and chroma siting of its [`Signalling`], into the planes
-    /// that [`rgb_to_ycbcr8`](crate::color::rgb_to_ycbcr8) makes of the same
-    /// picture in CPU memory (decision D65). R', G' and B' are taken as the
-    /// texture stores them, with their transfer function: a texture of an
-    /// sRGB format, whose reads undo it, is not taken. Nor is a view of
-    /// another format to be: an sRGB view of an `Rgba8Unorm` texture would
-    /// undo it as well, and the encoder cannot tell a view's format.
+    /// The picture as R, G and B, in one `Rgba8Unorm`, `Bgra8Unorm`,
+    /// `Rgb10a2Unorm` or `Rgba16Float` texture of the picture's size, as a
+    /// capture surface holds it; alpha is not read.
+    ///
+    /// `Rgba8Unorm`, `Bgra8Unorm` and `Rgb10a2Unorm` carry non-linear R', G'
+    /// and B' as the texture stores them, converted to Y'CbCr by the matrix,
+    /// range and chroma siting of the encoder's [`Signalling`] (`8`-bit path
+    /// into [`rgb_to_ycbcr8`](crate::color::rgb_to_ycbcr8) or `16`-bit planes
+    /// for `Rgb10a2Unorm`). `Rgba16Float` carries linear scRGB (`1.0` = 80
+    /// nits): non-finite channels are replaced with zero before primary
+    /// conversion (subject to WGSL finite-math rules), BT.709-to-BT.2020
+    /// primary conversion is applied when [`Signalling::color_primaries`] is
+    /// BT.2020, negative components clamp to zero after primary conversion, and
+    /// the PQ or sRGB OETF is applied per [`Signalling::transfer_function`]
+    /// before converting to 16-bit Y'CbCr. An sRGB-format texture is not taken.
+    /// Nor may the view override the format to sRGB: an sRGB view of an
+    /// `Rgba8Unorm` or `Bgra8Unorm` texture would undo the transfer function on
+    /// reads, and the encoder validates the underlying texture format because it
+    /// cannot inspect a view's format.
     Rgb(&'a wgpu::TextureView),
 }
 
@@ -151,12 +160,11 @@ enum Input<'a> {
     Planes16Le([&'a [u8]; 3], [usize; 3]),
     /// In textures on the GPU.
     Textures(TexturePicture<'a>),
-    /// In CPU memory as R', G' and B': rows `stride` bytes apart of four
-    /// bytes a pixel in `order`.
+    /// In CPU memory as RGB pixels: rows `stride` bytes apart in `format`.
     Rgb {
         rgb: &'a [u8],
         stride: usize,
-        order: RgbOrder,
+        format: RgbFormat,
     },
 }
 
@@ -176,6 +184,11 @@ struct Planes16Resources {
     gather_planes: wgpu::Buffer,
     gather_luma_chroma: wgpu::Buffer,
     gather_grid: (u32, u32, u32),
+    /// `gather_rgb.wgsl`'s parameters for `Rgb10a2Unorm` and `Rgba16Float`,
+    /// and its 16-bit workgroup grid.
+    gather_rgb10: wgpu::Buffer,
+    gather_rgb16f: wgpu::Buffer,
+    gather_rgb16_grid: (u32, u32, u32),
     /// Forward-transform stages whose finest levels read from `planes`
     /// (`is_plane == 2`).
     fdwt_stages: Vec<FdwtStage>,
@@ -189,6 +202,7 @@ impl Planes16Resources {
         turns: Option<&QueueTurns>,
         frame_layout: &FrameLayout,
         buffers: &BufferLayout,
+        signalling: &Signalling,
         pyramid: &wgpu::Buffer,
         sample_levels: &wgpu::Buffer,
         pipelines: &EncoderPipelines,
@@ -221,6 +235,14 @@ impl Planes16Resources {
                 "gather r16 params, luma and chroma",
                 &GatherParams::new_u16(frame_layout, &layout, true),
             );
+            let rgb10_data = RgbGatherParams::new_16(frame_layout, &layout, signalling, false);
+            let gather_rgb10 = uniform_buffer(device, queue, "gather rgb10 params", &rgb10_data);
+            let gather_rgb16f = uniform_buffer(
+                device,
+                queue,
+                "gather rgb16f params",
+                &RgbGatherParams::new_16(frame_layout, &layout, signalling, true),
+            );
             let fdwt_stages = (0..DECOMPOSITION_LEVELS)
                 .map(|level| {
                     let stage = TransformLevel::new_u16(frame_layout, buffers, &layout, level);
@@ -248,6 +270,9 @@ impl Planes16Resources {
                 gather_planes,
                 gather_luma_chroma,
                 gather_grid: gather_planes_data.grid(),
+                gather_rgb10,
+                gather_rgb16f,
+                gather_rgb16_grid: rgb10_data.grid(frame_layout.chroma()),
                 fdwt_stages,
             }
         });
@@ -283,16 +308,18 @@ impl Planes16Resources {
         self.planes.destroy();
         self.gather_planes.destroy();
         self.gather_luma_chroma.destroy();
+        self.gather_rgb10.destroy();
+        self.gather_rgb16f.destroy();
     }
 }
 
 /// Where a picture in RGB in CPU memory goes on its way to the gather: a
 /// buffer the CPU writes it into, kept from frame to frame and mapped again
 /// before each, and the texture the encode copies it into, in the format of
-/// its order (decision D65). `Queue::write_texture` staged every picture in
+/// its pixels (decision D65). `Queue::write_texture` staged every picture in
 /// new memory of wgpu's, which cost a 4K picture 3.2 ms (issue #141).
 struct RgbUpload {
-    order: RgbOrder,
+    format: RgbFormat,
     /// The picture's rows, `row_bytes` apart, as a copy into a texture
     /// needs them.
     buffer: wgpu::Buffer,
@@ -304,21 +331,24 @@ struct RgbUpload {
 
 impl RgbUpload {
     /// The buffer, mapped, and the texture for pictures of `size` in
-    /// `order`.
+    /// `format`.
     fn new(
         device: &wgpu::Device,
-        order: RgbOrder,
+        format: RgbFormat,
         (width, height): (u32, u32),
     ) -> Result<Self, GpuError> {
-        let row_bytes = (4 * width).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let bpp = format.bytes_per_pixel() as u32;
+        let row_bytes = (bpp * width).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let bytes = u64::from(row_bytes) * u64::from(height);
         check_size(device, "the RGB picture's upload buffer", bytes)?;
-        let format = match order {
-            RgbOrder::Rgba => wgpu::TextureFormat::Rgba8Unorm,
-            RgbOrder::Bgra => wgpu::TextureFormat::Bgra8Unorm,
+        let texture_format = match format {
+            RgbFormat::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
+            RgbFormat::Bgra8 => wgpu::TextureFormat::Bgra8Unorm,
+            RgbFormat::Rgb10a2 => wgpu::TextureFormat::Rgb10a2Unorm,
+            RgbFormat::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
         };
         with_error_scope(device, || Self {
-            order,
+            format,
             buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rgb upload"),
                 size: bytes,
@@ -337,7 +367,7 @@ impl RgbUpload {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format,
+                format: texture_format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             }),
@@ -348,7 +378,10 @@ impl RgbUpload {
     /// mapped buffer.
     fn write(&self, rgb: &[u8], stride: usize) -> Result<(), GpuError> {
         let size = self.texture.size();
-        let (row, rows) = (4 * size.width as usize, size.height as usize);
+        let (row, rows) = (
+            self.format.bytes_per_pixel() * size.width as usize,
+            size.height as usize,
+        );
         let row_bytes = self.row_bytes as usize;
         let mut view = self
             .buffer
@@ -758,14 +791,17 @@ impl Encoder {
 
     /// Whether this encoder can read source textures in `format` via
     /// [`encode_textures`](Self::encode_textures). `R8Unorm`, `Rg8Unorm`,
-    /// `Rgba8Unorm`, and `Bgra8Unorm` are always supported; `R16Unorm` and
-    /// `Rg16Unorm` (P010) require [`wgpu::Features::TEXTURE_FORMAT_16BIT_NORM`].
+    /// `Rgba8Unorm`, `Bgra8Unorm`, `Rgb10a2Unorm` and `Rgba16Float` are always
+    /// supported; `R16Unorm` and `Rg16Unorm` (P010) require
+    /// [`wgpu::Features::TEXTURE_FORMAT_16BIT_NORM`].
     pub fn supports_source_format(&self, format: wgpu::TextureFormat) -> bool {
         match format {
             PLANE_FORMAT
             | wgpu::TextureFormat::Rg8Unorm
             | wgpu::TextureFormat::Rgba8Unorm
-            | wgpu::TextureFormat::Bgra8Unorm => true,
+            | wgpu::TextureFormat::Bgra8Unorm
+            | wgpu::TextureFormat::Rgb10a2Unorm
+            | wgpu::TextureFormat::Rgba16Float => true,
             PLANE_FORMAT_R16 => self.r16_source,
             CHROMA_FORMAT_RG16 => self.rg16_source,
             _ => false,
@@ -931,8 +967,31 @@ impl Encoder {
         order: RgbOrder,
         budget: usize,
     ) -> Result<Vec<u8>, GpuError> {
-        self.run_encode(Input::Rgb { rgb, stride, order }, budget, false, None)
-            .map(|(frame, _)| frame)
+        self.encode_rgb_with(rgb, stride, order.into(), budget)
+    }
+
+    /// Encodes a picture of RGB pixels in CPU memory in `format`, with rows
+    /// `stride` bytes apart, via the GPU RGB gather path (`Rgba8`/`Bgra8` into
+    /// 8-bit planes, `Rgb10a2`/`Rgba16Float` into 16-bit planes).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn encode_rgb_with(
+        &mut self,
+        rgb: &[u8],
+        stride: usize,
+        format: RgbFormat,
+        budget: usize,
+    ) -> Result<Vec<u8>, GpuError> {
+        self.run_encode(
+            Input::Rgb {
+                rgb,
+                stride,
+                format,
+            },
+            budget,
+            false,
+            None,
+        )
+        .map(|(frame, _)| frame)
     }
 
     /// Encodes like [`encode_rgb`](Self::encode_rgb) and says where the
@@ -946,7 +1005,29 @@ impl Encoder {
         order: RgbOrder,
         budget: usize,
     ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
-        self.run_encode(Input::Rgb { rgb, stride, order }, budget, true, None)
+        self.encode_rgb_with_timed(rgb, stride, order.into(), budget)
+    }
+
+    /// Encodes like [`encode_rgb_with`](Self::encode_rgb_with) and reports
+    /// per-stage timings.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn encode_rgb_with_timed(
+        &mut self,
+        rgb: &[u8],
+        stride: usize,
+        format: RgbFormat,
+        budget: usize,
+    ) -> Result<(Vec<u8>, EncodeTimings), GpuError> {
+        self.run_encode(
+            Input::Rgb {
+                rgb,
+                stride,
+                format,
+            },
+            budget,
+            true,
+            None,
+        )
     }
 
     fn run_encode(
@@ -996,8 +1077,12 @@ impl Encoder {
                 let (gather, is_16bit) = self.gather(picture)?;
                 (Some(gather), is_16bit)
             }
-            Input::Rgb { rgb, stride, order } => {
-                let view = self.upload_rgb(rgb, stride, order)?;
+            Input::Rgb {
+                rgb,
+                stride,
+                format,
+            } => {
+                let view = self.upload_rgb(rgb, stride, format)?;
                 let (gather, is_16bit) = self.gather(TexturePicture::Rgb(&view))?;
                 (Some(gather), is_16bit)
             }
@@ -1273,6 +1358,7 @@ impl Encoder {
                 self.turns.as_deref(),
                 &self.layout,
                 &self.buffers,
+                &self.signalling,
                 &self.pyramid,
                 &self.sample_levels,
                 &self.pipelines,
@@ -1358,7 +1444,7 @@ impl Encoder {
                 };
                 ([luma, chroma, chroma], is_16bit, true)
             }
-            TexturePicture::Rgb(view) => return self.gather_rgb(view).map(|g| (g, false)),
+            TexturePicture::Rgb(view) => return self.gather_rgb(view),
         };
 
         if !is_16bit {
@@ -1441,54 +1527,77 @@ impl Encoder {
         ))
     }
 
-    /// The pass that converts a picture in an RGB texture into the planes
-    /// buffer (decision D65), with the context's pipelines for it, built
-    /// now if no encoder of the context needed them before.
-    fn gather_rgb(&self, view: &wgpu::TextureView) -> Result<Gather, GpuError> {
+    /// The pass that converts a picture in an RGB texture into the 8-bit or
+    /// 16-bit planes buffer (decision D65), with the context's pipelines for it,
+    /// built now if no encoder of the context needed them before.
+    fn gather_rgb(&mut self, view: &wgpu::TextureView) -> Result<(Gather, bool), GpuError> {
         check_texture(
             view,
             "RGB",
             &RGB_FORMATS,
             self.layout.plane_size(Component::Y),
         )?;
+        let format = view.texture().format();
+        let is_16bit = matches!(
+            format,
+            wgpu::TextureFormat::Rgb10a2Unorm | wgpu::TextureFormat::Rgba16Float
+        );
+        if is_16bit {
+            self.ensure_planes16()?;
+        }
         let stages = self.rgb_pipelines.get(&self.device)?;
-        let stage = stages.for_chroma(self.layout.chroma());
+        let stage = stages.for_chroma(self.layout.chroma(), is_16bit);
+        let (planes_buf, params_buf, grid) = if is_16bit {
+            let planes16 = self.planes16.as_ref().expect("made above");
+            let params = if format == wgpu::TextureFormat::Rgba16Float {
+                &planes16.gather_rgb16f
+            } else {
+                &planes16.gather_rgb10
+            };
+            (&planes16.planes, params, planes16.gather_rgb16_grid)
+        } else {
+            (&self.planes, &self.gather_rgb, self.gather_rgb_grid)
+        };
         let bind_group = with_error_scope(&self.device, || {
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("gather rgb"),
+                label: Some(if is_16bit {
+                    "gather rgb16"
+                } else {
+                    "gather rgb"
+                }),
                 layout: &stage.layout,
-                entries: &[
-                    entry(0, &self.planes),
-                    entry(1, &self.gather_rgb),
-                    texture(2, view),
-                ],
+                entries: &[entry(0, planes_buf), entry(1, params_buf), texture(2, view)],
             })
         })?;
-        Ok(Gather {
-            pipeline: stage.pipeline.clone(),
-            bind_group,
-            grid: self.gather_rgb_grid,
-        })
+        Ok((
+            Gather {
+                pipeline: stage.pipeline.clone(),
+                bind_group,
+                grid,
+            },
+            is_16bit,
+        ))
     }
 
-    /// Writes a picture of R', G' and B' in CPU memory into the buffer the
-    /// encoder keeps for it, which [`encode_rgb_upload`](Self::encode_rgb_upload)
-    /// copies into its texture, and returns a view of the texture, or an
-    /// error if the bytes do not hold the picture.
+    /// Writes a picture of RGB pixels in CPU memory into the buffer the encoder
+    /// keeps for it, which [`encode_rgb_upload`](Self::encode_rgb_upload) copies
+    /// into its texture, and returns a view of the texture, or an error if the
+    /// bytes do not hold the picture.
     fn upload_rgb(
         &mut self,
         rgb: &[u8],
         stride: usize,
-        order: RgbOrder,
+        format: RgbFormat,
     ) -> Result<wgpu::TextureView, GpuError> {
         let size = self.layout.plane_size(Component::Y);
-        check_rgb(rgb.len(), stride, size.0, size.1).map_err(EncodeError::Picture)?;
+        check_rgb_stride(rgb.len(), stride, size.0, size.1, format.bytes_per_pixel())
+            .map_err(EncodeError::Picture)?;
         if self
             .rgb_upload
             .as_ref()
-            .is_none_or(|upload| upload.order != order)
+            .is_none_or(|upload| upload.format != format)
         {
-            let made = RgbUpload::new(&self.device, order, size)?;
+            let made = RgbUpload::new(&self.device, format, size)?;
             if let Some(old) = self.rgb_upload.replace(made) {
                 old.destroy();
             }
@@ -1830,9 +1939,11 @@ const CHROMA_FORMATS: [wgpu::TextureFormat; 2] =
     [wgpu::TextureFormat::Rg8Unorm, CHROMA_FORMAT_RG16];
 
 /// The formats of the textures of [`TexturePicture::Rgb`].
-const RGB_FORMATS: [wgpu::TextureFormat; 2] = [
+const RGB_FORMATS: [wgpu::TextureFormat; 4] = [
     wgpu::TextureFormat::Rgba8Unorm,
     wgpu::TextureFormat::Bgra8Unorm,
+    wgpu::TextureFormat::Rgb10a2Unorm,
+    wgpu::TextureFormat::Rgba16Float,
 ];
 
 /// An error unless the texture of `view` can hold a plane of `width` x

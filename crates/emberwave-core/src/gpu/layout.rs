@@ -548,7 +548,8 @@ impl GatherParams {
     }
 }
 
-/// Uniform block of `gather_rgb.wgsl` (decision D65).
+/// Uniform block of `gather_rgb.wgsl` (decision D65, extended for 10-bit / HDR
+/// capture inputs into [`Planes16Layout`]).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub(crate) struct RgbGatherParams {
@@ -559,15 +560,25 @@ pub(crate) struct RgbGatherParams {
     pub offset: [u32; 4],
     pub stride: [u32; 4],
     /// [`ForwardMatrix`]'s rows for Y, Cb and Cr: the factors of R', G' and
-    /// B', and the offset.
+    /// B', and the offset (8-bit path).
     pub rows: [[i32; 4]; 3],
     /// 1 where 4:2:0's chroma is sited on the left.
     pub left: u32,
-    pub pad: [u32; 3],
+    /// 0 for non-linear 10-bit (`Rgb10a2Unorm`), 1 for linear scRGB
+    /// (`Rgba16Float`). Unused by the 8-bit entry points.
+    pub mode: u32,
+    /// 1 when linear scRGB input should convert BT.709 primaries to BT.2020.
+    pub gamut_bt2020: u32,
+    /// 1 when linear scRGB input uses SMPTE ST 2084 PQ OETF, 0 for sRGB OETF.
+    pub transfer_pq: u32,
+    /// `[kr, kb, 0.5 / (1 - kb), 0.5 / (1 - kr)]` for 16-bit float conversion.
+    pub luma_chroma: [f32; 4],
+    /// `[luma_offset, luma_scale, chroma_offset, chroma_scale]` in `[0, 65535]`.
+    pub range_16: [f32; 4],
 }
 
 impl RgbGatherParams {
-    /// The parameters for pictures of `layout` converted as `color` says.
+    /// The parameters for 8-bit pictures of `layout` converted as `color` says.
     pub(crate) fn new(layout: &FrameLayout, buffers: &BufferLayout, color: &ColorParams) -> Self {
         let planes = GatherParams::new(layout, buffers, false);
         let forward = ForwardMatrix::new(color.matrix, color.range);
@@ -587,7 +598,52 @@ impl RgbGatherParams {
                 [r, g, b, forward.offsets[i]]
             }),
             left: u32::from(color.chroma_siting == ChromaSiting::Left),
-            pad: [0; 3],
+            mode: 0,
+            gamut_bt2020: 0,
+            transfer_pq: 0,
+            luma_chroma: [0.0; 4],
+            range_16: [0.0; 4],
+        }
+    }
+
+    /// The parameters for 10-bit / HDR RGB textures converted into 16-bit UNORM
+    /// planes of `planes16` using `signalling`.
+    pub(crate) fn new_16(
+        layout: &FrameLayout,
+        planes16: &Planes16Layout,
+        signalling: &crate::encode::Signalling,
+        is_fp16: bool,
+    ) -> Self {
+        use crate::bitstream::{ColorPrimaries, TransferFunction, YcbcrRange};
+
+        let planes = GatherParams::new_u16(layout, planes16, false);
+        debug_assert!(
+            layout.chroma() == ChromaSubsampling::Yuv444
+                || planes.stride[0] <= 2 * planes.stride[1]
+        );
+        let color = signalling.color_params();
+        let (kr, kb) = color.matrix.luma_weights();
+        let range_16 = match color.range {
+            YcbcrRange::Limited => [4096.0, 56064.0, 32768.0, 57344.0],
+            YcbcrRange::Full => [0.0, 65535.0, 32768.0, 65535.0],
+        };
+        Self {
+            width: planes.width,
+            height: planes.height,
+            offset: planes.offset,
+            stride: planes.stride,
+            rows: [[0; 4]; 3],
+            left: u32::from(color.chroma_siting == ChromaSiting::Left),
+            mode: u32::from(is_fp16),
+            gamut_bt2020: u32::from(signalling.color_primaries == ColorPrimaries::Bt2020),
+            transfer_pq: u32::from(signalling.transfer_function == TransferFunction::Pq),
+            luma_chroma: [
+                kr as f32,
+                kb as f32,
+                (0.5 / (1.0 - kb)) as f32,
+                (0.5 / (1.0 - kr)) as f32,
+            ],
+            range_16,
         }
     }
 
@@ -1127,6 +1183,40 @@ mod tests {
             (p.chroma_420, p.chroma_width, p.chroma_height),
             (0, 131, 67)
         );
+    }
+
+    #[test]
+    fn rgb16_gather_params_match_16bit_plane_layout() {
+        use crate::bitstream::{ColorPrimaries, TransferFunction, YcbcrRange, YcbcrTransform};
+
+        assert_eq!(std::mem::size_of::<RgbGatherParams>(), 160);
+        let signalling = crate::encode::Signalling {
+            color_primaries: ColorPrimaries::Bt2020,
+            transfer_function: TransferFunction::Pq,
+            ycbcr_transform: YcbcrTransform::Bt2020,
+            ycbcr_range: YcbcrRange::Limited,
+            chroma_siting: ChromaSiting::Left,
+        };
+        for chroma in [ChromaSubsampling::Yuv420, ChromaSubsampling::Yuv444] {
+            let layout = FrameLayout::new(66, 34, chroma).unwrap();
+            let p16 = Planes16Layout::new(&layout).unwrap();
+            let params = RgbGatherParams::new_16(&layout, &p16, &signalling, true);
+            assert_eq!(&params.stride[..3], &p16.packed_strides);
+            assert_eq!(&params.offset[..3], &p16.packed_offsets);
+            assert_eq!(
+                (
+                    params.mode,
+                    params.gamut_bt2020,
+                    params.transfer_pq,
+                    params.left
+                ),
+                (1, 1, 1, 1)
+            );
+            assert_eq!(params.range_16, [4096.0, 56064.0, 32768.0, 57344.0]);
+            if chroma == ChromaSubsampling::Yuv420 {
+                assert!(params.stride[0] <= 2 * params.stride[1]);
+            }
+        }
     }
 
     proptest::proptest! {

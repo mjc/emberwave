@@ -940,12 +940,12 @@ fn rgb_pictures_that_do_not_fit_are_errors() {
     let cases = [
         (
             view(wgpu::TextureFormat::R8Unorm, (64, 32)),
-            "the RGB texture is R8Unorm rather than Rgba8Unorm or Bgra8Unorm",
+            "the RGB texture is R8Unorm rather than Rgba8Unorm or Bgra8Unorm or Rgb10a2Unorm or Rgba16Float",
         ),
         // Its reads would undo the transfer function.
         (
             view(wgpu::TextureFormat::Bgra8UnormSrgb, (64, 32)),
-            "the RGB texture is Bgra8UnormSrgb rather than Rgba8Unorm or Bgra8Unorm",
+            "the RGB texture is Bgra8UnormSrgb rather than Rgba8Unorm or Bgra8Unorm or Rgb10a2Unorm or Rgba16Float",
         ),
         (
             view(wgpu::TextureFormat::Rgba8Unorm, (32, 32)),
@@ -1626,4 +1626,242 @@ fn encoding_u16_frame_after_frame_allocates_nothing() {
         before,
         "live GPU objects and memory"
     );
+}
+
+#[test]
+fn hdr_rgb10a2_and_rgba16f_capture_encode_and_roundtrip() {
+    use emberwave_core::bitstream::{
+        ChromaSiting, ColorPrimaries, TransferFunction, YcbcrRange, YcbcrTransform,
+    };
+    use emberwave_core::color::{RgbFormat, rgb10a2_to_ycbcr16, rgba16f_to_ycbcr16};
+    use emberwave_core::gpu::Decoder;
+
+    let f32_to_f16 = |value: f32| -> u16 {
+        let bits = value.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = ((bits >> 23) & 0xff) as i32;
+        let frac = bits & 0x007f_ffff;
+        if exp == 0xff {
+            let payload = if frac != 0 { (frac >> 13).max(1) } else { 0 };
+            return sign | 0x7c00 | (payload as u16);
+        }
+        let new_exp = exp - 127 + 15;
+        if new_exp >= 31 {
+            return sign | 0x7c00;
+        }
+        if new_exp <= 0 {
+            if new_exp < -10 {
+                return sign;
+            }
+            let mant = (frac | 0x0080_0000) >> (1 - new_exp + 13);
+            return sign | (mant as u16);
+        }
+        sign | ((new_exp as u16) << 10) | ((frac >> 13) as u16)
+    };
+
+    let context = gpu_or_return!();
+    assert!(context.supports_source_format(wgpu::TextureFormat::Rgb10a2Unorm));
+    assert!(context.supports_source_format(wgpu::TextureFormat::Rgba16Float));
+
+    let mut hdr = Signalling::default();
+    hdr.color_primaries = ColorPrimaries::Bt2020;
+    hdr.transfer_function = TransferFunction::Pq;
+    hdr.ycbcr_transform = YcbcrTransform::Bt2020;
+    hdr.ycbcr_range = YcbcrRange::Limited;
+    hdr.chroma_siting = ChromaSiting::Center;
+    let layout = FrameLayout::new(192, 136, ChromaSubsampling::Yuv420).unwrap();
+
+    // Smooth 10-bit ramp (differs between 8-bit and 10-bit).
+    let (w, h) = (layout.width(), layout.height());
+    let mut rgb10 = Vec::with_capacity((w * h * 4) as usize);
+    let mut rgb8 = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let r10 = (x * 1023) / (w - 1);
+            let g10 = (y * 1023) / (h - 1);
+            let b10 = ((x + y) * 511) / (w + h - 2);
+            let word = r10 | (g10 << 10) | (b10 << 20) | (3 << 30);
+            rgb10.extend_from_slice(&word.to_le_bytes());
+            rgb8.extend_from_slice(&[
+                ((r10 * 255 + 511) / 1023) as u8,
+                ((g10 * 255 + 511) / 1023) as u8,
+                ((b10 * 255 + 511) / 1023) as u8,
+                255,
+            ]);
+        }
+    }
+
+    // 1) CPU RGB upload matches GPU Rgb10a2Unorm texture encode bit-for-bit.
+    let mut enc_tex = Encoder::new(context, w, h, ChromaSubsampling::Yuv420, hdr).unwrap();
+    let mut enc_cpu = Encoder::new(context, w, h, ChromaSubsampling::Yuv420, hdr).unwrap();
+    let tex10 = texture(
+        context,
+        wgpu::TextureFormat::Rgb10a2Unorm,
+        wgpu::TextureUsages::TEXTURE_BINDING,
+        (w, h),
+        &rgb10,
+    );
+    let view10 = tex10.create_view(&Default::default());
+    let frame10_tex = enc_tex
+        .encode_textures(TexturePicture::Rgb(&view10), 80_000)
+        .unwrap();
+    let frame10_cpu = enc_cpu
+        .encode_rgb_with(&rgb10, w as usize * 4, RgbFormat::Rgb10a2, 80_000)
+        .unwrap();
+    assert_eq!(frame10_tex, frame10_cpu);
+
+    // 2) Rgb10a2 -> R16Unorm decode roundtrip achieves >60 dB PSNR against CPU
+    // 16-bit conversion and beats 8-bit Rgba8Unorm.
+    let src16_ref = rgb10a2_to_ycbcr16(
+        &rgb10,
+        w as usize * 4,
+        w,
+        h,
+        ChromaSubsampling::Yuv420,
+        &hdr.color_params(),
+    )
+    .unwrap();
+    if context.supports_plane_format(emberwave_core::gpu::PLANE_FORMAT_R16) {
+        let mut enc8 = Encoder::new(context, w, h, ChromaSubsampling::Yuv420, hdr).unwrap();
+        let frame8 = enc8
+            .encode_rgb(&rgb8, w as usize * 4, RgbOrder::Rgba, 80_000)
+            .unwrap();
+        let mut decoder = Decoder::new(context, w, h, ChromaSubsampling::Yuv420).unwrap();
+        let out_tex = Component::ALL.map(|c| {
+            decoder
+                .create_plane_texture_with_format(c, emberwave_core::gpu::PLANE_FORMAT_R16)
+                .unwrap()
+        });
+        let out_views: [_; 3] =
+            std::array::from_fn(|i| out_tex[i].create_view(&Default::default()));
+        let decode_u16 = |dec: &mut Decoder, frame: &[u8]| -> [Vec<u16>; 3] {
+            dec.clear();
+            dec.push_packet(frame).unwrap();
+            dec.decode_assembled_to_plane_textures([&out_views[0], &out_views[1], &out_views[2]])
+                .unwrap();
+            std::array::from_fn(|i| read_u16_texture(context, &out_tex[i]))
+        };
+        let dec10 = decode_u16(&mut decoder, &frame10_tex);
+        let dec8 = decode_u16(&mut decoder, &frame8);
+        let psnr16_fn = |a: &[u16], b: &[u16]| -> f64 {
+            let mse = a
+                .iter()
+                .zip(b)
+                .map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2))
+                .sum::<f64>()
+                / a.len() as f64;
+            10.0 * (65535.0 * 65535.0 / mse.max(1e-12)).log10()
+        };
+        let psnr10 = (0..3)
+            .map(|i| psnr16_fn(&src16_ref[i], &dec10[i]))
+            .fold(f64::INFINITY, f64::min);
+        let psnr8 = (0..3)
+            .map(|i| psnr16_fn(&src16_ref[i], &dec8[i]))
+            .fold(f64::INFINITY, f64::min);
+        assert!(psnr10 > 60.0, "Rgb10a2 roundtrip PSNR {psnr10:.2} dB");
+        assert!(
+            psnr10 > psnr8 + 5.0,
+            "Rgb10a2 ({psnr10:.2} dB) must beat 8-bit ({psnr8:.2} dB)"
+        );
+    }
+
+    // 3) Linear scRGB Rgba16Float: BT.2020 + PQ and stride validation (8 bpp).
+    let mut fp16 = Vec::with_capacity((w * h * 8) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let nit_scale = 0.01 + ((x + y) as f32 / (w + h - 2) as f32) * 124.99;
+            let px = [
+                nit_scale,
+                nit_scale * 0.5,
+                if x % 5 == 0 { -0.25 } else { nit_scale * 0.25 },
+                1.0,
+            ];
+            for c in px {
+                fp16.extend_from_slice(&f32_to_f16(c).to_le_bytes());
+            }
+        }
+    }
+    let _cpu16f_planes = rgba16f_to_ycbcr16(
+        &fp16,
+        w as usize * 8,
+        w,
+        h,
+        ChromaSubsampling::Yuv420,
+        hdr.color_primaries,
+        hdr.transfer_function,
+        &hdr.color_params(),
+    )
+    .unwrap();
+    let tex16f = texture(
+        context,
+        wgpu::TextureFormat::Rgba16Float,
+        wgpu::TextureUsages::TEXTURE_BINDING,
+        (w, h),
+        &fp16,
+    );
+    let view16f = tex16f.create_view(&Default::default());
+    let (frame16f_tex, timings) = enc_tex
+        .encode_textures_timed(TexturePicture::Rgb(&view16f), 80_000)
+        .unwrap();
+    assert_encode_timings(context, &timings);
+    let frame16f_cpu = enc_cpu
+        .encode_rgb_with(&fp16, w as usize * 8, RgbFormat::Rgba16Float, 80_000)
+        .unwrap();
+    assert_eq!(sequence_of(&frame16f_tex), 2);
+    assert!(frame16f_tex.len() <= 80_000);
+    assert_eq!(frame16f_cpu, frame16f_tex);
+
+    // Stride smaller than 8 * width for Rgba16Float is rejected cleanly.
+    match enc_cpu.encode_rgb_with(&fp16, w as usize * 8 - 1, RgbFormat::Rgba16Float, 80_000) {
+        Err(GpuError::Encode(EncodeError::Picture(ColorError::StrideTooSmall { stride, row }))) => {
+            assert_eq!(stride, w as usize * 8 - 1);
+            assert_eq!(row, u64::from(w) * 8);
+        }
+        other => panic!("bad fp16 stride: {:?}", other.map(drop)),
+    }
+
+    // 4) Works on a strict WebGPU context without TEXTURE_FORMAT_16BIT_NORM,
+    // and allocates zero per-frame GPU resources after warmup.
+    let mut strict_opts = common::options();
+    strict_opts.strict_webgpu = true;
+    strict_opts.timestamps = false;
+    if let Some(strict) = create_context(&strict_opts) {
+        assert!(strict.supports_source_format(wgpu::TextureFormat::Rgb10a2Unorm));
+        assert!(strict.supports_source_format(wgpu::TextureFormat::Rgba16Float));
+        let mut strict_enc = Encoder::new(&strict, w, h, ChromaSubsampling::Yuv420, hdr).unwrap();
+        let strict_tex10 = texture(
+            &strict,
+            wgpu::TextureFormat::Rgb10a2Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING,
+            (w, h),
+            &rgb10,
+        )
+        .create_view(&Default::default());
+        let strict_tex16f = texture(
+            &strict,
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureUsages::TEXTURE_BINDING,
+            (w, h),
+            &fp16,
+        )
+        .create_view(&Default::default());
+        for round in 0..4 {
+            if round % 2 == 0 {
+                strict_enc.encode_textures(TexturePicture::Rgb(&strict_tex10), 80_000)
+            } else {
+                strict_enc.encode_textures(TexturePicture::Rgb(&strict_tex16f), 80_000)
+            }
+            .unwrap();
+        }
+        let before = live_resources(&strict);
+        for round in 0..16 {
+            if round % 2 == 0 {
+                strict_enc.encode_textures(TexturePicture::Rgb(&strict_tex10), 80_000)
+            } else {
+                strict_enc.encode_textures(TexturePicture::Rgb(&strict_tex16f), 80_000)
+            }
+            .unwrap();
+        }
+        assert_eq!(live_resources(&strict), before);
+    }
 }

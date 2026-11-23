@@ -167,35 +167,44 @@ pub(crate) struct ScanStages {
     pub add: Stage,
 }
 
-/// The entry points of `gather_rgb.wgsl`, for 4:4:4 and 4:2:0, which share
-/// one bind group layout: an encoder's input from an RGB texture (decision
-/// D65). A context compiles them when one of its encoders first takes such a
-/// picture, as most never do.
+/// The entry points of `gather_rgb.wgsl`, for 8-bit and 16-bit 4:4:4 and 4:2:0,
+/// which share one bind group layout: an encoder's input from an RGB texture
+/// (decision D65). A context compiles them when one of its encoders first takes
+/// such a picture, as most never do.
 #[derive(Debug)]
 pub(crate) struct RgbStages {
     pub yuv444: Stage,
     pub yuv420: Stage,
+    pub yuv444_16: Stage,
+    pub yuv420_16: Stage,
 }
 
 impl RgbStages {
     pub(crate) fn new(device: &wgpu::Device) -> Result<Self, GpuError> {
         with_error_scope(device, || {
-            let [yuv444, yuv420] = create_stages(
+            let [yuv444, yuv420, yuv444_16, yuv420_16] = create_stages(
                 device,
                 "gather rgb",
                 shader_sources::GATHER_RGB,
-                ["yuv444", "yuv420"],
+                ["yuv444", "yuv420", "yuv444_16", "yuv420_16"],
                 &[storage_entry(0, false), uniform_entry(1), texture_entry(2)],
             );
-            Self { yuv444, yuv420 }
+            Self {
+                yuv444,
+                yuv420,
+                yuv444_16,
+                yuv420_16,
+            }
         })
     }
 
-    /// The stage for pictures of `chroma`.
-    pub(crate) fn for_chroma(&self, chroma: ChromaSubsampling) -> &Stage {
-        match chroma {
-            ChromaSubsampling::Yuv444 => &self.yuv444,
-            ChromaSubsampling::Yuv420 => &self.yuv420,
+    /// The stage for pictures of `chroma` and bit depth (`is_16bit`).
+    pub(crate) fn for_chroma(&self, chroma: ChromaSubsampling, is_16bit: bool) -> &Stage {
+        match (chroma, is_16bit) {
+            (ChromaSubsampling::Yuv444, false) => &self.yuv444,
+            (ChromaSubsampling::Yuv420, false) => &self.yuv420,
+            (ChromaSubsampling::Yuv444, true) => &self.yuv444_16,
+            (ChromaSubsampling::Yuv420, true) => &self.yuv420_16,
         }
     }
 }
