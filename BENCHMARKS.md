@@ -519,3 +519,87 @@ node scripts/chrome_codecs.mjs summary    # the tables above; `report` lists eve
 ```
 
 It needs Google Chrome (the `CHROME` variable names another binary), Node 20 or later and numpy. Every run has a Chrome of its own, with a mock keychain and a profile of its own, and its page is served on 127.0.0.1 only; Chrome and its profile are removed at the end of the run, when it times out, and on SIGINT and SIGTERM.
+
+## 4K 10-bit HDR10 decode baseline
+
+Measures end-to-end 4K (`3840x2160`, 4:2:0, BT.2020/PQ, `reference_bit_depth=10`) frame decode into GPU plane textures with per-stage CPU and GPU timestamp breakdown across streaming bitrates (`50–350 Mbps`).
+
+```sh
+scripts/bench_4k10.sh                         # local GPU, 120 frames per stream
+scripts/bench_4k10.sh --low-power             # select integrated GPU (RADV / iGPU)
+scripts/bench_4k10.sh --android-serial SERIAL --frames 60
+```
+
+`emberwave-cli gen-stream` writes five 60-frame deterministic synthetic `.pwv1` streams at `60 fps`: `idle` (`50 Mbps`, `104.1 kB/frame`), `scene` (`50`, `150`, and `350 Mbps`; `104.1`, `312.4`, and `729.1 kB/frame`), and `high-motion` (`350 Mbps`, `729.1 kB/frame`). `emberwave-cli bench` decodes single frames back-to-back with no display loop or network packetization (`QueueTurns` wait stays ~`0.000 ms` without concurrent queue callers).
+
+Measured on 2026-11-22:
+
+| Device | Adapter | OS / Driver / API | Notes |
+|---|---|---|---|
+| NVIDIA Shield TV (`mdarcy`) | NVIDIA Tegra X1 (rev B) (`nvgpu`) | Android 11, Vulkan `1.1.178`, `EMBERWAVE_ANDROID_API=24` | No `SHADER_F16`, no timeline semaphores; `60` frames/run after ~`46–74` warmup frames |
+| Workstation (`x86_64`) | AMD Radeon 760M Graphics (`RADV PHOENIX`) | Linux `7.3.4`, Vulkan via `--low-power`, `rustc 1.99.0` | `120` frames/run after `~1 s` warmup (`227–336` frames) |
+| Workstation (`x86_64`) | NVIDIA Quadro P2000 | Linux `6.18.63`, NVIDIA driver `580.196.07`, Vulkan | `120` frames/run after `~1 s` warmup (`248–308` frames) |
+| Apple Silicon (`arm64`) | Apple M1 | macOS `27.3`, Metal (`shared_uploads=true`) | `120` frames/run after `~1 s` warmup (`138–207` frames) |
+
+### Decode to `R16Unorm` planes (mean / percentiles, ms per frame)
+
+Vulkan rows use `--output r16 --upload queue --queue-turns`; Apple M1 shows both `--upload queue --queue-turns` and `--upload mapped` (direct shared-memory write). Shield TV `scene` rows were measured uncontended with the GPU idle; `idle` (`50 Mbps`) and `high-motion` (`350 Mbps`) timestamp `p50` values below come from a subsequent `--warmup-seconds 3.0` run where Tegra clocks were warmed (a concurrent player on the device shared GPU wall time during that second pass).
+
+| Device | Stream (`Mbps`) | total mean | p50 | p95 | p99 | min | max | asm mean | upl mean | sub mean | gpu wall mean | gpu ts mean | dequant mean | idwt mean |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Shield TV (Tegra X1) | `scene` `50` | 18.422 | 18.229 | 19.480 | 20.703 | 17.953 | 20.703 | 0.115 | 0.117 | 0.445 | 18.119 | 17.584 | 8.237 | 9.346 |
+| Shield TV (Tegra X1) | `scene` `150` | 18.838 | 18.612 | 19.660 | 23.881 | 18.406 | 23.881 | 0.273 | 0.222 | 0.538 | 18.262 | 17.571 | 8.290 | 9.280 |
+| Shield TV (Tegra X1) | `scene` `350` | 19.886 | 19.506 | 21.156 | 27.606 | 19.167 | 27.606 | 0.480 | 0.468 | 0.508 | 18.867 | 18.172 | 8.474 | 9.698 |
+| Radeon 760M (`RADV`) | `idle` `50` | 2.906 | 2.890 | 3.209 | 3.342 | 2.620 | 3.376 | 0.058 | 0.014 | 0.059 | 2.825 | 2.700 | 0.889 | 1.811 |
+| Radeon 760M (`RADV`) | `scene` `50` | 3.015 | 3.020 | 3.395 | 3.472 | 2.630 | 3.563 | 0.051 | 0.016 | 0.065 | 2.938 | 2.804 | 0.943 | 1.861 |
+| Radeon 760M (`RADV`) | `scene` `150` | 3.104 | 3.086 | 3.442 | 3.648 | 2.731 | 3.706 | 0.090 | 0.023 | 0.064 | 2.982 | 2.818 | 0.956 | 1.862 |
+| Radeon 760M (`RADV`) | `scene` `350` | 3.137 | 3.128 | 3.345 | 3.388 | 2.858 | 3.413 | 0.144 | 0.034 | 0.060 | 2.950 | 2.761 | 0.949 | 1.812 |
+| Radeon 760M (`RADV`) | `high-motion` `350` | 2.865 | 2.863 | 2.937 | 2.975 | 2.698 | 3.101 | 0.153 | 0.028 | 0.062 | 2.676 | 2.477 | 0.793 | 1.683 |
+| Quadro P2000 | `idle` `50` | 3.216 | 3.196 | 3.243 | 3.318 | 3.170 | 4.999 | 0.023 | 0.023 | 0.071 | 3.162 | 3.051 | 1.881 | 1.170 |
+| Quadro P2000 | `scene` `50` | 3.190 | 3.187 | 3.206 | 3.226 | 3.172 | 3.320 | 0.021 | 0.023 | 0.050 | 3.138 | 3.046 | 1.874 | 1.172 |
+| Quadro P2000 | `scene` `150` | 3.296 | 3.284 | 3.388 | 3.435 | 3.238 | 3.586 | 0.069 | 0.049 | 0.079 | 3.165 | 3.034 | 1.866 | 1.167 |
+| Quadro P2000 | `scene` `350` | 3.478 | 3.464 | 3.623 | 3.669 | 3.360 | 3.681 | 0.157 | 0.089 | 0.095 | 3.215 | 3.045 | 1.878 | 1.167 |
+| Quadro P2000 | `high-motion` `350` | 3.555 | 3.543 | 3.719 | 3.759 | 3.357 | 3.765 | 0.195 | 0.093 | 0.108 | 3.247 | 3.058 | 1.890 | 1.168 |
+| Apple M1 (`queue`) | `idle` `50` | 5.772 | 5.778 | 6.094 | 6.433 | 5.014 | 7.216 | 0.072 | 0.393 | 0.268 | 5.270 | 4.182 | 1.154 | 3.027 |
+| Apple M1 (`queue`) | `scene` `150` | 6.142 | 6.118 | 6.653 | 6.972 | 5.366 | 6.985 | 0.154 | 0.498 | 0.279 | 5.448 | 4.298 | 1.252 | 3.046 |
+| Apple M1 (`queue`) | `high-motion` `350` | 6.616 | 6.527 | 7.455 | 7.847 | 5.996 | 8.904 | 0.199 | 0.661 | 0.291 | 5.717 | 4.569 | 1.539 | 3.029 |
+| Apple M1 (`mapped`) | `idle` `50` | 4.863 | 4.705 | 5.866 | 9.885 | 3.768 | 13.193 | 0.060 | 0.023 | 0.232 | 4.749 | 3.941 | 1.096 | 2.844 |
+| Apple M1 (`mapped`) | `scene` `150` | 5.232 | 5.276 | 5.516 | 6.094 | 4.235 | 6.420 | 0.153 | 0.042 | 0.248 | 5.004 | 4.227 | 1.215 | 3.012 |
+| Apple M1 (`mapped`) | `high-motion` `350` | 4.952 | 4.795 | 5.818 | 6.679 | 3.952 | 8.252 | 0.180 | 0.062 | 0.248 | 4.676 | 3.950 | 1.352 | 2.598 |
+
+### Per-level `idwt` and `r16` vs `r8` plane store (`scene_4k10_150mbps`)
+
+`r16` writes `R16Unorm` plane textures directly in level 0 (`idwt_planes_r16.wgsl`). On Vulkan, `r8` packs level 0 into a staging buffer (`idwt_packed.wgsl`) and copies into `R8Unorm` textures (`gpu wall` includes that `copy_buffer_to_texture` step outside the compute pass timestamps). On Metal (`idwt_planes.wgsl`), both `r16` and `r8` store directly into textures.
+
+| Device | Output | total mean | p50 | gpu wall mean | gpu ts mean | dequant | idwt | L4 | L3 | L2 | L1 | L0 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Shield TV (Tegra X1) | `r16` (uncontended) | 18.838 | 18.612 | 18.262 | 17.571 | 8.290 | 9.280 | — | — | — | — | — |
+| Shield TV (Tegra X1) | `r16` (`--per-level`, `ts` `p50`) | — | — | — | 17.966 | 8.260 | 9.692 | 0.076 | 0.235 | 0.909 | 3.754 | 4.701 |
+| Shield TV (Tegra X1) | `r8` (uncontended) | 19.517 | 18.445 | 18.992 | 16.525 | 8.534 | 7.991 | — | — | — | — | — |
+| Shield TV (Tegra X1) | `r8` (`--per-level`, `ts` `p50`) | — | — | — | 16.001 | 8.260 | 7.744 | 0.076 | 0.232 | 0.901 | 2.998 | 3.500 |
+| Radeon 760M (`RADV`) | `r16` | 3.104 | 3.086 | 2.982 | 2.818 | 0.956 | 1.862 | — | — | — | — | — |
+| Radeon 760M (`RADV`) | `r16` (`--per-level`) | 2.866 | 2.862 | 2.754 | 2.549 | 0.851 | 1.698 | 0.009 | 0.040 | 0.187 | 0.658 | 0.804 |
+| Radeon 760M (`RADV`) | `r8` | 3.698 | 3.670 | 3.618 | 2.721 | 1.013 | 1.708 | — | — | — | — | — |
+| Radeon 760M (`RADV`) | `r8` (`--per-level`) | 3.457 | 3.446 | 3.376 | 2.499 | 0.939 | 1.561 | 0.009 | 0.041 | 0.193 | 0.621 | 0.696 |
+| Quadro P2000 | `r16` (`--per-level`) | 3.298 | 3.296 | 3.188 | 3.050 | 1.867 | 1.182 | 0.016 | 0.037 | 0.120 | 0.437 | 0.573 |
+| Quadro P2000 | `r8` (`--per-level`) | 3.637 | 3.577 | 3.505 | 2.995 | 1.868 | 1.127 | 0.016 | 0.037 | 0.121 | 0.422 | 0.532 |
+| Apple M1 | `r16` (`--per-level`) | 6.177 | 6.022 | 5.630 | 4.336 | 1.281 | 3.055 | 0.040 | 0.096 | 0.314 | 1.136 | 1.468 |
+| Apple M1 | `r8` (`--per-level`) | 6.156 | 6.137 | 5.569 | 4.274 | 1.241 | 3.032 | 0.040 | 0.095 | 0.298 | 1.131 | 1.468 |
+
+### Upload path comparison (`mapped` vs `queue.write_buffer`, `scene_4k10_150mbps`)
+
+| Device | Backend | `shared_uploads` | `queue` total / upl | `mapped` total / upl | Difference (`mapped - queue`) |
+|---|---|---|---|---|---|
+| Shield TV (Tegra X1) | Vulkan | `false` | 18.838 / 0.222 | 19.306 / 0.232 | +0.468 ms |
+| Radeon 760M (`RADV`) | Vulkan | `false` | 3.104 / 0.023 | 3.211 / 0.019 | +0.107 ms |
+| Quadro P2000 | Vulkan | `false` | 3.296 / 0.049 | 3.288 / 0.036 | -0.008 ms |
+| Apple M1 | Metal | `true` | 6.142 / 0.498 | 5.232 / 0.042 | -0.910 ms (`-1.664 ms` at `350 Mbps`) |
+
+### Findings
+
+- **Tegra X1 is split nearly evenly between `dequant` and `idwt`.** At `150 Mbps`, `dequant` takes `8.29 ms` (`47.2%` of GPU pass time) and `idwt` takes `9.28 ms` (`52.8%`), putting total uncontended decode at `18.84 ms` mean / `18.61 ms` `p50` — above a `16.68 ms` 60 Hz frame budget even before display swapchain rendering runs.
+- **`dequant` cost is nearly invariant across `50–350 Mbps`.** On Shield TV (`8.24 -> 8.47 ms`), Quadro P2000 (`1.87 -> 1.88 ms`), and Radeon 760M (`0.94 -> 0.95 ms`), tripling bitrate barely moves `dequant` because `dequant.wgsl` dispatches all `32x32` blocks with workgroup barriers and full pyramid writes regardless of block sparsity. With warmed Tegra X1 clocks under `--warmup-seconds 3.0`, `idle` (`50 Mbps`) and `high-motion` (`350 Mbps`) still measured `8.21 ms` and `8.35 ms` `p50` in `dequant` (`9.82 ms` and `9.70 ms` `p50` in `idwt`).
+- **`L1` and `L0` account for 85–87% of `idwt`.** On Tegra X1, `L1` (`3.75 ms`) and `L0` (`4.70 ms`) take `8.46 ms` of `9.69 ms` (`87.2%`); `L4`–`L2` together take `1.22 ms`. Radeon 760M (`86.0%`), Quadro P2000 (`85.5%`), and Apple M1 (`85.2%`) show the same concentration.
+- **`r16` direct store matches or beats `r8` packed+copy in Vulkan wall time.** Although `idwt_packed` compute timestamps are `1.3–1.8 ms` shorter than direct `R16Unorm` texture stores on Tegra X1 (`7.74–7.99 ms` vs `9.28–9.69 ms`), the separate `copy_buffer_to_texture` transfer leaves `r8` slower end-to-end across Shield TV (`19.52` vs `18.84 ms` at `150 Mbps`), Radeon 760M (`3.70` vs `3.10 ms`), and Quadro P2000 (`3.55` vs `3.30 ms`).
+- **UMA `shared_uploads` pays off on Metal and remains disabled on Vulkan.** `GpuContext` currently sets `shared_uploads` on Metal only; enabling host-visible device-local writes there drops upload time on M1 from `0.50 ms` to `0.04 ms` (`0.91 ms` faster total at `150 Mbps`, `1.66 ms` at `350 Mbps`).
+- **Warm-up sensitivity on Tegra X1.** A `1 s` warm-up on an idle Shield TV only ran ~10 frames at throttled clocks and left the first run at `64.6 ms` (`50.4 ms` GPU timestamps) before governors ramped up; `scripts/bench_4k10.sh` defaults Android warm-up to `3.0 s` (`~61–74` frames).

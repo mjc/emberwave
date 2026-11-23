@@ -5,13 +5,14 @@
 # dequant, idwt + per-level idwt, r16unorm vs r8unorm plane store).
 #
 # Usage:
-#   scripts/bench_4k10.sh [--frames N] [--low-power] [--adapter SUBSTR]
-#                         [--android-serial SERIAL] [--out-dir DIR]
+#   scripts/bench_4k10.sh [--frames N] [--warmup-seconds SEC] [--low-power]
+#                         [--adapter SUBSTR] [--android-serial SERIAL] [--out-dir DIR]
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FRAMES=120
 GEN_FRAMES=60
+WARMUP_SECONDS=
 GPU_ARGS=()
 ANDROID_SERIAL=${EMBERWAVE_ANDROID_SERIAL:-}
 OUT_DIR=$ROOT/target/bench/4k10
@@ -19,6 +20,7 @@ OUT_DIR=$ROOT/target/bench/4k10
 while [ $# -gt 0 ]; do
     case "$1" in
         --frames) FRAMES=$2; shift 2 ;;
+        --warmup-seconds) WARMUP_SECONDS=$2; shift 2 ;;
         --low-power) GPU_ARGS+=(--low-power); shift ;;
         --adapter) GPU_ARGS+=(--adapter "$2"); shift 2 ;;
         --android-serial) ANDROID_SERIAL=$2; shift 2 ;;
@@ -26,6 +28,14 @@ while [ $# -gt 0 ]; do
         *) echo "unknown option $1" >&2; exit 2 ;;
     esac
 done
+
+if [ -z "$WARMUP_SECONDS" ]; then
+    if [ -n "$ANDROID_SERIAL" ]; then
+        WARMUP_SECONDS=3.0
+    else
+        WARMUP_SECONDS=1.0
+    fi
+fi
 
 STREAMS_DIR=$ROOT/testdata/generated/4k10
 mkdir -p "$STREAMS_DIR" "$OUT_DIR"
@@ -93,29 +103,29 @@ if [ -n "$ANDROID_SERIAL" ]; then
 
     for s in "${STREAM_LIST[@]}"; do
         echo "=== Android [$s] r16 (queue + QueueTurns) ==="
-        "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/$s.pwv1' --frames $FRAMES --output r16 --upload queue --queue-turns" | tee "$OUT_DIR/android_${s}_r16_queue.txt"
-        "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/$s.pwv1' --frames $FRAMES --output r16 --upload queue --queue-turns --json" > "$OUT_DIR/android_${s}_r16_queue.json"
+        "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/$s.pwv1' --frames $FRAMES --warmup-seconds $WARMUP_SECONDS --output r16 --upload queue --queue-turns" | tee "$OUT_DIR/android_${s}_r16_queue.txt"
+        "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/$s.pwv1' --frames $FRAMES --warmup-seconds $WARMUP_SECONDS --output r16 --upload queue --queue-turns --json" > "$OUT_DIR/android_${s}_r16_queue.json"
         echo "=== Android [$s] r16 (mapped) ==="
-        "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/$s.pwv1' --frames $FRAMES --output r16 --upload mapped --json" > "$OUT_DIR/android_${s}_r16_mapped.json"
+        "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/$s.pwv1' --frames $FRAMES --warmup-seconds $WARMUP_SECONDS --output r16 --upload mapped --json" > "$OUT_DIR/android_${s}_r16_mapped.json"
         echo "=== Android [$s] r8 (queue + QueueTurns) ==="
-        "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/$s.pwv1' --frames $FRAMES --output r8 --upload queue --queue-turns --json" > "$OUT_DIR/android_${s}_r8_queue.json"
+        "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/$s.pwv1' --frames $FRAMES --warmup-seconds $WARMUP_SECONDS --output r8 --upload queue --queue-turns --json" > "$OUT_DIR/android_${s}_r8_queue.json"
     done
     echo "=== Android per-level idwt [scene_4k10_150mbps] ==="
-    "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/scene_4k10_150mbps.pwv1' --frames $FRAMES --output r16 --upload queue --queue-turns --per-level" | tee "$OUT_DIR/android_scene_4k10_150mbps_r16_per_level.txt"
-    "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/scene_4k10_150mbps.pwv1' --frames $FRAMES --output r16 --upload queue --queue-turns --per-level --json" > "$OUT_DIR/android_scene_4k10_150mbps_r16_per_level.json"
-    "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/scene_4k10_150mbps.pwv1' --frames $FRAMES --output r8 --upload queue --queue-turns --per-level --json" > "$OUT_DIR/android_scene_4k10_150mbps_r8_per_level.json"
+    "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/scene_4k10_150mbps.pwv1' --frames $FRAMES --warmup-seconds $WARMUP_SECONDS --output r16 --upload queue --queue-turns --per-level" | tee "$OUT_DIR/android_scene_4k10_150mbps_r16_per_level.txt"
+    "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/scene_4k10_150mbps.pwv1' --frames $FRAMES --warmup-seconds $WARMUP_SECONDS --output r16 --upload queue --queue-turns --per-level --json" > "$OUT_DIR/android_scene_4k10_150mbps_r16_per_level.json"
+    "${ADB[@]}" shell "'$DEVICE_DIR/emberwave-cli' bench '$DEVICE_DIR/scene_4k10_150mbps.pwv1' --frames $FRAMES --warmup-seconds $WARMUP_SECONDS --output r8 --upload queue --queue-turns --per-level --json" > "$OUT_DIR/android_scene_4k10_150mbps_r8_per_level.json"
 else
     for s in "${STREAM_LIST[@]}"; do
         echo "=== Local [$s] r16 (queue + QueueTurns) ==="
-        "$CLI" bench "$STREAMS_DIR/$s.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --output r16 --upload queue --queue-turns | tee "$OUT_DIR/local_${s}_r16_queue.txt"
-        "$CLI" bench "$STREAMS_DIR/$s.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --output r16 --upload queue --queue-turns --json > "$OUT_DIR/local_${s}_r16_queue.json"
+        "$CLI" bench "$STREAMS_DIR/$s.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --warmup-seconds "$WARMUP_SECONDS" --output r16 --upload queue --queue-turns | tee "$OUT_DIR/local_${s}_r16_queue.txt"
+        "$CLI" bench "$STREAMS_DIR/$s.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --warmup-seconds "$WARMUP_SECONDS" --output r16 --upload queue --queue-turns --json > "$OUT_DIR/local_${s}_r16_queue.json"
         echo "=== Local [$s] r16 (mapped) ==="
-        "$CLI" bench "$STREAMS_DIR/$s.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --output r16 --upload mapped --json > "$OUT_DIR/local_${s}_r16_mapped.json"
+        "$CLI" bench "$STREAMS_DIR/$s.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --warmup-seconds "$WARMUP_SECONDS" --output r16 --upload mapped --json > "$OUT_DIR/local_${s}_r16_mapped.json"
         echo "=== Local [$s] r8 (queue + QueueTurns) ==="
-        "$CLI" bench "$STREAMS_DIR/$s.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --output r8 --upload queue --queue-turns --json > "$OUT_DIR/local_${s}_r8_queue.json"
+        "$CLI" bench "$STREAMS_DIR/$s.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --warmup-seconds "$WARMUP_SECONDS" --output r8 --upload queue --queue-turns --json > "$OUT_DIR/local_${s}_r8_queue.json"
     done
     echo "=== Local per-level idwt [scene_4k10_150mbps] ==="
-    "$CLI" bench "$STREAMS_DIR/scene_4k10_150mbps.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --output r16 --upload queue --queue-turns --per-level | tee "$OUT_DIR/local_scene_4k10_150mbps_r16_per_level.txt"
-    "$CLI" bench "$STREAMS_DIR/scene_4k10_150mbps.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --output r16 --upload queue --queue-turns --per-level --json > "$OUT_DIR/local_scene_4k10_150mbps_r16_per_level.json"
-    "$CLI" bench "$STREAMS_DIR/scene_4k10_150mbps.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --output r8 --upload queue --queue-turns --per-level --json > "$OUT_DIR/local_scene_4k10_150mbps_r8_per_level.json"
+    "$CLI" bench "$STREAMS_DIR/scene_4k10_150mbps.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --warmup-seconds "$WARMUP_SECONDS" --output r16 --upload queue --queue-turns --per-level | tee "$OUT_DIR/local_scene_4k10_150mbps_r16_per_level.txt"
+    "$CLI" bench "$STREAMS_DIR/scene_4k10_150mbps.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --warmup-seconds "$WARMUP_SECONDS" --output r16 --upload queue --queue-turns --per-level --json > "$OUT_DIR/local_scene_4k10_150mbps_r16_per_level.json"
+    "$CLI" bench "$STREAMS_DIR/scene_4k10_150mbps.pwv1" "${GPU_ARGS[@]}" --frames "$FRAMES" --warmup-seconds "$WARMUP_SECONDS" --output r8 --upload queue --queue-turns --per-level --json > "$OUT_DIR/local_scene_4k10_150mbps_r8_per_level.json"
 fi
