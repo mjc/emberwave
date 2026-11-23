@@ -118,19 +118,25 @@ impl MapTracker {
                 self.begin_remap(buffers);
             })?;
         }
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|error| {
-                GpuError::Device(format!("mapping the upload buffer failed: {error}"))
-            })?;
-        if self.poll_ready()? {
-            Ok(())
-        } else {
-            self.state = SlotMapState::Unmapped;
-            Err(GpuError::Device(
-                "mapping the upload buffer failed".to_owned(),
-            ))
+        // When tests or callers share one device across threads, another
+        // thread's `device.poll` can dequeue our `map_async` callback and be
+        // milliseconds/microseconds away from running it when our own `poll`
+        // returns. Yield and re-poll before failing.
+        for _ in 0..1024 {
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|error| {
+                    GpuError::Device(format!("mapping the upload buffer failed: {error}"))
+                })?;
+            if self.poll_ready()? {
+                return Ok(());
+            }
+            std::thread::yield_now();
         }
+        self.state = SlotMapState::Unmapped;
+        Err(GpuError::Device(
+            "mapping the upload buffer failed".to_owned(),
+        ))
     }
 }
 
