@@ -42,11 +42,11 @@ pub struct GpuOptions {
     #[doc(hidden)]
     pub plane_stores: bool,
     /// Let the decoders write a frame, and the encoders a picture's planes,
-    /// where their shaders read them, on GPUs that share their memory with
-    /// the CPU: on Metal on Apple silicon, through mappable storage buffers
-    /// (decisions D53, D54). Without it, and elsewhere, they go into an
-    /// upload buffer that the GPU copies from (decisions D30, D34). Ignored
-    /// with `strict_webgpu`.
+    /// where their shaders read them, on unified-memory GPUs: integrated GPUs
+    /// on Metal (Apple silicon) and Vulkan (APUs and SoCs such as Tegra X1)
+    /// through mappable primary buffers (decisions D53, D54). Discrete GPUs
+    /// and other backends keep an upload buffer that the GPU copies from
+    /// (decisions D30, D34). Ignored with `strict_webgpu`.
     #[doc(hidden)]
     pub shared_uploads: bool,
     /// Let the decoders write 16-bit normalised Y, Cb and Cr planes into
@@ -461,9 +461,10 @@ impl GpuContext {
     }
 
     /// Whether the decoders write a frame's data, and the encoders a
-    /// picture's planes, where their shaders read them, without an upload
-    /// buffer and the copies from it: on Metal on Apple silicon, unless
-    /// `GpuOptions::shared_uploads` was off (decisions D53, D54).
+    /// picture's planes, where their shaders read them, without copying from
+    /// a staging buffer: on unified-memory integrated GPUs (Metal on Apple
+    /// silicon and Vulkan integrated GPUs), unless `GpuOptions::shared_uploads`
+    /// was off (decisions D53, D54).
     pub fn shares_uploads(&self) -> bool {
         self.shared_uploads
     }
@@ -595,12 +596,12 @@ fn supports_r16_planes(adapter: &wgpu::Adapter) -> bool {
 }
 
 /// Whether the decoders can write a frame where their shaders read it on
-/// `adapter`, once its device has mappable storage buffers: on Metal with
-/// memory that the CPU and the GPU share, as Apple silicon has (decision D53).
-/// wgpu warns that such buffers cost a GPU of its own memory dearly.
+/// `adapter`, once its device has mappable storage buffers: on Metal or Vulkan
+/// with an integrated GPU that shares memory with the CPU (decision D53).
+/// Discrete GPUs keep staging copies so shaders never read across a bus.
 fn shares_memory(adapter: &wgpu::Adapter) -> bool {
     let info = adapter.get_info();
-    info.backend == wgpu::Backend::Metal
+    matches!(info.backend, wgpu::Backend::Metal | wgpu::Backend::Vulkan)
         && info.device_type == wgpu::DeviceType::IntegratedGpu
         && adapter
             .features()

@@ -28,13 +28,9 @@ use super::pipelines::{
     DrawPipeline, Pipelines, ScopedError, Stage, with_error_scope, with_error_scope_kind,
 };
 use super::resources::{
-    StageQueries, buffer, buffer_limit, check_size, entry, map_for_writing, read_back,
-    read_back_with, texture, uniform_buffer,
+    ConcealTarget, DecoderUploads, DequantTarget, FrameUpload, PreparedUpload, StageQueries,
+    buffer, check_size, entry, read_back, read_back_with, texture, uniform_buffer,
 };
-
-/// Zero words after the payload. The dequantiser may read a little past the
-/// end of the last block; this keeps those reads deterministic.
-const PAYLOAD_PADDING_WORDS: usize = 4;
 
 /// The payload buffer never shrinks below this many words.
 const MIN_PAYLOAD_WORDS: usize = 16 * 1024;
@@ -182,18 +178,6 @@ struct ColorResources {
 /// passes (one per level), and the colour conversion.
 const TIMED_STAGES: u32 = 2 + DECOMPOSITION_LEVELS as u32;
 
-/// Where the CPU writes a frame's block table and payload for the GPU to
-/// copy, in the decodes that wait for their frame (decision D34): kept from
-/// frame to frame, so that a frame goes into memory that is there already,
-/// where `Queue::write_buffer` allocates new memory for every frame and the
-/// first writes to it cost more than the copy.
-struct FrameUpload {
-    /// The block table, then, from the table's full size on, the payload.
-    buffer: wgpu::Buffer,
-    /// Whether `buffer` is mapped for writing.
-    mapped: bool,
-}
-
 /// A dispatch of the inverse transform for one decomposition level.
 struct IdwtStage {
     bind_group: wgpu::BindGroup,
@@ -214,7 +198,7 @@ enum PlaneFill {
     /// a plane, in the order of `idwt_stages`, and none for the others.
     Store {
         pipeline: wgpu::ComputePipeline,
-        bind_groups: Vec<Option<wgpu::BindGroup>>,
+        bind_groups: [Option<wgpu::BindGroup>; DECOMPOSITION_LEVELS],
     },
 }
 
@@ -227,6 +211,14 @@ enum Output {
     Picture(Fill),
     /// The Y, Cb and Cr planes.
     Planes(PlaneFill),
+}
+
+struct PassOptions<'a> {
+    slot_index: usize,
+    rgb: bool,
+    conceal: bool,
+    queries: Option<&'a StageQueries>,
+    per_level_idwt: bool,
 }
 
 /// Decodes PyroWave frames of one size and chroma format on the GPU.
@@ -247,10 +239,7 @@ pub struct Decoder {
     partial_share: f32,
     buffers: BufferLayout,
 
-    payload: wgpu::Buffer,
-    payload_capacity_words: usize,
-    block_offsets: wgpu::Buffer,
-    dequant_work: wgpu::Buffer,
+    uploads: DecoderUploads,
     dirty_ballots: wgpu::Buffer,
     block_band: Vec<u8>,
     first_detail_block: u32,
@@ -260,15 +249,6 @@ pub struct Decoder {
     work_scratch: Vec<u32>,
     pending_decode_count: u32,
     pending_clear_count: u32,
-    /// Made on the first decode that waits for its frame, and made again
-    /// when the payload buffer grows; `record_rgb`, which does not wait,
-    /// writes through the queue instead, as a browser has to. Never made
-    /// where `shared_uploads` is.
-    upload: Option<FrameUpload>,
-    /// Whether the decodes that wait for their frame write it straight into
-    /// `payload` and `block_offsets`, which the CPU can map then (decision
-    /// D53).
-    shared_uploads: bool,
     pyramid: wgpu::Buffer,
     packed: wgpu::Buffer,
     /// Made by the first decode that reads the planes back: a player never
@@ -280,7 +260,6 @@ pub struct Decoder {
     r16_plane_pipeline: R16PlanePipeline,
 
     dequant_params: wgpu::Buffer,
-    dequant_bind_group: wgpu::BindGroup,
     dequant_grid: (u32, u32),
 
     /// Whether frames drawn in part conceal the blocks of detail they lack
@@ -313,9 +292,10 @@ pub struct Decoder {
 /// last frame's detail where the picture is still.
 struct ConcealResources {
     last: wgpu::Buffer,
+    uniform: wgpu::Buffer,
     params: ConcealParams,
     pipeline: wgpu::ComputePipeline,
-    bind_group: wgpu::BindGroup,
+    layout: wgpu::BindGroupLayout,
 }
 
 /// The pipeline of `draw.wgsl` for one target format, and its bind group:
@@ -409,16 +389,7 @@ impl Decoder {
         let made = with_error_scope(&device, || {
             let storage = |label: &str, bytes: u64, usage| buffer(&device, label, bytes, usage);
 
-            let payload_capacity_words = MIN_PAYLOAD_WORDS;
-            let frame_usage = frame_buffer_usage(context.shares_uploads());
-            let payload = storage("payload", payload_capacity_words as u64 * 4, frame_usage);
             let block_count = layout.block_count();
-            let block_offsets = storage("block offsets", u64::from(block_count) * 4, frame_usage);
-            let dequant_work = storage(
-                "dequant work",
-                (3 + 2 * u64::from(block_count)) * 4,
-                frame_usage,
-            );
             let dirty_ballots = storage(
                 "dirty ballots",
                 u64::from(block_count) * 4,
@@ -452,14 +423,18 @@ impl Decoder {
             let dequant_grid = dequant_params_data.grid();
             let dequant_params =
                 uniform_buffer(&device, &queue, "dequant params", &dequant_params_data);
-            let dequant_bind_group = dequant_bind_group(
+            let uploads = DecoderUploads::new(
                 &device,
-                &pipelines.dequant,
-                &payload,
-                &dequant_work,
-                &pyramid,
-                &dequant_params,
-                &dirty_ballots,
+                DequantTarget {
+                    stage: &pipelines.dequant,
+                    pyramid: &pyramid,
+                    params: &dequant_params,
+                    dirty_ballots: &dirty_ballots,
+                },
+                u64::from(block_count) * 4,
+                (3 + 2 * u64::from(block_count)) * 4,
+                MIN_PAYLOAD_WORDS,
+                context.shares_uploads(),
             );
 
             // Levels from the coarsest to the finest: each consumes the LL band
@@ -492,10 +467,7 @@ impl Decoder {
                 assembler: FrameAssembler::new(layout.clone()),
                 partial_share: DEFAULT_MINIMUM_PACKET_RATIO,
                 buffers: buffers.clone(),
-                payload,
-                payload_capacity_words,
-                block_offsets,
-                dequant_work,
+                uploads,
                 dirty_ballots,
                 block_band,
                 first_detail_block,
@@ -505,8 +477,6 @@ impl Decoder {
                 work_scratch: Vec::new(),
                 pending_decode_count: 0,
                 pending_clear_count: 0,
-                upload: None,
-                shared_uploads: context.shares_uploads(),
                 pyramid,
                 packed,
                 readback: None,
@@ -514,7 +484,6 @@ impl Decoder {
                 r16_planes: context.supports_plane_format(PLANE_FORMAT_R16),
                 r16_plane_pipeline: context.r16_plane_pipeline(),
                 dequant_params,
-                dequant_bind_group,
                 dequant_grid,
                 concealment: false,
                 conceal: None,
@@ -1100,11 +1069,24 @@ impl Decoder {
     /// with concealment on. Makes what the concealment needs on its first
     /// use. Called in the decode's turn at the queue (decision D60), as it
     /// writes through the queue.
-    fn prepare_concealment(&mut self) -> Result<bool, GpuError> {
+    fn prepare_concealment(&mut self, slot_index: usize) -> Result<bool, GpuError> {
         let conceal =
             self.concealment && self.assembler.received_blocks() < self.assembler.total_blocks();
         if conceal && self.conceal.is_none() {
             self.conceal = Some(self.make_conceal()?);
+        }
+        if let Some(resources) = self.conceal.as_ref().filter(|_| conceal) {
+            self.uploads.ensure_conceal_bind_group(
+                slot_index,
+                &self.device,
+                ConcealTarget {
+                    layout: &resources.layout,
+                    pyramid: &self.pyramid,
+                    dequant_params: &self.dequant_params,
+                    uniform: &resources.uniform,
+                    last: &resources.last,
+                },
+            );
         }
         if conceal != self.conceal_written {
             with_error_scope(&self.device, || {
@@ -1119,8 +1101,8 @@ impl Decoder {
         Ok(conceal)
     }
 
-    /// The copy of the coarsest level, the parameters and the bind group of
-    /// the concealment, with the context's pipeline.
+    /// The copy of the coarsest level, the parameters and the bind group layout
+    /// of the concealment, with the context's pipeline.
     fn make_conceal(&self) -> Result<ConcealResources, GpuError> {
         let stage = self.conceal_pipeline.get(&self.device)?;
         let params = ConcealParams::new(self.layout(), &self.buffers);
@@ -1133,22 +1115,12 @@ impl Decoder {
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             );
             let uniform = uniform_buffer(&self.device, &self.queue, "conceal params", &params);
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("conceal"),
-                layout: &stage.layout,
-                entries: &[
-                    entry(0, &self.block_offsets),
-                    entry(1, &self.pyramid),
-                    entry(2, &self.dequant_params),
-                    entry(3, &uniform),
-                    entry(4, &last),
-                ],
-            });
             ConcealResources {
                 last,
+                uniform,
                 params,
                 pipeline: stage.pipeline.clone(),
-                bind_group,
+                layout: stage.layout.clone(),
             }
         })
     }
@@ -1351,45 +1323,38 @@ impl Decoder {
     ) -> Result<Timings, GpuError> {
         let timing_opts = timing.unwrap_or_default();
         let prepare_start = Instant::now();
-        self.ensure_payload_capacity()?;
         self.compile_concealment()?;
         let conceal = self.will_conceal();
         self.prepare_dequant_work(conceal);
         let turns = self.turns.clone();
-        let (table_bytes, work_bytes, payload_bytes, upload, queue_turn, mut recording) =
-            match timing_opts.upload {
-                TimedUpload::Mapped => {
-                    let upload_start = Instant::now();
-                    let (table_bytes, work_bytes, payload_bytes) = self.upload_mapped(conceal)?;
-                    let upload = upload_start.elapsed();
-                    // The decode makes command buffers from here to its submission, and
-                    // takes its turn at them (decision D60); the upload above waits for
-                    // the GPU to map its buffer, so it comes first.
-                    let turn_start = Instant::now();
-                    let recording = take_turn(turns.as_deref(), &self.device, &self.queue);
-                    let queue_turn = turn_start.elapsed();
-                    (
-                        table_bytes,
-                        work_bytes,
-                        payload_bytes,
-                        upload,
-                        queue_turn,
-                        recording,
-                    )
-                }
-                TimedUpload::QueueWrite => {
-                    let turn_start = Instant::now();
-                    let recording = take_turn(turns.as_deref(), &self.device, &self.queue);
-                    let queue_turn = turn_start.elapsed();
-                    let upload_start = Instant::now();
-                    with_error_scope(&self.device, || self.upload(conceal))?;
-                    let upload = upload_start.elapsed();
-                    (0, 0, 0, upload, queue_turn, recording)
-                }
-            };
+        let (prepared_upload, upload, queue_turn, mut recording) = match timing_opts.upload {
+            TimedUpload::Mapped => {
+                let upload_start = Instant::now();
+                let prepared = self.upload_mapped(false, conceal)?;
+                let upload = upload_start.elapsed();
+                // The decode makes command buffers from here to its submission, and
+                // takes its turn at them (decision D60); the upload above waits for
+                // the GPU only if an earlier frame is still in flight.
+                let turn_start = Instant::now();
+                let recording = take_turn(turns.as_deref(), &self.device, &self.queue);
+                let queue_turn = turn_start.elapsed();
+                (Some(prepared), upload, queue_turn, recording)
+            }
+            TimedUpload::QueueWrite => {
+                self.prepare_queue_write()?;
+                let turn_start = Instant::now();
+                let recording = take_turn(turns.as_deref(), &self.device, &self.queue);
+                let queue_turn = turn_start.elapsed();
+                let upload_start = Instant::now();
+                self.upload(conceal)?;
+                let upload = upload_start.elapsed();
+                (None, upload, queue_turn, recording)
+            }
+        };
+        let slot_index = prepared_upload.map_or(0, |p| p.slot_index);
         let submit_prep_start = Instant::now();
         let output = self.prepare_output(color, read, prepared_planes)?;
-        let conceal = self.prepare_concealment()?;
+        let conceal = self.prepare_concealment(slot_index)?;
         let submit_prep = submit_prep_start.elapsed();
         let prepare = assembled_in + prepare_start.elapsed();
 
@@ -1418,43 +1383,18 @@ impl Decoder {
                     label: Some("decode"),
                 });
 
-            if timing_opts.upload == TimedUpload::Mapped
-                && let Some(upload) = &self.upload
-            {
-                let work_start = self.table_capacity_bytes();
-                let payload_start = work_start + self.dequant_work_capacity_bytes();
-                if table_bytes > 0 {
-                    encoder.copy_buffer_to_buffer(
-                        &upload.buffer,
-                        0,
-                        &self.block_offsets,
-                        0,
-                        table_bytes,
-                    );
-                }
-                if work_bytes > 0 {
-                    encoder.copy_buffer_to_buffer(
-                        &upload.buffer,
-                        work_start,
-                        &self.dequant_work,
-                        0,
-                        work_bytes,
-                    );
-                }
-                encoder.copy_buffer_to_buffer(
-                    &upload.buffer,
-                    payload_start,
-                    &self.payload,
-                    0,
-                    payload_bytes,
-                );
+            if let Some(prepared) = prepared_upload {
+                self.encode_staging_copies(&mut encoder, prepared);
             }
             self.encode_passes(
                 &mut encoder,
-                color.is_some(),
-                conceal,
-                queries,
-                timing_opts.per_level_idwt,
+                PassOptions {
+                    slot_index,
+                    rgb: color.is_some(),
+                    conceal,
+                    queries,
+                    per_level_idwt: timing_opts.per_level_idwt,
+                },
                 &output,
             );
             self.encode_output(&mut encoder, read, &output);
@@ -1468,6 +1408,9 @@ impl Decoder {
         // The dequant pass has been submitted; keep host dirty tracking aligned
         // with GPU `dirty_ballots` even if readback or the row closure fails.
         std::mem::swap(&mut self.dirty_list, &mut self.next_dirty_list);
+        if let Some(prepared) = prepared_upload {
+            self.uploads.begin_remap(prepared.slot_index);
+        }
         let submit_dur = submit_prep + encode_start.elapsed();
 
         // The wait for the frame polls the device, which records a loss. A
@@ -1545,11 +1488,10 @@ impl Decoder {
         let [y, cb, cr] = targets;
         let build_bind_groups = |stage: &Stage, label: &str| {
             with_error_scope_kind(&self.device, || {
-                let bind_groups = self
-                    .idwt_stages
-                    .iter()
-                    .map(|level| {
-                        level.writes_plane.then(|| {
+                let bind_groups: [Option<wgpu::BindGroup>; DECOMPOSITION_LEVELS] =
+                    std::array::from_fn(|index| {
+                        self.idwt_stages[index].writes_plane.then(|| {
+                            let level = &self.idwt_stages[index];
                             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                                 label: Some(label),
                                 layout: &stage.layout,
@@ -1562,8 +1504,7 @@ impl Decoder {
                                 ],
                             })
                         })
-                    })
-                    .collect();
+                    });
                 PlaneFill::Store {
                     pipeline: stage.pipeline.clone(),
                     bind_groups,
@@ -1610,15 +1551,20 @@ impl Decoder {
         // caller on Vulkan knows their layout between decodes,
         // `SHADER_READ_ONLY_OPTIMAL` (decision D61). Elsewhere it changes
         // nothing that matters.
-        let textures: Vec<&wgpu::Texture> = match read {
-            Read::Texture(target) => vec![target.texture()],
-            Read::Planes(targets) => targets.iter().map(|target| target.texture()).collect(),
-            Read::Nothing | Read::Yuv | Read::Rgb => Vec::new(),
+        let textures: [Option<&wgpu::Texture>; 3] = match read {
+            Read::Texture(target) => [Some(target.texture()), None, None],
+            Read::Planes(targets) => [
+                Some(targets[0].texture()),
+                Some(targets[1].texture()),
+                Some(targets[2].texture()),
+            ],
+            Read::Nothing | Read::Yuv | Read::Rgb => [None, None, None],
         };
         encoder.transition_resources(
             std::iter::empty(),
             textures
                 .into_iter()
+                .flatten()
                 .filter(|texture| {
                     texture
                         .usage()
@@ -1633,10 +1579,10 @@ impl Decoder {
     }
 
     /// Records the decode of the frame the assembler holds into `encoder`,
-    /// its data uploaded through the queue: the passes, with the colour
-    /// conversion if `color` is given, and then what `read` asks of
-    /// textures. The caller marks the frame decoded once that cannot fail
-    /// any more.
+    /// its data uploaded through the queue (or directly into a mapped UMA slot
+    /// when ready): the passes, with the colour conversion if `color` is
+    /// given, and then what `read` asks of textures. The caller marks the frame
+    /// decoded once that cannot fail any more.
     fn record_assembled(
         &mut self,
         color: Option<&ColorParams>,
@@ -1644,22 +1590,35 @@ impl Decoder {
         prepared_planes: Option<PlaneFill>,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<(), GpuError> {
-        self.ensure_payload_capacity()?;
         let conceal = self.will_conceal();
         self.prepare_dequant_work(conceal);
-        with_error_scope(&self.device, || self.upload(conceal))?;
+        let wrote_in_place = self.try_write_uma_for_record(conceal)?;
+        if !wrote_in_place {
+            self.prepare_queue_write()?;
+            self.upload(conceal)?;
+        }
         let output = self.prepare_output(color, read, prepared_planes)?;
-        let conceal = self.prepare_concealment()?;
-        self.encode_passes(encoder, color.is_some(), conceal, None, false, &output);
+        let conceal = self.prepare_concealment(0)?;
+        self.encode_passes(
+            encoder,
+            PassOptions {
+                slot_index: 0,
+                rgb: color.is_some(),
+                conceal,
+                queries: None,
+                per_level_idwt: false,
+            },
+            &output,
+        );
         self.encode_output(encoder, read, &output);
         Ok(())
     }
 
-    /// Records the decode of the frame the assembler holds, as
-    /// [`record_assembled`](Self::record_assembled) does, and submits it
-    /// without waiting for it. The frame counts as decoded only once it is
-    /// submitted: finishing the commands can still fail, as for a view in a
-    /// format the draw does not take, and then the frame is still there.
+    /// Records the decode of the frame the assembler holds and submits it
+    /// without waiting for it. On native backends this uses the upload ring
+    /// (writing into a mapped UMA or staging slot before taking the queue turn)
+    /// and schedules an asynchronous remap right after submission. On `wasm32`,
+    /// where nothing may block, it falls back to `record_assembled`.
     fn submit_assembled(
         &mut self,
         color: Option<&ColorParams>,
@@ -1669,6 +1628,14 @@ impl Decoder {
     ) -> Result<(), GpuError> {
         self.check_device()?;
         self.compile_concealment()?;
+        let conceal = self.will_conceal();
+        self.prepare_dequant_work(conceal);
+        #[cfg(not(target_arch = "wasm32"))]
+        let prepared_upload = Some(self.upload_mapped(true, conceal)?);
+        #[cfg(target_arch = "wasm32")]
+        let prepared_upload: Option<PreparedUpload> = None;
+        let slot_index = prepared_upload.map_or(0, |p| p.slot_index);
+
         let turns = self.turns.clone();
         let mut recording = take_turn(turns.as_deref(), &self.device, &self.queue);
         let mut encoder = self
@@ -1684,17 +1651,35 @@ impl Decoder {
             queue: self.queue.clone(),
             submitted: false,
         };
-        let outcome = self
-            .record_assembled(color, read, prepared_planes, &mut encoder)
-            .and_then(|()| {
-                with_error_scope(&self.device, || {
-                    if let Some(hooks) = after.hooks.as_deref_mut() {
-                        hooks.record(&mut encoder);
-                        hooks.before_submit(&self.queue);
-                    }
-                    submit(&self.queue, turns.as_deref(), [encoder.finish()]);
-                })
-            });
+        let outcome = (|| {
+            if let Some(prepared) = prepared_upload {
+                self.encode_staging_copies(&mut encoder, prepared);
+            } else {
+                self.prepare_queue_write()?;
+                self.upload(conceal)?;
+            }
+            let output = self.prepare_output(color, read, prepared_planes)?;
+            let conceal = self.prepare_concealment(slot_index)?;
+            self.encode_passes(
+                &mut encoder,
+                PassOptions {
+                    slot_index,
+                    rgb: color.is_some(),
+                    conceal,
+                    queries: None,
+                    per_level_idwt: false,
+                },
+                &output,
+            );
+            self.encode_output(&mut encoder, read, &output);
+            with_error_scope(&self.device, || {
+                if let Some(hooks) = after.hooks.as_deref_mut() {
+                    hooks.record(&mut encoder);
+                    hooks.before_submit(&self.queue);
+                }
+                submit(&self.queue, turns.as_deref(), [encoder.finish()]);
+            })
+        })();
         after.submitted = outcome.is_ok();
         drop(after);
         if outcome.is_ok() {
@@ -1703,11 +1688,14 @@ impl Decoder {
         drop(recording);
         if outcome.is_ok() {
             self.commit_dequant_dirty();
+            if let Some(prepared) = prepared_upload {
+                self.uploads.begin_remap(prepared.slot_index);
+            }
             self.assembler.mark_frame_decoded();
         }
         // Nothing waits for the work, so nothing else polls the device: one
-        // poll that does not wait hands back what finished work held, and
-        // tells of a lost device.
+        // poll that does not wait hands back what finished work held, drives
+        // pending map callbacks, and tells of a lost device.
         notice_loss(&self.device, &self.lost);
         self.check_device()?;
         outcome
@@ -1929,18 +1917,22 @@ impl Decoder {
     }
 
     /// Records the GPU stages of a frame into `encoder`: dequantisation, the
-    /// inverse transform and, with `rgb`, the colour conversion. With
-    /// `queries` each pass writes its timestamps. When `output` stores the
+    /// inverse transform and, with `opts.rgb`, the colour conversion. With
+    /// `opts.queries` each pass writes its timestamps. When `output` stores the
     /// planes into textures, the levels that write planes store them there.
     fn encode_passes(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        rgb: bool,
-        conceal: bool,
-        queries: Option<&StageQueries>,
-        per_level_idwt: bool,
+        opts: PassOptions<'_>,
         output: &Output,
     ) {
+        let PassOptions {
+            slot_index,
+            rgb,
+            conceal,
+            queries,
+            per_level_idwt,
+        } = opts;
         // Each pass is a stage of its own.
         let writes = |pass: u32| queries.map(|q| q.writes(Some(pass), Some(pass)));
 
@@ -1952,23 +1944,28 @@ impl Decoder {
                 label: Some("dequant"),
                 timestamp_writes: writes(0),
             });
+            let dequant_bg = &self.uploads.slot(slot_index).dequant_bind_group;
             if self.pending_clear_count > 0 {
                 let grid = grid_for(u64::from(self.pending_clear_count));
                 pass.set_pipeline(&self.pipelines.dequant_clear.pipeline);
-                pass.set_bind_group(0, &self.dequant_bind_group, &[]);
+                pass.set_bind_group(0, dequant_bg, &[]);
                 pass.dispatch_workgroups(grid.0, grid.1, 1);
             }
             if self.pending_decode_count > 0 {
                 let grid = grid_for(u64::from(self.pending_decode_count));
                 pass.set_pipeline(&self.pipelines.dequant.pipeline);
-                pass.set_bind_group(0, &self.dequant_bind_group, &[]);
+                pass.set_bind_group(0, dequant_bg, &[]);
                 pass.dispatch_workgroups(grid.0, grid.1, 1);
             }
             // A dispatch of a compute pass sees the writes of the ones
             // before it: the concealment, the frame's coarsest level.
-            if let (true, Some(resources)) = (conceal, &self.conceal) {
+            if let (true, Some(resources), Some(conceal_bg)) = (
+                conceal,
+                &self.conceal,
+                self.uploads.conceal_bind_group(slot_index),
+            ) {
                 pass.set_pipeline(&resources.pipeline);
-                pass.set_bind_group(0, &resources.bind_group, &[]);
+                pass.set_bind_group(0, conceal_bg, &[]);
                 pass.dispatch_workgroups(self.dequant_grid.0, self.dequant_grid.1, 1);
             }
         }
@@ -2194,58 +2191,13 @@ impl Decoder {
         ))
     }
 
-    /// Grows the payload buffer if the assembled frame does not fit.
-    ///
-    /// A frame whose payload is larger than the device can bind is an error,
-    /// not a crash. This can only happen with a huge stream: a 4K frame whose
-    /// every block is as large as the format allows is about 200 MiB, and the
-    /// WebGPU default limit is 128 MiB.
-    fn ensure_payload_capacity(&mut self) -> Result<(), GpuError> {
-        let needed_words = self.assembler.frame().payload().len() + PAYLOAD_PADDING_WORDS;
-        if needed_words <= self.payload_capacity_words {
-            return Ok(());
-        }
-
-        let limit_bytes = buffer_limit(&self.device);
-        let capacity_bytes =
-            payload_capacity_bytes(needed_words, limit_bytes).ok_or(GpuError::LimitExceeded {
-                what: "the payload of this frame",
-                needed: needed_words as u64 * 4,
-                limit: limit_bytes & !3,
-            })?;
-        let (payload, bind_group) = with_error_scope(&self.device, || {
-            let payload = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("payload"),
-                size: capacity_bytes,
-                usage: frame_buffer_usage(self.shared_uploads),
-                mapped_at_creation: false,
-            });
-            let bind_group = dequant_bind_group(
-                &self.device,
-                &self.pipelines.dequant,
-                &payload,
-                &self.dequant_work,
-                &self.pyramid,
-                &self.dequant_params,
-                &self.dirty_ballots,
-            );
-            (payload, bind_group)
-        })?;
-
-        // Work already submitted keeps the old buffer until it is done.
-        std::mem::replace(&mut self.payload, payload).destroy();
-        self.payload_capacity_words = (capacity_bytes / 4) as usize;
-        self.dequant_bind_group = bind_group;
-        Ok(())
-    }
-
-    /// Bytes of the block table: where the dequant worklist starts in the upload
+    /// Bytes of the block table: where the dequant worklist starts in the staging
     /// buffer.
     fn table_capacity_bytes(&self) -> u64 {
         u64::from(self.layout().block_count()) * 4
     }
 
-    /// Maximum bytes of `dequant_work`: where the payload starts in the upload
+    /// Maximum bytes of `dequant_work`: where the payload starts in the staging
     /// buffer.
     fn dequant_work_capacity_bytes(&self) -> u64 {
         (3 + 2 * u64::from(self.layout().block_count())) * 4
@@ -2309,158 +2261,160 @@ impl Decoder {
         std::mem::swap(&mut self.dirty_list, &mut self.next_dirty_list);
     }
 
-    /// Writes the block table (when concealing), dequant worklist, and payload
-    /// of the assembled frame into the upload buffer, which is made, or made
-    /// larger, first if it has to be, and returns the bytes of each for the
-    /// copies at the start of the frame's command buffer. The previous frame is
-    /// done, so mapping the buffer waits for nothing.
-    fn upload_mapped(&mut self, conceal: bool) -> Result<(u64, u64, u64), GpuError> {
-        if self.shared_uploads {
-            return self.upload_in_place(conceal);
-        }
-        let work_start = self.table_capacity_bytes();
-        let payload_start = work_start + self.dequant_work_capacity_bytes();
-        let capacity_bytes = payload_start + self.payload_capacity_words as u64 * 4;
-        let upload = match &mut self.upload {
-            Some(upload) if upload.buffer.size() >= capacity_bytes => upload,
-            slot => {
-                let buffer = with_error_scope(&self.device, || {
-                    self.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("frame upload"),
-                        size: capacity_bytes,
-                        usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-                        mapped_at_creation: true,
-                    })
-                })?;
-                // Work already submitted keeps the old buffer until it is done.
-                if let Some(old) = slot.take() {
-                    old.buffer.destroy();
-                }
-                slot.insert(FrameUpload {
-                    buffer,
-                    mapped: true,
-                })
-            }
-        };
-        if !upload.mapped {
-            map_for_writing(&self.device, &[&upload.buffer])?;
-            upload.mapped = true;
-        }
-
-        let frame = self.assembler.frame();
-        let table: &[u8] = bytemuck::cast_slice(frame.block_offsets());
-        let work: &[u8] = bytemuck::cast_slice(&self.work_scratch);
-        let payload: &[u8] = bytemuck::cast_slice(frame.payload());
-        let table_bytes = if conceal { table.len() as u64 } else { 0 };
-        let work_bytes = work.len() as u64;
-        let payload_bytes = (payload.len() + PAYLOAD_PADDING_WORDS * 4) as u64;
-        {
-            let mut view = upload
-                .buffer
-                .slice(..payload_start + payload_bytes)
-                .get_mapped_range_mut()
-                .map_err(|error| GpuError::Device(error.to_string()))?;
-            if conceal {
-                view.slice(..table.len()).copy_from_slice(table);
-            }
-            let w_start = work_start as usize;
-            view.slice(w_start..w_start + work.len())
-                .copy_from_slice(work);
-            let p_start = payload_start as usize;
-            view.slice(p_start..p_start + payload.len())
-                .copy_from_slice(payload);
-            view.slice(p_start + payload.len()..p_start + payload_bytes as usize)
-                .fill(0);
-        }
-        with_error_scope(&self.device, || upload.buffer.unmap())?;
-        upload.mapped = false;
-        Ok((table_bytes, work_bytes, payload_bytes))
+    /// Prepares slot 0's shader-read buffers for `Queue::write_buffer`.
+    fn prepare_queue_write(&mut self) -> Result<(), GpuError> {
+        let needed_words = self.assembler.payload_padded_len();
+        self.uploads.prepare_queue_write(
+            &self.device,
+            DequantTarget {
+                stage: &self.pipelines.dequant,
+                pyramid: &self.pyramid,
+                params: &self.dequant_params,
+                dirty_ballots: &self.dirty_ballots,
+            },
+            needed_words,
+            MIN_PAYLOAD_WORDS,
+        )
     }
 
-    /// Writes the dequant worklist, payload, and (when concealing) block table
-    /// where the shaders read them, on a GPU that shares its memory with the
-    /// CPU (decision D53): no upload buffer, and no copies at the start of
-    /// the frame's command buffer, whose sizes this returns as zero. The
-    /// previous frame is done, so mapping the buffers waits for nothing.
-    fn upload_in_place(&mut self, conceal: bool) -> Result<(u64, u64, u64), GpuError> {
-        let written = if conceal {
-            map_for_writing(
-                &self.device,
-                &[&self.block_offsets, &self.dequant_work, &self.payload],
-            )
-            .and_then(|()| self.write_in_place(true))
+    /// Writes the dequant worklist, padded payload, and (when concealing) block
+    /// table into an upload slot (directly into primary buffers on UMA, or into
+    /// a persistent staging ring slot on discrete GPUs).
+    fn upload_mapped(
+        &mut self,
+        allow_ring: bool,
+        conceal: bool,
+    ) -> Result<PreparedUpload, GpuError> {
+        let table_capacity_bytes = self.table_capacity_bytes();
+        let work_capacity_bytes = self.dequant_work_capacity_bytes();
+        let (block_offsets, padded) = self.assembler.padded_payload();
+        let needed_words = padded.len();
+        let table: &[u8] = if conceal {
+            bytemuck::cast_slice(block_offsets)
         } else {
-            map_for_writing(&self.device, &[&self.dequant_work, &self.payload])
-                .and_then(|()| self.write_in_place(false))
+            &[]
         };
-        // Unmapped whatever happened: a buffer left mapped would fail every
-        // later decode and every write through the queue.
-        let unmapped = with_error_scope(&self.device, || {
-            if conceal {
-                self.block_offsets.unmap();
-            }
-            self.dequant_work.unmap();
-            self.payload.unmap();
-        });
-        written?;
-        unmapped?;
-        Ok((0, 0, 0))
-    }
-
-    /// The writing of [`upload_in_place`](Self::upload_in_place), into the
-    /// mapped buffers.
-    fn write_in_place(&self, conceal: bool) -> Result<(), GpuError> {
-        let frame = self.assembler.frame();
-        let table: &[u8] = bytemuck::cast_slice(frame.block_offsets());
         let work: &[u8] = bytemuck::cast_slice(&self.work_scratch);
-        let payload: &[u8] = bytemuck::cast_slice(frame.payload());
-        let padded = payload.len() + PAYLOAD_PADDING_WORDS * 4;
-        let mapped = |buffer: &wgpu::Buffer, bytes: usize| {
-            buffer
-                .slice(..bytes as u64)
-                .get_mapped_range_mut()
-                .map_err(|error| GpuError::Device(error.to_string()))
-        };
-        if conceal {
-            mapped(&self.block_offsets, table.len())?
-                .slice(..)
-                .copy_from_slice(table);
-        }
-        mapped(&self.dequant_work, work.len())?
-            .slice(..)
-            .copy_from_slice(work);
-        let mut view = mapped(&self.payload, padded)?;
-        view.slice(..payload.len()).copy_from_slice(payload);
-        view.slice(payload.len()..).fill(0);
-        Ok(())
+        let payload: &[u8] = bytemuck::cast_slice(padded);
+        self.uploads.write_mapped(
+            &self.device,
+            DequantTarget {
+                stage: &self.pipelines.dequant,
+                pyramid: &self.pyramid,
+                params: &self.dequant_params,
+                dirty_ballots: &self.dirty_ballots,
+            },
+            FrameUpload {
+                table,
+                work,
+                payload,
+                table_capacity_bytes,
+                work_capacity_bytes,
+                needed_words,
+                min_payload_words: MIN_PAYLOAD_WORDS,
+            },
+            allow_ring,
+        )
     }
 
-    /// Uploads the dequant worklist, payload, and (when concealing) block table
-    /// through the queue, for `record_rgb`, which does not wait for its frame
-    /// and so cannot map the upload buffer.
-    fn upload(&self, conceal: bool) {
-        let frame = self.assembler.frame();
-        if conceal {
-            self.queue.write_buffer(
-                &self.block_offsets,
+    /// Writes the frame directly into UMA slot 0 for `record_assembled` when
+    /// it is already mapped, returning `false` when `queue.write_buffer`
+    /// should be used instead.
+    fn try_write_uma_for_record(&mut self, conceal: bool) -> Result<bool, GpuError> {
+        if !self.uploads.is_shared() {
+            return Ok(false);
+        }
+        let table_capacity_bytes = self.table_capacity_bytes();
+        let work_capacity_bytes = self.dequant_work_capacity_bytes();
+        let (block_offsets, padded) = self.assembler.padded_payload();
+        let needed_words = padded.len();
+        let table: &[u8] = if conceal {
+            bytemuck::cast_slice(block_offsets)
+        } else {
+            &[]
+        };
+        let work: &[u8] = bytemuck::cast_slice(&self.work_scratch);
+        let payload: &[u8] = bytemuck::cast_slice(padded);
+        self.uploads.try_write_uma_for_record(
+            &self.device,
+            DequantTarget {
+                stage: &self.pipelines.dequant,
+                pyramid: &self.pyramid,
+                params: &self.dequant_params,
+                dirty_ballots: &self.dirty_ballots,
+            },
+            FrameUpload {
+                table,
+                work,
+                payload,
+                table_capacity_bytes,
+                work_capacity_bytes,
+                needed_words,
+                min_payload_words: MIN_PAYLOAD_WORDS,
+            },
+        )
+    }
+
+    /// Records staging-to-primary copies when `prepared` came from a discrete
+    /// staging slot.
+    fn encode_staging_copies(&self, encoder: &mut wgpu::CommandEncoder, prepared: PreparedUpload) {
+        if !prepared.needs_copy {
+            return;
+        }
+        if let Some(staging) = self.uploads.staging_buffer(prepared.slot_index) {
+            let slot = self.uploads.slot(prepared.slot_index);
+            let work_start = self.table_capacity_bytes();
+            let payload_start = work_start + self.dequant_work_capacity_bytes();
+            if prepared.table_bytes > 0 {
+                encoder.copy_buffer_to_buffer(
+                    staging,
+                    0,
+                    &slot.block_offsets,
+                    0,
+                    prepared.table_bytes,
+                );
+            }
+            if prepared.work_bytes > 0 {
+                encoder.copy_buffer_to_buffer(
+                    staging,
+                    work_start,
+                    &slot.dequant_work,
+                    0,
+                    prepared.work_bytes,
+                );
+            }
+            encoder.copy_buffer_to_buffer(
+                staging,
+                payload_start,
+                &slot.payload,
                 0,
-                bytemuck::cast_slice(frame.block_offsets()),
+                prepared.payload_bytes,
             );
         }
-        self.queue.write_buffer(
-            &self.dequant_work,
-            0,
-            bytemuck::cast_slice(&self.work_scratch),
-        );
+    }
 
-        let payload = frame.payload();
-        self.queue
-            .write_buffer(&self.payload, 0, bytemuck::cast_slice(payload));
-        self.queue.write_buffer(
-            &self.payload,
-            payload.len() as u64 * 4,
-            bytemuck::cast_slice(&[0u32; PAYLOAD_PADDING_WORDS]),
-        );
+    /// Uploads the dequant worklist, padded payload, and (when concealing) block
+    /// table through the queue, when `TimedUpload::QueueWrite` or `record_*`
+    /// runs on a non-mapped slot.
+    fn upload(&mut self, conceal: bool) -> Result<(), GpuError> {
+        let (block_offsets, padded) = self.assembler.padded_payload();
+        let slot = self.uploads.primary_slot();
+        with_error_scope(&self.device, || {
+            if conceal {
+                self.queue.write_buffer(
+                    &slot.block_offsets,
+                    0,
+                    bytemuck::cast_slice(block_offsets),
+                );
+            }
+            self.queue.write_buffer(
+                &slot.dequant_work,
+                0,
+                bytemuck::cast_slice(&self.work_scratch),
+            );
+            self.queue
+                .write_buffer(&slot.payload, 0, bytemuck::cast_slice(padded));
+        })
     }
 
     /// Where the planes are in the packed buffer, Y, Cb and Cr.
@@ -2556,7 +2510,10 @@ impl std::fmt::Debug for Decoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Decoder")
             .field("layout", self.assembler.layout())
-            .field("payload_capacity_words", &self.payload_capacity_words)
+            .field(
+                "payload_capacity_words",
+                &self.uploads.primary_slot().payload_capacity_words,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -2568,18 +2525,9 @@ impl Drop for Decoder {
     /// collector: about 140 MiB for a 4K decoder. Work already submitted keeps
     /// its buffers until it is done.
     fn drop(&mut self) {
-        let mut buffers = vec![
-            &self.payload,
-            &self.block_offsets,
-            &self.dequant_work,
-            &self.dirty_ballots,
-            &self.pyramid,
-            &self.packed,
-        ];
+        self.uploads.destroy_all();
+        let mut buffers = vec![&self.dirty_ballots, &self.pyramid, &self.packed];
         buffers.extend(&self.readback);
-        if let Some(upload) = &self.upload {
-            buffers.push(&upload.buffer);
-        }
         if let Some(color) = &self.color {
             buffers.push(&color.rgba);
             buffers.extend(&color.readback);
@@ -2591,52 +2539,6 @@ impl Drop for Decoder {
             buffer.destroy();
         }
     }
-}
-
-/// The size in bytes of a payload buffer that holds `needed_words` words on a
-/// device whose buffers can be at most `limit_bytes` large, or `None` if even
-/// the exact size is too much.
-///
-/// The size is rounded up to a power of two, so that a stream of slowly
-/// growing frames does not reallocate every time, but never beyond the limit.
-fn payload_capacity_bytes(needed_words: usize, limit_bytes: u64) -> Option<u64> {
-    let limit = limit_bytes & !3;
-    let needed = needed_words as u64 * 4;
-    if needed > limit {
-        return None;
-    }
-    let rounded = needed_words.next_power_of_two().max(MIN_PAYLOAD_WORDS) as u64 * 4;
-    Some(rounded.min(limit))
-}
-
-/// The usage of the buffers the shaders read a frame from: written through
-/// the queue, or with `shared_uploads` also mapped by the CPU (decision D53).
-fn frame_buffer_usage(shared_uploads: bool) -> wgpu::BufferUsages {
-    let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-    usage.set(wgpu::BufferUsages::MAP_WRITE, shared_uploads);
-    usage
-}
-
-fn dequant_bind_group(
-    device: &wgpu::Device,
-    stage: &Stage,
-    payload: &wgpu::Buffer,
-    dequant_work: &wgpu::Buffer,
-    pyramid: &wgpu::Buffer,
-    params: &wgpu::Buffer,
-    dirty_ballots: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("dequant"),
-        layout: &stage.layout,
-        entries: &[
-            entry(0, payload),
-            entry(1, dequant_work),
-            entry(2, pyramid),
-            entry(3, params),
-            entry(4, dirty_ballots),
-        ],
-    })
 }
 
 #[cfg(test)]
@@ -2809,18 +2711,22 @@ mod tests {
         };
         let mut decoder =
             Decoder::new(context, 64, 32, ChromaSubsampling::Yuv420).expect("decoder");
-        assert_eq!(decoder.shared_uploads, context.shares_uploads());
+        assert_eq!(decoder.uploads.is_shared(), context.shares_uploads());
         decoder
             .decode(&empty_frame(64, 32, ChromaSubsampling::Yuv420))
             .expect("decode");
-        // No upload buffer and so no copies from it, or the buffer.
-        assert_eq!(decoder.upload.is_none(), context.shares_uploads());
-        let usage = decoder.payload.usage();
+        // No staging buffer on UMA, and a persistent staging slot on discrete GPUs.
+        assert_eq!(
+            matches!(decoder.uploads, DecoderUploads::Uma { .. }),
+            context.shares_uploads()
+        );
+        let slot = decoder.uploads.primary_slot();
+        let usage = slot.payload.usage();
         assert_eq!(
             usage.contains(wgpu::BufferUsages::MAP_WRITE),
             context.shares_uploads()
         );
-        assert_eq!(usage, decoder.block_offsets.usage());
+        assert_eq!(usage, slot.block_offsets.usage());
     }
 
     #[test]
@@ -3026,41 +2932,54 @@ mod tests {
 
     #[test]
     fn the_payload_buffer_grows_by_doubling_but_never_past_the_limit() {
+        use super::super::resources::payload_capacity_bytes;
         const MIB: u64 = 1024 * 1024;
 
         // Small frames get the minimum, then powers of two.
         assert_eq!(
-            payload_capacity_bytes(10, 128 * MIB),
+            payload_capacity_bytes(10, MIN_PAYLOAD_WORDS, 128 * MIB),
             Some(MIN_PAYLOAD_WORDS as u64 * 4)
         );
-        assert_eq!(payload_capacity_bytes(20_000, 128 * MIB), Some(32_768 * 4));
+        assert_eq!(
+            payload_capacity_bytes(20_000, MIN_PAYLOAD_WORDS, 128 * MIB),
+            Some(32_768 * 4)
+        );
 
         // A payload that fits the limit but whose power of two does not gets
         // exactly its size.
         let needed_words = (70 * MIB / 4) as usize;
         assert_eq!(
-            payload_capacity_bytes(needed_words, 100 * MIB),
+            payload_capacity_bytes(needed_words, MIN_PAYLOAD_WORDS, 100 * MIB),
             Some(100 * MIB)
         );
         // A limit that is not a multiple of four is rounded down to whole words.
         assert_eq!(
-            payload_capacity_bytes(needed_words, 100 * MIB + 3),
+            payload_capacity_bytes(needed_words, MIN_PAYLOAD_WORDS, 100 * MIB + 3),
             Some(100 * MIB)
         );
 
         // About 200 MiB, a 4K frame of blocks of the largest size the format
         // allows, does not fit the WebGPU default of 128 MiB but fits a larger limit.
         let huge_words = (12_429u64 * 4095) as usize;
-        assert_eq!(payload_capacity_bytes(huge_words, 128 * MIB), None);
         assert_eq!(
-            payload_capacity_bytes(huge_words, 4095 * MIB),
+            payload_capacity_bytes(huge_words, MIN_PAYLOAD_WORDS, 128 * MIB),
+            None
+        );
+        assert_eq!(
+            payload_capacity_bytes(huge_words, MIN_PAYLOAD_WORDS, 4095 * MIB),
             Some(256 * MIB)
         );
 
         // Exactly the limit fits, one word more does not.
         let words = (128 * MIB / 4) as usize;
-        assert_eq!(payload_capacity_bytes(words, 128 * MIB), Some(128 * MIB));
-        assert_eq!(payload_capacity_bytes(words + 1, 128 * MIB), None);
+        assert_eq!(
+            payload_capacity_bytes(words, MIN_PAYLOAD_WORDS, 128 * MIB),
+            Some(128 * MIB)
+        );
+        assert_eq!(
+            payload_capacity_bytes(words + 1, MIN_PAYLOAD_WORDS, 128 * MIB),
+            None
+        );
     }
 
     #[test]

@@ -22,6 +22,10 @@ use super::layout::{Band, Component, FrameLayout};
 /// Value in the block offset table for a block that has not been received.
 pub const MISSING_BLOCK: u32 = u32::MAX;
 
+/// Zero words kept immediately past the active payload so GPU reads past the
+/// last block remain deterministic without a separate upload write.
+pub(crate) const PAYLOAD_PADDING_WORDS: usize = 4;
+
 /// Default number of coarse bands that must be complete before a partial
 /// frame may be decoded (the next-to-final LL band).
 ///
@@ -52,9 +56,16 @@ pub struct FrameAssembler {
     block_offsets: Vec<u32>,
     /// The indices of the blocks in `block_offsets`, in the order they came:
     /// a new frame resets those slots alone, so that a stream of tiny blocks
-    /// of ever newer frames costs no more than their bytes.
+    /// of ever newer frames costs no more than their bytes. Once a frame fills
+    /// at least a quarter of `block_offsets`, `filled_dense` switches `clear()`
+    /// to a bulk `fill(MISSING_BLOCK)` while keeping `filled` populated for
+    /// callers such as `FrameView::filled()`.
     filled: Vec<u32>,
+    filled_dense: bool,
+    /// Stored block words; [`padded_payload`](Self::padded_payload) appends
+    /// [`PAYLOAD_PADDING_WORDS`] trailing zero words before GPU upload.
     payload: Vec<u32>,
+    payload_len: usize,
     received_blocks: u32,
     total_blocks: u32,
     last_sequence: Option<u8>,
@@ -66,19 +77,25 @@ impl FrameAssembler {
     /// Creates an assembler for frames with the given layout.
     pub fn new(layout: FrameLayout) -> Self {
         let block_count = layout.block_count();
-        let mut assembler = Self {
+        let initial_payload_words = if block_count >= 1024 {
+            (block_count as usize * 8).min(64 * 1024)
+        } else {
+            PAYLOAD_PADDING_WORDS
+        };
+        let payload = Vec::with_capacity(initial_payload_words);
+        Self {
             block_offsets: vec![MISSING_BLOCK; block_count as usize],
             filled: Vec::new(),
-            payload: Vec::new(),
+            filled_dense: false,
+            payload,
+            payload_len: 0,
             received_blocks: 0,
             total_blocks: block_count,
             last_sequence: None,
             frame_decoded: false,
             start_of_frame: None,
             layout,
-        };
-        assembler.clear();
-        assembler
+        }
     }
 
     /// The layout frames are assembled for.
@@ -88,10 +105,16 @@ impl FrameAssembler {
 
     /// Drops everything received so far. Allocated memory is kept.
     pub fn clear(&mut self) {
-        for &index in &self.filled {
-            self.block_offsets[index as usize] = MISSING_BLOCK;
+        if self.filled_dense {
+            self.block_offsets.fill(MISSING_BLOCK);
+            self.filled_dense = false;
+        } else {
+            for &index in &self.filled {
+                self.block_offsets[index as usize] = MISSING_BLOCK;
+            }
         }
         self.filled.clear();
+        self.payload_len = 0;
         self.payload.clear();
         self.received_blocks = 0;
         self.total_blocks = self.layout.block_count();
@@ -214,7 +237,7 @@ impl FrameAssembler {
 
                     // Validate before anything is changed, so a rejected block
                     // never discards the frame being assembled.
-                    BlockStructure::check_bytes(&data[..size])?;
+                    BlockStructure::check_bytes_with_ballot(header.ballot, &data[..size])?;
 
                     if freshness == Freshness::Newer {
                         self.restart(header.sequence);
@@ -290,9 +313,26 @@ impl FrameAssembler {
             layout: &self.layout,
             block_offsets: &self.block_offsets,
             filled: &self.filled,
-            payload: &self.payload,
+            payload: &self.payload[..self.payload_len],
             start_of_frame: self.start_of_frame.as_ref(),
         }
+    }
+
+    /// Total payload words once [`PAYLOAD_PADDING_WORDS`] zero words are appended.
+    #[cfg_attr(any(target_arch = "wasm32", not(feature = "gpu")), allow(dead_code))]
+    pub(crate) fn payload_padded_len(&self) -> usize {
+        self.payload_len + PAYLOAD_PADDING_WORDS
+    }
+
+    /// Appends [`PAYLOAD_PADDING_WORDS`] zero words once and returns
+    /// `(block_offsets, padded_payload)` for GPU upload.
+    #[cfg_attr(any(target_arch = "wasm32", not(feature = "gpu")), allow(dead_code))]
+    pub(crate) fn padded_payload(&mut self) -> (&[u32], &[u32]) {
+        let target = self.payload_len + PAYLOAD_PADDING_WORDS;
+        if self.payload.len() < target {
+            self.payload.resize(target, 0);
+        }
+        (&self.block_offsets, &self.payload[..target])
     }
 
     fn freshness(&self, sequence: u8) -> Freshness {
@@ -320,14 +360,22 @@ impl FrameAssembler {
             return Ok(());
         }
 
-        let offset = u32::try_from(self.payload.len()).map_err(|_| Error::FrameTooLarge)?;
+        let old_len = self.payload_len;
+        let offset = u32::try_from(old_len).map_err(|_| Error::FrameTooLarge)?;
+        if self.payload.len() != old_len {
+            self.payload.truncate(old_len);
+        }
         self.payload.extend(
             block
                 .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                .map(|src| u32::from_le_bytes([src[0], src[1], src[2], src[3]])),
         );
+        self.payload_len = self.payload.len();
         *slot = offset;
         self.filled.push(block_index);
+        if !self.filled_dense && self.filled.len() * 4 >= self.block_offsets.len() {
+            self.filled_dense = true;
+        }
         self.received_blocks += 1;
         Ok(())
     }
@@ -804,5 +852,48 @@ mod tests {
         assert!(a.start_of_frame().is_none());
         assert!(a.frame().payload().is_empty());
         assert!(!a.is_ready(false));
+    }
+
+    #[test]
+    fn dense_clear_resets_after_filling_more_than_a_quarter_of_blocks() {
+        let mut a = assembler();
+        let count = a.layout().block_count();
+        assert!(count > 16);
+        let fill_count = count / 4 + 2;
+        for index in 0..fill_count {
+            a.push_packet(&block(index, 1, 0)).unwrap();
+        }
+        assert!(a.filled_dense);
+        assert_eq!(a.received_blocks(), fill_count);
+
+        // A newer frame clears densely and resets every slot.
+        a.push_packet(&block(0, 2, 1)).unwrap();
+        assert!(!a.filled_dense);
+        assert_eq!(a.received_blocks(), 1);
+        assert!(a.frame().block(0).is_some());
+        for index in 1..fill_count {
+            assert!(a.frame().block(index).is_none());
+        }
+    }
+
+    #[test]
+    fn padded_payload_appends_zero_words_once_and_preserves_frame_payload() {
+        let mut a = assembler();
+        a.push_packet(&block(0, 1, 0)).unwrap();
+        let unpadded_len = a.frame().payload().len();
+        assert_eq!(a.payload_padded_len(), unpadded_len + PAYLOAD_PADDING_WORDS);
+
+        {
+            let (_, padded) = a.padded_payload();
+            assert_eq!(padded.len(), unpadded_len + PAYLOAD_PADDING_WORDS);
+            assert_eq!(&padded[unpadded_len..], &[0; PAYLOAD_PADDING_WORDS]);
+        }
+        // `frame().payload()` stays exact, and subsequent block inserts truncate trailing pad before extending.
+        assert_eq!(a.frame().payload().len(), unpadded_len);
+        a.push_packet(&block(1, 1, 2)).unwrap();
+        assert_eq!(a.frame().payload().len(), unpadded_len + 4);
+        let (_, padded) = a.padded_payload();
+        assert_eq!(padded.len(), unpadded_len + 4 + PAYLOAD_PADDING_WORDS);
+        assert_eq!(&padded[unpadded_len + 4..], &[0; PAYLOAD_PADDING_WORDS]);
     }
 }

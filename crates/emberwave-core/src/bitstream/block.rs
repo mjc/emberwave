@@ -160,9 +160,14 @@ impl BlockStructure {
         if words < HEADER_WORDS {
             return Err(Error::BlockTooSmall { words });
         }
-        let size = words * 4;
         let ballot = u16::from_le_bytes([bytes[0], bytes[1]]);
+        Self::check_bytes_with_ballot(ballot, &bytes[..words * 4])
+    }
 
+    /// Checks a block whose header `ballot` and word-aligned `size` are already
+    /// known (`bytes.len() >= HEADER_BYTES` and multiple of 4).
+    pub(crate) fn check_bytes_with_ballot(ballot: u16, bytes: &[u8]) -> Result<(), Error> {
+        let size = bytes.len();
         let active = ballot.count_ones() as usize;
         let tables_end = HEADER_BYTES + active * (CONTROL_WORD_BYTES + QSCALE_BYTES);
         if tables_end > size {
@@ -172,17 +177,17 @@ impl BlockStructure {
             });
         }
 
+        if active == 0 {
+            return Ok(());
+        }
+
         let qscale_base = HEADER_BYTES + active * CONTROL_WORD_BYTES;
         let controls = &bytes[HEADER_BYTES..qscale_base];
         let qscales = &bytes[qscale_base..tables_end];
-        let planes_end = tables_end
-            + controls
-                .chunks_exact(CONTROL_WORD_BYTES)
-                .zip(qscales)
-                .map(|(control, &qscale)| {
-                    block8_plane_bytes(u16::from_le_bytes([control[0], control[1]]), qscale)
-                })
-                .sum::<usize>();
+        let mut planes_end = tables_end;
+        for (control, &qscale) in controls.chunks_exact(CONTROL_WORD_BYTES).zip(qscales) {
+            planes_end += block8_plane_bytes(u16::from_le_bytes([control[0], control[1]]), qscale);
+        }
         if planes_end > size {
             return Err(Error::BlockContentOverrun {
                 needed: planes_end,

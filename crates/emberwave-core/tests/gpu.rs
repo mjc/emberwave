@@ -776,13 +776,13 @@ fn planes_stored_into_textures_are_the_copied_planes() {
 
 #[test]
 fn frames_written_in_place_decode_as_copied_ones() {
-    // On Metal on Apple silicon the decodes that wait write a frame where the
-    // shaders read it; elsewhere, and with `shared_uploads` off, it goes
-    // through an upload buffer and copies (decision D53).
+    // On unified-memory integrated GPUs (Metal on Apple silicon and Vulkan
+    // integrated GPUs), decodes write a frame where the shaders read it;
+    // discrete GPUs and `shared_uploads = false` keep staging copies (decision D53).
     let context = gpu_or_return!();
     let info = context.adapter_info();
-    let shares =
-        info.backend == wgpu::Backend::Metal && info.device_type == wgpu::DeviceType::IntegratedGpu;
+    let shares = matches!(info.backend, wgpu::Backend::Metal | wgpu::Backend::Vulkan)
+        && info.device_type == wgpu::DeviceType::IntegratedGpu;
     assert_eq!(context.shares_uploads(), shares);
     let options = {
         let mut options = common::options();
@@ -2828,4 +2828,71 @@ fn decoding_into_r16_plane_textures_frame_after_frame_leaves_nothing_behind() {
         before,
         "live GPU objects and memory"
     );
+}
+
+#[test]
+fn context_reports_shared_uploads_according_to_backend_and_options() {
+    let options = common::options();
+    let Some(context) = create_context(&options) else {
+        return;
+    };
+    let info = context.adapter_info();
+    let expected = match info.backend {
+        wgpu::Backend::Metal => true,
+        wgpu::Backend::Vulkan => info.device_type == wgpu::DeviceType::IntegratedGpu,
+        _ => false,
+    };
+    assert_eq!(context.shares_uploads(), expected);
+
+    let mut strict = options;
+    strict.strict_webgpu = true;
+    if let Some(strict_ctx) = create_context(&strict) {
+        assert!(!strict_ctx.shares_uploads());
+    }
+}
+
+#[test]
+fn pipelined_submit_to_plane_textures_cycles_upload_ring_past_three_frames() {
+    let context = gpu_or_return!();
+    let (layout, frames) = vector_frames("noise_192x136_420");
+    let mut decoder = decoder_for(context, &layout);
+    let mut reference = decoder_for(context, &layout);
+
+    const IN_FLIGHT: usize = 8;
+    let target_sets: Vec<[wgpu::Texture; 3]> = (0..IN_FLIGHT)
+        .map(|_| {
+            Component::ALL.map(|component| {
+                decoder
+                    .create_plane_texture(component)
+                    .expect("plane texture")
+            })
+        })
+        .collect();
+    let expected: Vec<_> = frames
+        .iter()
+        .cycle()
+        .take(IN_FLIGHT)
+        .map(|frame| reference.decode(frame).expect("reference decode"))
+        .collect();
+
+    for (frame, targets) in frames.iter().cycle().take(IN_FLIGHT).zip(&target_sets) {
+        let views = targets
+            .each_ref()
+            .map(|texture| texture.create_view(&Default::default()));
+        decoder.clear();
+        decoder.push_packet(frame).expect("packet");
+        decoder
+            .submit_assembled_to_plane_textures(views.each_ref())
+            .expect("submit assembled to plane textures");
+    }
+
+    for (index, (targets, want)) in target_sets.iter().zip(&expected).enumerate() {
+        for (component, texture) in Component::ALL.into_iter().zip(targets) {
+            assert_eq!(
+                read_texture(context, texture),
+                want.planes[component.index()].data,
+                "frame {index}, component {component:?}"
+            );
+        }
+    }
 }
