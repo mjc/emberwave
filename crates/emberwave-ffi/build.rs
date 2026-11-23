@@ -34,6 +34,9 @@ fn main() {
         Ok("linux") => {
             println!("cargo::rustc-cdylib-link-arg=-Wl,-soname,libemberwave_ffi.so.{major}");
         }
+        Ok("android") => {
+            println!("cargo::rustc-cdylib-link-arg=-Wl,-soname,libemberwave_ffi.so");
+        }
         _ => {}
     }
 }

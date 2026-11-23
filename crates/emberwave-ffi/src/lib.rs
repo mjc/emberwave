@@ -3308,6 +3308,16 @@ mod vulkan {
             .map_err(no_gpu)
     }
 
+    /// Whether a Vulkan instance `apiVersion` (whose patch bits are 0 in
+    /// `VK_API_VERSION_1_x` constants) satisfies `needed`.
+    pub(super) fn api_version_supports(instance_api: u32, needed: u32) -> bool {
+        vk::api_version_variant(instance_api) == vk::api_version_variant(needed)
+            && (
+                vk::api_version_major(instance_api),
+                vk::api_version_minor(instance_api),
+            ) >= (vk::api_version_major(needed), vk::api_version_minor(needed))
+    }
+
     fn no_gpu(error: impl std::fmt::Display) -> Failure {
         Failure(EmberwaveStatus::NoGpu, error.to_string())
     }
@@ -3346,12 +3356,14 @@ mod vulkan {
         let ash_instance = unsafe { ash::Instance::load(entry.static_fn(), raw_instance) };
         let physical = vk::PhysicalDevice::from_raw(physical_device as usize as u64);
         // wgpu takes the version of the physical device, up to 1.3, as the
-        // one it may use; the instance's limits what may be used.
+        // one it may use; the instance's limits what may be used. Vulkan's
+        // VkApplicationInfo.apiVersion ignores the patch field (callers pass
+        // VK_API_VERSION_1_x with patch 0), so compare major.minor only.
         // SAFETY: a physical device of the instance, as the caller promises.
         let device_version =
             unsafe { ash_instance.get_physical_device_properties(physical) }.api_version;
         let needed = device_version.min(vk::API_VERSION_1_3);
-        if instance.api_version < needed {
+        if !api_version_supports(instance.api_version, needed) {
             return Err(Failure::argument(format!(
                 "the instance's apiVersion is {}.{}, below the {}.{} of the physical device that \
                  wgpu uses: make the instance with at least that",
@@ -6561,5 +6573,41 @@ mod tests {
         // SAFETY: a static string with a NUL at its end.
         let text = unsafe { std::ffi::CStr::from_ptr(version) };
         assert_eq!(text.to_str(), Ok(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        all(windows, target_pointer_width = "64")
+    ))]
+    #[test]
+    fn vulkan_instance_api_version_ignores_patch_field() {
+        use ash::vk;
+
+        let tegra_1_1 = vk::make_api_version(0, 1, 1, 178);
+        assert!(super::vulkan::api_version_supports(
+            vk::API_VERSION_1_1,
+            tegra_1_1.min(vk::API_VERSION_1_3)
+        ));
+        assert!(super::vulkan::api_version_supports(
+            vk::API_VERSION_1_3,
+            tegra_1_1.min(vk::API_VERSION_1_3)
+        ));
+        assert!(!super::vulkan::api_version_supports(
+            vk::API_VERSION_1_0,
+            tegra_1_1.min(vk::API_VERSION_1_3)
+        ));
+        assert!(super::vulkan::api_version_supports(
+            vk::API_VERSION_1_3,
+            vk::make_api_version(0, 1, 3, 289).min(vk::API_VERSION_1_3)
+        ));
+        assert!(!super::vulkan::api_version_supports(
+            vk::API_VERSION_1_1,
+            vk::make_api_version(0, 1, 3, 289).min(vk::API_VERSION_1_3)
+        ));
+        assert!(!super::vulkan::api_version_supports(
+            vk::make_api_version(1, 1, 3, 0),
+            tegra_1_1.min(vk::API_VERSION_1_3)
+        ));
     }
 }

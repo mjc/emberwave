@@ -21,6 +21,9 @@ impl Drop for Late {
 }
 
 thread_local! {
+    // On targets without ELF #[thread_local] (such as Android), std::thread_local!
+    // expands `const { Late }` in a way Clippy flags as missing_const_for_thread_local.
+    #[allow(clippy::missing_const_for_thread_local)]
     static LATE: Late = const { Late };
 }
 
