@@ -99,6 +99,18 @@ impl PyramidCull {
             };
         }
 
+        // A handful of blocks is enough to notice a frame that changes most
+        // of them. The full walk then only runs for a sparse change, which is
+        // the one where skipping tiles pays for the compare.
+        if self.sample_is_dense(n, offsets, payload) {
+            self.remember(n, offsets, payload);
+            return ChangeSet {
+                bits: Vec::new(),
+                count: block_count,
+                force_full: true,
+            };
+        }
+
         self.scratch.resize(n.div_ceil(64), 0);
         self.scratch.fill(0);
         let mut count = 0u32;
@@ -111,7 +123,7 @@ impl PyramidCull {
             }
             self.scratch[index / 64] |= 1u64 << (index % 64);
             count += 1;
-            if count.saturating_mul(2) > block_count {
+            if broad_change(block_count, count) {
                 force_full = true;
                 break;
             }
@@ -130,6 +142,26 @@ impl PyramidCull {
             count,
             force_full,
         }
+    }
+
+    /// More than half of 32 evenly spaced blocks differ. Redrawing the frame
+    /// is then cheaper than listing the tiles, and a single changed block
+    /// almost never lands on the sample.
+    fn sample_is_dense(&self, n: usize, offsets: &[u32], payload: &[u32]) -> bool {
+        let samples = 32.min(n);
+        if samples == 0 {
+            return false;
+        }
+        let mut changed = 0u32;
+        for step in 0..samples {
+            let index = step * n / samples;
+            let old = block_words(&self.offsets, &self.payload, index);
+            let new = block_words(offsets, payload, index);
+            if !same_coefficients(old, new) {
+                changed += 1;
+            }
+        }
+        changed.saturating_mul(2) > samples as u32
     }
 
     fn remember(&mut self, n: usize, offsets: &[u32], payload: &[u32]) {
@@ -159,6 +191,16 @@ fn block_words<'a>(offsets: &'a [u32], payload: &'a [u32], index: usize) -> &'a 
         Some(end) if words > 0 && end <= payload.len() => &payload[offset..end],
         _ => &[],
     }
+}
+
+/// More than half the blocks, or more than one in sixteen on a large frame.
+///
+/// A 4K scene that changes about a thousand blocks still marks every finest
+/// tile: the apron and the coarse levels fill the picture, and building that
+/// tile list costs more than drawing it.
+fn broad_change(block_count: u32, count: u32) -> bool {
+    count.saturating_mul(2) > block_count
+        || (block_count > 1024 && count.saturating_mul(16) > block_count)
 }
 
 /// Coefficient words, ignoring the frame counter in the first header word.
@@ -322,22 +364,21 @@ fn covered_band(
 ) -> (u32, u32, u32, u32) {
     let tile_x = tx as i32 * TILE_W as i32;
     let tile_y = ty as i32 * TILE_H as i32;
-    let mut min_x = u32::MAX;
-    let mut max_x = 0u32;
-    let mut min_y = u32::MAX;
-    let mut max_y = 0u32;
-    let x_end = tile_x + TILE_W as i32 + APRON;
-    let y_end = tile_y + TILE_H as i32 + APRON;
-    for x in (tile_x - APRON)..x_end {
-        let bx = (mirror(x, image_w as i32) as u32) >> 1;
-        min_x = min_x.min(bx);
-        max_x = max_x.max(bx);
-    }
-    for y in (tile_y - APRON)..y_end {
-        let by = (mirror(y, image_h as i32) as u32) >> 1;
-        min_y = min_y.min(by);
-        max_y = max_y.max(by);
-    }
+    let x0 = tile_x - APRON;
+    let x1 = tile_x + TILE_W as i32 + APRON;
+    let y0 = tile_y - APRON;
+    let y1 = tile_y + TILE_H as i32 + APRON;
+    let interior = x0 >= 0 && x1 <= image_w as i32 && y0 >= 0 && y1 <= image_h as i32;
+    let (min_x, max_x, min_y, max_y) = if interior {
+        (
+            (x0 as u32) >> 1,
+            ((x1 - 1) as u32) >> 1,
+            (y0 as u32) >> 1,
+            ((y1 - 1) as u32) >> 1,
+        )
+    } else {
+        covered_band_edges(x0, x1, y0, y1, image_w, image_h)
+    };
     // A neighbourhood that the image cannot contain still has to name a block.
     let max_bx = band_w.saturating_sub(1);
     let max_by = band_h.saturating_sub(1);
@@ -347,6 +388,32 @@ fn covered_band(
         max_x.min(max_bx),
         max_y.min(max_by),
     )
+}
+
+/// Band span of a tile whose apron crosses the picture edge, where samples mirror.
+fn covered_band_edges(
+    x0: i32,
+    x1: i32,
+    y0: i32,
+    y1: i32,
+    image_w: u32,
+    image_h: u32,
+) -> (u32, u32, u32, u32) {
+    let mut min_x = u32::MAX;
+    let mut max_x = 0u32;
+    let mut min_y = u32::MAX;
+    let mut max_y = 0u32;
+    for x in x0..x1 {
+        let bx = (mirror(x, image_w as i32) as u32) >> 1;
+        min_x = min_x.min(bx);
+        max_x = max_x.max(bx);
+    }
+    for y in y0..y1 {
+        let by = (mirror(y, image_h as i32) as u32) >> 1;
+        min_y = min_y.min(by);
+        max_y = max_y.max(by);
+    }
+    (min_x, max_x, min_y, max_y)
 }
 
 fn rect_hits(
@@ -501,6 +568,47 @@ mod tests {
     }
 
     #[test]
+    fn one_block_off_the_sample_stays_sparse() {
+        let mut cull = PyramidCull::default();
+        let blank = vec![None; 64];
+        assert!(watch(&mut cull, &blank, 0).force_full);
+        let mut blocks = blank.clone();
+        // Samples for 64 blocks are the even indexes.
+        blocks[1] = Some(&[4, 5][..]);
+        let changed = watch(&mut cull, &blocks, 1);
+        assert!(!changed.force_full);
+        assert_eq!(changed.count, 1);
+        assert!(bit(&changed.bits, 1));
+
+        let mut dense = vec![None; 64];
+        for block in dense.iter_mut().step_by(2) {
+            *block = Some(&[9][..]);
+        }
+        assert!(watch(&mut cull, &dense, 2).force_full);
+    }
+
+    #[test]
+    fn a_wide_change_on_a_large_frame_redraws_everything() {
+        let mut cull = PyramidCull::default();
+        let blank = vec![None; 2048];
+        assert!(watch(&mut cull, &blank, 0).force_full);
+
+        let mut few = blank.clone();
+        for block in few.iter_mut().take(10) {
+            *block = Some(&[1][..]);
+        }
+        let sparse = watch(&mut cull, &few, 1);
+        assert!(!sparse.force_full);
+        assert_eq!(sparse.count, 10);
+
+        let mut many = blank;
+        for block in many.iter_mut().take(200) {
+            *block = Some(&[2][..]);
+        }
+        assert!(watch(&mut cull, &many, 2).force_full);
+    }
+
+    #[test]
     fn one_detail_block_marks_nearby_tiles_only() {
         let layout = layout_512();
         let hl = layout.band(Component::Y, 0, Band::Hl).unwrap();
@@ -570,6 +678,41 @@ mod tests {
             assert_eq!(region.offset % 256, 0);
         }
         assert_eq!(plan.bytes.len() as u64 % 4, 0);
+    }
+
+    #[test]
+    fn interior_tiles_cover_the_same_band_as_the_mirror_walk() {
+        for (width, height) in [(3840, 2160), (1920, 1080), (64, 64), (40, 48)] {
+            let layout = FrameLayout::new(width, height, ChromaSubsampling::Yuv420).unwrap();
+            for level in 0..DECOMPOSITION_LEVELS {
+                let (band_w, band_h) = layout.level_size(level);
+                let (tiles_x, tiles_y) = tile_grid(&layout, level);
+                for ty in 0..tiles_y {
+                    for tx in 0..tiles_x {
+                        let fast = covered_band(tx, ty, band_w, band_h, 2 * band_w, 2 * band_h);
+                        let tile_x = tx as i32 * TILE_W as i32;
+                        let tile_y = ty as i32 * TILE_H as i32;
+                        let slow = covered_band_edges(
+                            tile_x - APRON,
+                            tile_x + TILE_W as i32 + APRON,
+                            tile_y - APRON,
+                            tile_y + TILE_H as i32 + APRON,
+                            2 * band_w,
+                            2 * band_h,
+                        );
+                        let max_bx = band_w.saturating_sub(1);
+                        let max_by = band_h.saturating_sub(1);
+                        let slow = (
+                            slow.0.min(max_bx),
+                            slow.2.min(max_by),
+                            slow.1.min(max_bx),
+                            slow.3.min(max_by),
+                        );
+                        assert_eq!(fast, slow, "{width}x{height} L{level} tile {tx},{ty}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

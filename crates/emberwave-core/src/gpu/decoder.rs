@@ -1793,8 +1793,8 @@ impl Decoder {
     /// Rewrites the tile lists the fast inverse transform dispatches.
     ///
     /// A repeated payload keeps the tile it already painted. The first frame,
-    /// a concealed frame and a frame that changes more than half of its blocks
-    /// redraw every tile.
+    /// a concealed frame, and a frame whose changes would cover the finest
+    /// tiles redraw every tile and keep the lists already on the GPU.
     fn prepare_fast_tiles(&mut self, output: &Output, conceal: bool) {
         if !output_uses_fast_tiles(output) || self.fast.is_none() {
             return;
