@@ -83,7 +83,7 @@ fn the_workgroup_variables_are_the_ones_checked_for_writes_before_reads() {
         ("block8_meta", 64),
         ("block8_packed_counts", 64),
     ];
-    let idwt: &[Variable] = &[("horizontal", 5120), ("levels", 4096)];
+    let idwt: &[Variable] = &[("horizontal", 10240), ("levels", 2048)];
     let fdwt: &[Variable] = &[("horizontal", 5120)];
     // quantise.wgsl's, in front of equant.wgsl's and pack.wgsl's.
     let quantise: &[Variable] = &[
@@ -199,10 +199,7 @@ fn the_inverse_transform_that_stores_planes_differs_only_in_its_store() {
             (name, layouter[variable.ty].size)
         })
         .collect();
-    assert_eq!(
-        workgroup,
-        [("horizontal".to_owned(), 5120), ("levels".to_owned(), 4096)]
-    );
+    assert_eq!(workgroup, [("horizontal".to_owned(), 10240)]);
     let store = naga::StorageAccess::STORE;
     assert_eq!(
         storage_textures(&module),
@@ -267,10 +264,7 @@ fn the_r16_plane_shader_requires_only_16bit_norm_storage_textures() {
             (name, layouter[variable.ty].size)
         })
         .collect();
-    assert_eq!(
-        workgroup,
-        [("horizontal".to_owned(), 5120), ("levels".to_owned(), 4096)]
-    );
+    assert_eq!(workgroup, [("horizontal".to_owned(), 10240)]);
 
     let store = naga::StorageAccess::STORE;
     assert_eq!(
@@ -304,4 +298,59 @@ fn the_draw_shader_validates_without_optional_capabilities() {
             ("fs", naga::ShaderStage::Fragment)
         ]
     );
+}
+
+#[test]
+fn the_f16_inverse_transform_shaders_validate_with_float16_capabilities() {
+    for (name, source, extra_caps, expected_workgroup) in [
+        (
+            "idwt_f16",
+            shader_sources::IDWT_F16,
+            Capabilities::SHADER_FLOAT16,
+            vec![("horizontal", 5120u32), ("levels", 8192u32)],
+        ),
+        (
+            "idwt_planes_f16",
+            shader_sources::IDWT_PLANES_F16,
+            Capabilities::SHADER_FLOAT16,
+            vec![("horizontal", 5120u32)],
+        ),
+        (
+            "idwt_planes_r16_f16",
+            shader_sources::IDWT_PLANES_R16_F16,
+            Capabilities::SHADER_FLOAT16 | Capabilities::STORAGE_TEXTURE_16BIT_NORM_FORMATS,
+            vec![("horizontal", 5120u32)],
+        ),
+    ] {
+        let module = naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|e| panic!("{name} does not parse:\n{}", e.emit_to_string(source)));
+        assert!(
+            Validator::new(ValidationFlags::all(), Capabilities::empty())
+                .validate(&module)
+                .is_err(),
+            "{name} unexpectedly validated with empty capabilities"
+        );
+        Validator::new(ValidationFlags::all(), extra_caps)
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name} does not validate: {e:?}"));
+
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).expect("layout");
+        let workgroup: Vec<(String, u32)> = module
+            .global_variables
+            .iter()
+            .filter(|(_, variable)| variable.space == naga::AddressSpace::WorkGroup)
+            .map(|(_, variable)| {
+                let var_name = variable.name.clone().unwrap_or_default();
+                (var_name, layouter[variable.ty].size)
+            })
+            .collect();
+        let expected: Vec<(String, u32)> = expected_workgroup
+            .iter()
+            .map(|&(k, v)| (k.to_owned(), v))
+            .collect();
+        assert_eq!(workgroup, expected, "{name}");
+        let total_bytes: u32 = workgroup.iter().map(|(_, s)| s).sum();
+        assert!(total_bytes <= 16 * 1024, "{name}: {total_bytes}");
+    }
 }
