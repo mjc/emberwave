@@ -131,6 +131,25 @@ jobs:
       - run: scripts/build_web.sh
       - run: node scripts/check_web.mjs
 
+  android:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    name: Android FFI (aarch64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install stable toolchain with the Android target
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --target aarch64-linux-android --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo clippy -p emberwave-ffi -p emberwave-core --target aarch64-linux-android --all-targets -- -D warnings
+      - name: Build Android cdylib, staticlib, and Vulkan R16 smoke binary
+        run: scripts/check_android_vulkan.sh --build-only
+
   build-test:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
