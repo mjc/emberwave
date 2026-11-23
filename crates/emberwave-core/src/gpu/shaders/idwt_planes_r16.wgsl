@@ -1,7 +1,7 @@
 // Stage: the store of the inverse transform's last level into r16unorm textures.
 //
-// Behind idwt.wgsl, for decodes into 16-bit normalised Y, Cb and Cr plane
-// textures on devices with TEXTURE_FORMAT_16BIT_NORM.
+// Behind idwt_fast.wgsl, or idwt_f16.wgsl when the device has shader f16, for
+// decodes into 16-bit normalised Y, Cb and Cr plane textures.
 
 @group(0) @binding(3) var plane_y: texture_storage_2d<r16unorm, write>;
 @group(0) @binding(4) var plane_cb: texture_storage_2d<r16unorm, write>;

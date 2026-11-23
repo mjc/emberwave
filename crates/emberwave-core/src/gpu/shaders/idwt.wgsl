@@ -9,7 +9,7 @@
 //
 // One dispatch combines the LL, HL, LH and HH bands of a level into the LL band
 // of the next finer level (or into the final plane). A workgroup produces a
-// 32x32 tile of the output from its 40x40 interleaved neighbourhood (4 samples
+// 64x32 tile of the output from its 72x40 interleaved neighbourhood (4 samples
 // of extension on each side, one per lifting step): it lifts the rows of the
 // neighbourhood, read straight from the bands, into workgroup memory, then the
 // columns of the tile from there, and stores the tile.
@@ -17,11 +17,9 @@
 // `to_unorm16` and stored straight into plane textures or packed into words.
 // Workgroup z selects the colour component.
 //
-// This file is the front of three shaders, which differ in quantisation and
-// where the last level stores its samples: idwt_packed.wgsl packs 8-bit levels
-// four to a word into a buffer, idwt_planes.wgsl stores them straight into an
-// `r8unorm` texture per plane (decision D52), and idwt_planes_r16.wgsl stores
-// 16-bit levels into an `r16unorm` texture per plane.
+// This file is the front of the 8-bit shaders. idwt_packed.wgsl packs the last
+// level four samples to a word. idwt_planes.wgsl stores it into an `r8unorm`
+// texture per plane (decision D52). The 16-bit path uses idwt_fast.wgsl.
 
 // The parameters of a level are shared with fdwt.wgsl, which goes the other
 // way between the same places (gpu/layout.rs, TransformLevel).
@@ -74,8 +72,12 @@ const DC_SHIFT: f32 = 0.5;
 
 // Workgroup memory is not zeroed for this pipeline (decision D25): every
 // element is written before it is read. The horizontal pass fills all of
-// `horizontal` (40 * 64 = 2560 floats = 10240 bytes).
+// `horizontal` (40 * 64 = 2560 floats = 10240 bytes). Interior tiles first
+// stage one band-row per warp in `band_even` / `band_odd` (8 * 36 floats)
+// so a warp loads consecutive samples.
 var<workgroup> horizontal: array<f32, 2560>;
+var<workgroup> band_even: array<f32, 288>;
+var<workgroup> band_odd: array<f32, 288>;
 
 // Whole-sample symmetric mirroring: -1 -> 1, n -> n - 2.
 fn mirror(index: i32, n: i32) -> i32 {
@@ -209,6 +211,48 @@ fn horiz_segment(comp: CompParams, tile_x: i32, tile_y: i32, out_width: i32, out
     horizontal[out + 7u] = v[11];
 }
 
+// Even and odd samples at one band x of an interior row. `y` is an output
+// coordinate inside the image, so the band row needs no mirror.
+fn band_pair(comp: CompParams, y: i32, band_x: u32) -> vec2<f32> {
+    let row_bands = u32(y & 1) << 1u;
+    let band_row = u32(y >> 1u) * params.band_width;
+    let even = comp.band_offset[row_bands] + band_row;
+    let odd = comp.band_offset[row_bands | 1u] + band_row;
+    return vec2<f32>(pyramid[even + band_x], pyramid[odd + band_x]);
+}
+
+// Eight segments of one interior row, from the 36 staged band samples.
+fn lift_staged_row(slot: u32, row: u32, segment: u32) {
+    let local = 4u * segment;
+    var v: array<f32, 16>;
+    v[0] = band_even[slot + local + 0u];
+    v[1] = band_odd[slot + local + 0u];
+    v[2] = band_even[slot + local + 1u];
+    v[3] = band_odd[slot + local + 1u];
+    v[4] = band_even[slot + local + 2u];
+    v[5] = band_odd[slot + local + 2u];
+    v[6] = band_even[slot + local + 3u];
+    v[7] = band_odd[slot + local + 3u];
+    v[8] = band_even[slot + local + 4u];
+    v[9] = band_odd[slot + local + 4u];
+    v[10] = band_even[slot + local + 5u];
+    v[11] = band_odd[slot + local + 5u];
+    v[12] = band_even[slot + local + 6u];
+    v[13] = band_odd[slot + local + 6u];
+    v[14] = band_even[slot + local + 7u];
+    v[15] = band_odd[slot + local + 7u];
+    lift(&v);
+    let out = row * TILE + 8u * segment;
+    horizontal[out + 0u] = v[4];
+    horizontal[out + 1u] = v[5];
+    horizontal[out + 2u] = v[6];
+    horizontal[out + 3u] = v[7];
+    horizontal[out + 4u] = v[8];
+    horizontal[out + 5u] = v[9];
+    horizontal[out + 6u] = v[10];
+    horizontal[out + 7u] = v[11];
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
     let comp = params.comps[wg.z];
@@ -216,17 +260,46 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     let out_height = i32(params.image_height);
     let tile_x = i32(wg.x * TILE);
     let tile_y = i32(wg.y * TILE_H);
-
-    // Horizontal pass: 40 rows x 8 segments = 320 segments across 256 threads.
-    let h_seg = tid % 8u;
-    let row0 = 2u * ((tid % 128u) / 8u) + (tid / 128u);
-    horiz_segment(comp, tile_x, tile_y, out_width, out_height, row0, h_seg);
-    if (tid < 64u) {
-        let row1 = 32u + 2u * ((tid % 32u) / 8u) + (tid / 32u);
-        horiz_segment(comp, tile_x, tile_y, out_width, out_height, row1, h_seg);
-    }
     init_levels(tid);
-    workgroupBarrier();
+
+    // The neighbourhood of an interior tile sits inside the image, so the
+    // band rows are contiguous and a warp can load them in order. Border
+    // tiles keep the mirrored scalar path.
+    let interior = tile_x >= APRON && tile_y >= APRON && tile_x + i32(TILE) + APRON <= out_width && tile_y + i32(TILE_H) + APRON <= out_height;
+    if (interior) {
+        let warp = tid >> 5u;
+        let lane = tid & 31u;
+        let bx0 = u32(tile_x - APRON) >> 1u;
+        for (var phase: u32 = 0u; phase < 5u; phase++) {
+            let row = warp + phase * 8u;
+            let y = tile_y + i32(row) - APRON;
+            let slot = warp * 36u;
+            if (lane < 32u) {
+                let pair = band_pair(comp, y, bx0 + lane);
+                band_even[slot + lane] = pair.x;
+                band_odd[slot + lane] = pair.y;
+            }
+            if (lane < 4u) {
+                let pair = band_pair(comp, y, bx0 + 32u + lane);
+                band_even[slot + 32u + lane] = pair.x;
+                band_odd[slot + 32u + lane] = pair.y;
+            }
+            workgroupBarrier();
+            if (lane < 8u) {
+                lift_staged_row(slot, row, lane);
+            }
+            workgroupBarrier();
+        }
+    } else {
+        let h_seg = tid % 8u;
+        let row0 = 2u * ((tid % 128u) / 8u) + (tid / 128u);
+        horiz_segment(comp, tile_x, tile_y, out_width, out_height, row0, h_seg);
+        if (tid < 64u) {
+            let row1 = 32u + 2u * ((tid % 32u) / 8u) + (tid / 32u);
+            horiz_segment(comp, tile_x, tile_y, out_width, out_height, row1, h_seg);
+        }
+        workgroupBarrier();
+    }
 
     // Vertical pass: 64 columns x 4 vertical segments = 256 invocations (100% active).
     let is_final = comp.is_plane != 0u;
@@ -257,7 +330,7 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
     if (is_final) {
         store_vertical_8(
             comp,
-            wg.z,
+            comp.pad2,
             u32(x),
             u32(y),
             base,

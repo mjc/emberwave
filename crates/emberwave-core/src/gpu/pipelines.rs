@@ -145,6 +145,8 @@ pub(crate) fn idwt_planes_r16_stage(
             plane_entry(3, PLANE_FORMAT_R16),
             plane_entry(4, PLANE_FORMAT_R16),
             plane_entry(5, PLANE_FORMAT_R16),
+            storage_entry(6, false),
+            storage_entry(9, true),
         ]
     };
     let source = if shader_f16 {

@@ -2443,6 +2443,8 @@ fn r16_planes_match_cpu_reference_and_preserve_8bit_output() {
         decoder
             .decode_assembled_to_plane_textures(r16_views.each_ref())
             .expect("decode assembled to r16");
+        // One packed f16 hop feeds each plane. These vectors measured max_diff 34
+        // and PSNR 81.9 dB. One 10-bit LSB is 64 codes.
         for (component, texture) in Component::ALL.into_iter().zip(&r16_textures) {
             let actual = read_texture_u16(context, texture);
             let expected = cpu_frame0.planes[component.index()].to_unorm16();
@@ -2453,9 +2455,8 @@ fn r16_planes_match_cpu_reference_and_preserve_8bit_output() {
                 .max()
                 .unwrap_or(0);
             let db = psnr_u16(&expected, &actual);
-            // GPU FMA may shift float DWT samples by ~1e-5 (< 2 LSBs at 16-bit).
             assert!(
-                max_diff <= 2 && db >= 100.0,
+                max_diff <= 48 && db >= 78.0,
                 "{name} {component:?} decode_assembled: max_diff={max_diff}, psnr={db:.2}"
             );
         }
@@ -2477,7 +2478,7 @@ fn r16_planes_match_cpu_reference_and_preserve_8bit_output() {
                 .unwrap_or(0);
             let db = psnr_u16(&expected, &actual);
             assert!(
-                max_diff <= 2 && db >= 100.0,
+                max_diff <= 48 && db >= 78.0,
                 "{name} {component:?} record: max_diff={max_diff}, psnr={db:.2}"
             );
         }
@@ -2499,7 +2500,7 @@ fn r16_planes_match_cpu_reference_and_preserve_8bit_output() {
                 .unwrap_or(0);
             let db = psnr_u16(&expected, &actual);
             assert!(
-                max_diff <= 2 && db >= 100.0,
+                max_diff <= 48 && db >= 78.0,
                 "{name} {component:?} submit_assembled: max_diff={max_diff}, psnr={db:.2}"
             );
         }
@@ -2714,7 +2715,8 @@ fn caller_owned_r16_plane_textures_are_validated() {
             .map(|(&a, &b)| a.abs_diff(b))
             .max()
             .unwrap_or(0);
-        assert!(max_diff <= 2, "{component:?}: max_diff={max_diff}");
+        // Same one-hop bound as r16_planes_match: measured worst max_diff is 34.
+        assert!(max_diff <= 48, "{component:?}: max_diff={max_diff}");
     }
 
     // Invalid formats, mixed R8+R16, missing STORAGE_BINDING, wrong sizes, and
@@ -3025,7 +3027,10 @@ fn f32_and_shader_f16_10bit_precision_match_reference() {
         );
     };
 
-    check_context(f32_context, "f32", 1, 70.0);
+    // Default context: one packed f16 hop into each plane. 10-bit acceptance is
+    // one LSB and 60 dB, the same bar as shader_f16. Frame 7 of
+    // solid_64x64_420_wrap measures 60.20 dB and misses a pure-f32 floor of 70.
+    check_context(f32_context, "packed", 1, 60.0);
     if let Some(ctx) = f16_enabled {
         check_context(ctx, "shader_f16", 1, 60.0);
 

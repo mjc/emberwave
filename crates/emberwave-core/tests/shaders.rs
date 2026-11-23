@@ -83,7 +83,12 @@ fn the_workgroup_variables_are_the_ones_checked_for_writes_before_reads() {
         ("block8_meta", 64),
         ("block8_packed_counts", 64),
     ];
-    let idwt: &[Variable] = &[("horizontal", 10240), ("levels", 2048)];
+    let idwt: &[Variable] = &[
+        ("horizontal", 10240),
+        ("band_even", 1152),
+        ("band_odd", 1152),
+        ("levels", 2048),
+    ];
     let fdwt: &[Variable] = &[("horizontal", 5120)];
     // quantise.wgsl's, in front of equant.wgsl's and pack.wgsl's.
     let quantise: &[Variable] = &[
@@ -199,7 +204,14 @@ fn the_inverse_transform_that_stores_planes_differs_only_in_its_store() {
             (name, layouter[variable.ty].size)
         })
         .collect();
-    assert_eq!(workgroup, [("horizontal".to_owned(), 10240)]);
+    assert_eq!(
+        workgroup,
+        [
+            ("horizontal".to_owned(), 10240),
+            ("band_even".to_owned(), 1152),
+            ("band_odd".to_owned(), 1152),
+        ]
+    );
     let store = naga::StorageAccess::STORE;
     assert_eq!(
         storage_textures(&module),
@@ -235,10 +247,19 @@ fn the_r16_plane_shader_requires_only_16bit_norm_storage_textures() {
         "r16unorm storage shader unexpectedly validated with empty capabilities"
     );
 
-    // Must pass with only STORAGE_TEXTURE_16BIT_NORM_FORMATS.
+    // pack2x16float needs naga's SHADER_FLOAT16_IN_FLOAT32. wgpu maps that to
+    // the downlevel flag SHADER_F16_IN_F32, which Vulkan sets without
+    // Features::SHADER_F16. The 16-bit storage format is still required.
+    let packed = Capabilities::SHADER_FLOAT16_IN_FLOAT32;
+    assert!(
+        Validator::new(ValidationFlags::all(), packed)
+            .validate(&module)
+            .is_err(),
+        "r16unorm storage shader unexpectedly validated without 16-bit storage"
+    );
     Validator::new(
         ValidationFlags::all(),
-        Capabilities::STORAGE_TEXTURE_16BIT_NORM_FORMATS,
+        Capabilities::STORAGE_TEXTURE_16BIT_NORM_FORMATS | packed,
     )
     .validate(&module)
     .unwrap_or_else(|error| panic!("idwt planes r16 does not validate: {error:?}"));
@@ -264,7 +285,17 @@ fn the_r16_plane_shader_requires_only_16bit_norm_storage_textures() {
             (name, layouter[variable.ty].size)
         })
         .collect();
-    assert_eq!(workgroup, [("horizontal".to_owned(), 10240)]);
+    // 10240 + 1152 + 1152 = 12544, under 16 KiB.
+    assert_eq!(
+        workgroup,
+        [
+            ("horizontal".to_owned(), 10240),
+            ("band_even".to_owned(), 1152),
+            ("band_odd".to_owned(), 1152),
+        ]
+    );
+    let total: u32 = workgroup.iter().map(|(_, size)| size).sum();
+    assert!(total <= 16 * 1024, "{total}");
 
     let store = naga::StorageAccess::STORE;
     assert_eq!(

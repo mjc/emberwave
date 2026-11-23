@@ -20,6 +20,7 @@ use super::context::{
     AfterSubmit, ConcealPipeline, GpuContext, QueueTurns, R16PlanePipeline, SubmissionHooks,
     notice_loss, submit, take_turn,
 };
+use super::cull::{self, PyramidCull, TileRegion};
 use super::error::GpuError;
 use super::layout::{
     BufferLayout, ConcealParams, DequantParams, TransformLevel, YuvParams, grid_for,
@@ -178,6 +179,22 @@ struct ColorResources {
 /// passes (one per level), and the colour conversion.
 const TIMED_STAGES: u32 = 2 + DECOMPOSITION_LEVELS as u32;
 
+/// Buffers for the r16 inverse transform that dispatches one workgroup per
+/// changed tile and keeps intermediate lowpass bands packed.
+struct FastTiles {
+    ll_packed: wgpu::Buffer,
+    tile_ids: wgpu::Buffer,
+    regions: Vec<TileRegion>,
+    full_counts: [u32; DECOMPOSITION_LEVELS],
+    counts: [u32; DECOMPOSITION_LEVELS],
+    full_bytes: Vec<u8>,
+    /// The GPU buffer holds [`full_bytes`]. A sparse frame clears it.
+    gpu_full: bool,
+    dummy_views: [wgpu::TextureView; 3],
+    _dummy_textures: [wgpu::Texture; 3],
+    cull: PyramidCull,
+}
+
 /// A dispatch of the inverse transform for one decomposition level.
 struct IdwtStage {
     bind_group: wgpu::BindGroup,
@@ -199,6 +216,8 @@ enum PlaneFill {
     Store {
         pipeline: wgpu::ComputePipeline,
         bind_groups: [Option<wgpu::BindGroup>; DECOMPOSITION_LEVELS],
+        /// One workgroup per tile id, instead of the level's full grid.
+        fast_tiles: bool,
     },
 }
 
@@ -211,6 +230,17 @@ enum Output {
     Picture(Fill),
     /// The Y, Cb and Cr planes.
     Planes(PlaneFill),
+}
+
+fn output_uses_fast_tiles(output: &Output) -> bool {
+    if let Output::Planes(PlaneFill::Store {
+        fast_tiles: true, ..
+    }) = output
+    {
+        true
+    } else {
+        false
+    }
 }
 
 struct PassOptions<'a> {
@@ -275,6 +305,9 @@ pub struct Decoder {
     conceal_written: bool,
 
     idwt_stages: Vec<IdwtStage>,
+    /// Present when this device stores `r16unorm` planes and does not run the
+    /// `f16` inverse transform. Those decodes use [`FastTiles`].
+    fast: Option<FastTiles>,
 
     color: Option<ColorResources>,
     /// What draws the RGB picture into a texture, made by the first such
@@ -390,6 +423,22 @@ impl Decoder {
             )?;
         }
         check_size(&device, "the packed planes", buffers.packed_words * 4)?;
+        let fast_r16 = context.supports_plane_format(PLANE_FORMAT_R16) && !shader_f16;
+        let tile_plan = fast_r16.then(|| {
+            super::cull::plan_tiles(
+                &layout,
+                u64::from(device.limits().min_storage_buffer_offset_alignment.max(256)),
+                false,
+            )
+        });
+        if let Some(plan) = &tile_plan {
+            check_size(
+                &device,
+                "the packed lowpass",
+                (buffers.ll_f16_elements * 2).max(4),
+            )?;
+            check_size(&device, "the tile lists", plan.bytes.len() as u64)?;
+        }
 
         // The parameters written below wait in a command buffer of the queue
         // until a submission. On a queue of the caller's they are written
@@ -459,7 +508,11 @@ impl Decoder {
             let idwt_stages = (0..DECOMPOSITION_LEVELS)
                 .rev()
                 .map(|level| {
-                    let stage = TransformLevel::new(&layout, &buffers, level);
+                    let stage = if shader_f16 {
+                        TransformLevel::with_f16_lowpass(&layout, &buffers, level)
+                    } else {
+                        TransformLevel::new(&layout, &buffers, level)
+                    };
                     let params = uniform_buffer(&device, &queue, "idwt params", &stage.params);
                     let bind_group = if let Some(ll_f16) = &ll_f16 {
                         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -492,6 +545,55 @@ impl Decoder {
                 .supports_timestamps()
                 .then(|| StageQueries::new(&device, &queue, TIMED_STAGES));
 
+            let fast = tile_plan.map(|plan| {
+                let ll_packed = storage(
+                    "packed ll",
+                    (buffers.ll_f16_elements * 2).max(4),
+                    wgpu::BufferUsages::STORAGE,
+                );
+                let tile_ids = storage(
+                    "idwt tiles",
+                    plan.bytes.len() as u64,
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                );
+                queue.write_buffer(&tile_ids, 0, &plan.bytes);
+                let dummy_textures = [0, 1, 2].map(|_| {
+                    device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("idwt dummy plane"),
+                        size: wgpu::Extent3d {
+                            width: 1,
+                            height: 1,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: PLANE_FORMAT_R16,
+                        usage: wgpu::TextureUsages::STORAGE_BINDING,
+                        view_formats: &[],
+                    })
+                });
+                let dummy_views = dummy_textures
+                    .each_ref()
+                    .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
+                let mut full_counts = [0u32; DECOMPOSITION_LEVELS];
+                for (index, count) in plan.counts.iter().copied().enumerate() {
+                    full_counts[index] = count;
+                }
+                FastTiles {
+                    ll_packed,
+                    tile_ids,
+                    regions: plan.regions,
+                    full_counts,
+                    counts: full_counts,
+                    full_bytes: plan.bytes,
+                    gpu_full: true,
+                    dummy_views,
+                    _dummy_textures: dummy_textures,
+                    cull: PyramidCull::default(),
+                }
+            });
+
             Self {
                 device: device.clone(),
                 queue: queue.clone(),
@@ -523,6 +625,7 @@ impl Decoder {
                 conceal_pipeline: context.conceal_pipeline(),
                 conceal_written: false,
                 idwt_stages,
+                fast,
                 color: None,
                 draw: None,
                 timestamps,
@@ -1178,9 +1281,12 @@ impl Decoder {
 
     /// Discards what was received, and forgets the order of the frames: the
     /// next packet starts a frame, whatever its sequence number. See
-    /// [`FrameAssembler::clear`].
+    /// [`FrameAssembler::clear`]. The next decode redraws every tile.
     pub fn clear(&mut self) {
         self.assembler.clear();
+        if let Some(fast) = &mut self.fast {
+            fast.cull.forget();
+        }
     }
 
     /// The start of frame header of the frame being received, once it has
@@ -1388,6 +1494,7 @@ impl Decoder {
         let submit_prep_start = Instant::now();
         let output = self.prepare_output(color, read, prepared_planes)?;
         let conceal = self.prepare_concealment(slot_index)?;
+        self.prepare_fast_tiles(&output, conceal);
         let submit_prep = submit_prep_start.elapsed();
         let prepare = assembled_in + prepare_start.elapsed();
 
@@ -1518,6 +1625,9 @@ impl Decoder {
     /// copied otherwise (decisions D41, D52).
     fn plane_fill(&self, targets: [&wgpu::TextureView; 3]) -> Result<PlaneFill, GpuError> {
         let format = targets[0].texture().format();
+        if format == PLANE_FORMAT_R16 && self.fast.is_some() {
+            return self.bind_fast_planes(targets);
+        }
         let [y, cb, cr] = targets;
         let build_bind_groups = |stage: &Stage, label: &str| {
             with_error_scope_kind(&self.device, || {
@@ -1556,6 +1666,7 @@ impl Decoder {
                 PlaneFill::Store {
                     pipeline: stage.pipeline.clone(),
                     bind_groups,
+                    fast_tiles: false,
                 }
             })
         };
@@ -1581,6 +1692,128 @@ impl Decoder {
             return Ok(PlaneFill::Copy);
         }
         Ok(build_bind_groups(stage, "idwt planes").unwrap_or(PlaneFill::Copy))
+    }
+
+    /// Bind groups for every level of the fast 16-bit inverse transform.
+    ///
+    /// Levels that do not write a plane still bind a group, aimed at 1×1
+    /// stand-in textures, because the pipeline's plane bindings are always
+    /// there. Every level shares the packed lowpass: a coarser level writes
+    /// the band the next finer level reads.
+    fn bind_fast_planes(&self, targets: [&wgpu::TextureView; 3]) -> Result<PlaneFill, GpuError> {
+        let stage = self.r16_plane_pipeline.get(&self.device, self.shader_f16)?;
+        let fast = self.fast.as_ref().expect("fast r16 tiles");
+        let [y, cb, cr] = targets;
+        let planes = [y, cb, cr];
+        with_error_scope_kind(&self.device, || {
+            let bind_groups = std::array::from_fn(|index| {
+                let level = &self.idwt_stages[index];
+                let views = if level.writes_plane {
+                    planes
+                } else {
+                    fast.dummy_views.each_ref()
+                };
+                let region = &fast.regions[index];
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("idwt planes r16"),
+                    layout: &stage.layout,
+                    entries: &[
+                        entry(0, &self.pyramid),
+                        entry(2, &level.params),
+                        texture(3, views[0]),
+                        texture(4, views[1]),
+                        texture(5, views[2]),
+                        entry(6, &fast.ll_packed),
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &fast.tile_ids,
+                                offset: region.offset,
+                                size: std::num::NonZeroU64::new(region.size),
+                            }),
+                        },
+                    ],
+                }))
+            });
+            PlaneFill::Store {
+                pipeline: stage.pipeline.clone(),
+                bind_groups,
+                fast_tiles: true,
+            }
+        })
+        .map_err(|error| match error {
+            ScopedError::Validation(message) => GpuError::Texture(format!(
+                "a target view is unsuitable for 16-bit plane stores: {message}"
+            )),
+            ScopedError::Device(error) => error,
+        })
+    }
+
+    /// Rewrites the tile lists the fast inverse transform dispatches.
+    ///
+    /// A repeated payload keeps the tile it already painted. The first frame,
+    /// a concealed frame and a frame that changes more than half of its blocks
+    /// redraw every tile.
+    fn prepare_fast_tiles(&mut self, output: &Output, conceal: bool) {
+        if !output_uses_fast_tiles(output) || self.fast.is_none() {
+            return;
+        }
+        enum TileUpload {
+            Full,
+            Regions(Vec<(u64, Vec<u32>)>),
+        }
+        let write = {
+            let layout = self.assembler.layout();
+            let frame = self.assembler.frame();
+            let fast = self.fast.as_mut().expect("fast r16 tiles");
+            let mut change = fast.cull.observe(layout.block_count(), |index| {
+                frame.block(index).unwrap_or(&[])
+            });
+            if conceal {
+                change.force_full = true;
+                fast.cull.forget();
+            }
+            if change.force_full {
+                fast.counts = fast.full_counts;
+                if fast.gpu_full {
+                    None
+                } else {
+                    fast.gpu_full = true;
+                    Some(TileUpload::Full)
+                }
+            } else {
+                let mut parent = None;
+                let mut regions = Vec::new();
+                let mut counts = [0u32; DECOMPOSITION_LEVELS];
+                for (index, level) in (0..DECOMPOSITION_LEVELS).rev().enumerate() {
+                    let selected =
+                        cull::select_tiles(layout, level, &change.bits, parent.as_deref(), None);
+                    counts[index] = u32::try_from(selected.ids.len()).unwrap_or(u32::MAX);
+                    if !selected.ids.is_empty() {
+                        regions.push((fast.regions[index].offset, selected.ids));
+                    }
+                    parent = Some(selected.coverage);
+                }
+                fast.counts = counts;
+                fast.gpu_full = false;
+                Some(TileUpload::Regions(regions))
+            }
+        };
+        let Some(fast) = self.fast.as_ref() else {
+            return;
+        };
+        match write {
+            None => {}
+            Some(TileUpload::Full) => {
+                self.queue.write_buffer(&fast.tile_ids, 0, &fast.full_bytes);
+            }
+            Some(TileUpload::Regions(regions)) => {
+                for (offset, ids) in &regions {
+                    self.queue
+                        .write_buffer(&fast.tile_ids, *offset, bytemuck::cast_slice(ids));
+                }
+            }
+        }
     }
 
     /// Records, after the passes, what `read` asks of textures, which
@@ -1647,6 +1880,7 @@ impl Decoder {
         }
         let output = self.prepare_output(color, read, prepared_planes)?;
         let conceal = self.prepare_concealment(0)?;
+        self.prepare_fast_tiles(&output, conceal);
         self.encode_passes(
             encoder,
             PassOptions {
@@ -1708,6 +1942,7 @@ impl Decoder {
             }
             let output = self.prepare_output(color, read, prepared_planes)?;
             let conceal = self.prepare_concealment(slot_index)?;
+            self.prepare_fast_tiles(&output, conceal);
             self.encode_passes(
                 &mut encoder,
                 PassOptions {
@@ -2018,12 +2253,13 @@ impl Decoder {
             }
         }
 
-        let (plane_pipeline, stores) = match output {
+        let (plane_pipeline, stores, fast_tiles) = match output {
             Output::Planes(PlaneFill::Store {
                 pipeline,
                 bind_groups,
-            }) => (Some(pipeline), bind_groups.as_slice()),
-            _ => (None, &[][..]),
+                fast_tiles,
+            }) => (Some(pipeline), bind_groups.as_slice(), *fast_tiles),
+            _ => (None, &[][..], false),
         };
 
         if per_level_idwt {
@@ -2032,17 +2268,7 @@ impl Decoder {
                     label: Some("idwt level"),
                     timestamp_writes: writes(1 + index as u32),
                 });
-                match (stores.get(index), plane_pipeline) {
-                    (Some(Some(bind_group)), Some(pipeline)) => {
-                        pass.set_pipeline(pipeline);
-                        pass.set_bind_group(0, bind_group, &[]);
-                    }
-                    _ => {
-                        pass.set_pipeline(&self.pipelines.idwt.pipeline);
-                        pass.set_bind_group(0, &stage.bind_group, &[]);
-                    }
-                }
-                pass.dispatch_workgroups(stage.grid.0, stage.grid.1, stage.grid.2);
+                self.dispatch_idwt(&mut pass, index, stage, stores, plane_pipeline, fast_tiles);
             }
         } else {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2050,17 +2276,7 @@ impl Decoder {
                 timestamp_writes: writes(1),
             });
             for (index, stage) in self.idwt_stages.iter().enumerate() {
-                match (stores.get(index), plane_pipeline) {
-                    (Some(Some(bind_group)), Some(pipeline)) => {
-                        pass.set_pipeline(pipeline);
-                        pass.set_bind_group(0, bind_group, &[]);
-                    }
-                    _ => {
-                        pass.set_pipeline(&self.pipelines.idwt.pipeline);
-                        pass.set_bind_group(0, &stage.bind_group, &[]);
-                    }
-                }
-                pass.dispatch_workgroups(stage.grid.0, stage.grid.1, stage.grid.2);
+                self.dispatch_idwt(&mut pass, index, stage, stores, plane_pipeline, fast_tiles);
             }
         }
 
@@ -2077,6 +2293,41 @@ impl Decoder {
             pass.set_pipeline(&self.pipelines.yuv2rgb.pipeline);
             pass.set_bind_group(0, &resources.bind_group, &[]);
             pass.dispatch_workgroups(resources.grid.0, resources.grid.1, 1);
+        }
+    }
+
+    /// One inverse-transform level. A fast 16-bit level launches one workgroup
+    /// per tile id and skips the level when that list is empty. The timestamp
+    /// pass around it is still opened.
+    fn dispatch_idwt<'pass>(
+        &'pass self,
+        pass: &mut wgpu::ComputePass<'pass>,
+        index: usize,
+        stage: &'pass IdwtStage,
+        stores: &'pass [Option<wgpu::BindGroup>],
+        plane_pipeline: Option<&'pass wgpu::ComputePipeline>,
+        fast_tiles: bool,
+    ) {
+        if let (Some(Some(bind_group)), Some(pipeline)) = (stores.get(index), plane_pipeline) {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            if fast_tiles {
+                match self.fast.as_ref() {
+                    Some(fast) if fast.counts[index] > 0 => {
+                        pass.dispatch_workgroups(fast.counts[index], 1, 1);
+                    }
+                    Some(_) => {}
+                    None => {
+                        pass.dispatch_workgroups(stage.grid.0, stage.grid.1, stage.grid.2);
+                    }
+                }
+            } else {
+                pass.dispatch_workgroups(stage.grid.0, stage.grid.1, stage.grid.2);
+            }
+        } else {
+            pass.set_pipeline(&self.pipelines.idwt.pipeline);
+            pass.set_bind_group(0, &stage.bind_group, &[]);
+            pass.dispatch_workgroups(stage.grid.0, stage.grid.1, stage.grid.2);
         }
     }
 
@@ -3172,10 +3423,23 @@ mod tests {
             .plane_fill(plain_views.each_ref())
             .expect("r16 plane_fill")
         {
-            PlaneFill::Store { bind_groups, .. } => assert_eq!(
-                bind_groups.iter().map(Option::is_some).collect::<Vec<_>>(),
-                [false, false, false, true, true]
-            ),
+            PlaneFill::Store {
+                bind_groups,
+                fast_tiles,
+                ..
+            } => {
+                let fast = !context.supports_f16();
+                assert_eq!(fast_tiles, fast);
+                let expected = if fast {
+                    vec![true, true, true, true, true]
+                } else {
+                    vec![false, false, false, true, true]
+                };
+                assert_eq!(
+                    bind_groups.iter().map(Option::is_some).collect::<Vec<_>>(),
+                    expected
+                );
+            }
             PlaneFill::Copy => panic!("r16 planes must always store, never copy"),
         }
 
