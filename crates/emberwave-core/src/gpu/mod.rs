@@ -77,6 +77,20 @@ pub mod shader_sources {
         include_str!("shaders/idwt.wgsl"),
         include_str!("shaders/idwt_planes_r16.wgsl")
     );
+    /// Capability-gated `f16` intermediate variants for adapters with
+    /// [`wgpu::Features::SHADER_F16`].
+    pub const IDWT_F16: &str = concat!(
+        include_str!("shaders/idwt_f16.wgsl"),
+        include_str!("shaders/idwt_packed_f16.wgsl")
+    );
+    pub const IDWT_PLANES_F16: &str = concat!(
+        include_str!("shaders/idwt_f16.wgsl"),
+        include_str!("shaders/idwt_planes.wgsl")
+    );
+    pub const IDWT_PLANES_R16_F16: &str = concat!(
+        include_str!("shaders/idwt_f16.wgsl"),
+        include_str!("shaders/idwt_planes_r16.wgsl")
+    );
     /// 8-bit YCbCr planes to RGB.
     pub const YUV2RGB: &str = include_str!("shaders/yuv2rgb.wgsl");
     /// The RGB picture drawn into a texture: a vertex and a fragment shader,

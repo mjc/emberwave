@@ -34,6 +34,11 @@ pub(crate) struct BufferLayout {
     band_offsets: [[[u32; BANDS_PER_LEVEL]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS],
     /// Size of the pyramid in floats.
     pub pyramid_floats: u64,
+    /// Element offset of intermediate `f16` LL band `[component][level]`.
+    ll_f16_offsets: [[u32; DECOMPOSITION_LEVELS]; NUM_COMPONENTS],
+    /// Size of the intermediate `f16` LL buffer in `f16` elements (even, for
+    /// 4-byte copy alignment).
+    pub ll_f16_elements: u64,
     /// Word offset of each packed 8-bit plane.
     pub packed_offsets: [u32; NUM_COMPONENTS],
     /// Words per row of each packed plane.
@@ -79,6 +84,8 @@ impl BufferLayout {
     ) -> Result<Self, GpuError> {
         let mut band_offsets = [[[ABSENT; BANDS_PER_LEVEL]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS];
         let mut pyramid_floats = 0u64;
+        let mut ll_f16_offsets = [[ABSENT; DECOMPOSITION_LEVELS]; NUM_COMPONENTS];
+        let mut ll_f16_elements = 0u64;
 
         for component in Component::ALL {
             // 4:2:0 chroma has no finest level.
@@ -92,6 +99,10 @@ impl BufferLayout {
                 for band in Band::ALL {
                     offsets[band.index()] = to_offset(pyramid_floats)?;
                     pyramid_floats += u64::from(width) * u64::from(height);
+                }
+                if level + 1 < DECOMPOSITION_LEVELS {
+                    ll_f16_offsets[component.index()][level] = to_offset(ll_f16_elements)?;
+                    ll_f16_elements += (u64::from(width) * u64::from(height)).next_multiple_of(2);
                 }
             }
         }
@@ -111,6 +122,8 @@ impl BufferLayout {
         Ok(Self {
             band_offsets,
             pyramid_floats,
+            ll_f16_offsets,
+            ll_f16_elements,
             packed_offsets,
             packed_strides,
             packed_words,
@@ -129,6 +142,13 @@ impl BufferLayout {
             .get(component.index())?
             .get(level)?
             .get(band.index())?;
+        (offset != ABSENT).then_some(offset)
+    }
+
+    /// Element offset of an intermediate `f16` LL band, if the component has that level
+    /// and it is finer than the coarsest level.
+    pub(crate) fn ll_f16_offset(&self, component: Component, level: usize) -> Option<u32> {
+        let offset = *self.ll_f16_offsets.get(component.index())?.get(level)?;
         (offset != ABSENT).then_some(offset)
     }
 }
@@ -629,6 +649,7 @@ impl TransformLevel {
 
             let comp = &mut params.comps[component.index()];
             comp.band_offset = offsets;
+            comp.pad[0] = buffers.ll_f16_offset(component, level).unwrap_or(ABSENT);
             if level == layout.finest_level(component) {
                 let (width, height) = layout.plane_size(component);
                 comp.image_offset = buffers.packed_offsets[component.index()];
@@ -641,6 +662,9 @@ impl TransformLevel {
                 comp.image_offset = buffers
                     .band_offset(component, level - 1, Band::Ll)
                     .expect("the next finer level exists");
+                comp.pad[1] = buffers
+                    .ll_f16_offset(component, level - 1)
+                    .unwrap_or(ABSENT);
                 comp.image_stride = 2 * band_width;
                 comp.plane_width = 2 * band_width;
                 comp.plane_height = 2 * band_height;
@@ -654,9 +678,14 @@ impl TransformLevel {
 
     /// Workgroup grid: 32x32 tiles of the image in x and y, components in z.
     pub(crate) fn grid(&self) -> (u32, u32, u32) {
+        self.grid_for_tile(32, 32)
+    }
+
+    /// Workgroup grid for a given `(tile_width, tile_height)` output tile.
+    pub(crate) fn grid_for_tile(&self, tile_width: u32, tile_height: u32) -> (u32, u32, u32) {
         (
-            self.params.image_width.div_ceil(32),
-            self.params.image_height.div_ceil(32),
+            self.params.image_width.div_ceil(tile_width),
+            self.params.image_height.div_ceil(tile_height),
             self.components,
         )
     }

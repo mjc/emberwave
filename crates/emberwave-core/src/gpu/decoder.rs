@@ -250,6 +250,7 @@ pub struct Decoder {
     pending_decode_count: u32,
     pending_clear_count: u32,
     pyramid: wgpu::Buffer,
+    ll_f16: Option<wgpu::Buffer>,
     packed: wgpu::Buffer,
     /// Made by the first decode that reads the planes back: a player never
     /// does, and the browser's never may.
@@ -258,6 +259,7 @@ pub struct Decoder {
     pipelines: Arc<Pipelines>,
     r16_planes: bool,
     r16_plane_pipeline: R16PlanePipeline,
+    shader_f16: bool,
 
     dequant_params: wgpu::Buffer,
     dequant_grid: (u32, u32),
@@ -378,7 +380,15 @@ impl Decoder {
             .pipelines()
             .map_err(|error| context.explain(error))?;
 
+        let shader_f16 = context.supports_f16();
         check_size(&device, "the wavelet pyramid", buffers.pyramid_floats * 4)?;
+        if shader_f16 {
+            check_size(
+                &device,
+                "the f16 LL pyramid",
+                (buffers.ll_f16_elements * 2).max(4),
+            )?;
+        }
         check_size(&device, "the packed planes", buffers.packed_words * 4)?;
 
         // The parameters written below wait in a command buffer of the queue
@@ -410,6 +420,13 @@ impl Decoder {
                 buffers.pyramid_floats * 4,
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             );
+            let ll_f16 = shader_f16.then(|| {
+                storage(
+                    "wavelet ll f16",
+                    (buffers.ll_f16_elements * 2).max(4),
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                )
+            });
             // COPY_DST lets a test fill the planes before a decode, to see
             // that the decode writes every word of them.
             let packed = storage(
@@ -444,15 +461,29 @@ impl Decoder {
                 .map(|level| {
                     let stage = TransformLevel::new(&layout, &buffers, level);
                     let params = uniform_buffer(&device, &queue, "idwt params", &stage.params);
-                    IdwtStage {
-                        bind_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    let bind_group = if let Some(ll_f16) = &ll_f16 {
+                        device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("idwt f16"),
+                            layout: &pipelines.idwt.layout,
+                            entries: &[
+                                entry(0, &pyramid),
+                                entry(1, &packed),
+                                entry(2, &params),
+                                entry(6, ll_f16),
+                            ],
+                        })
+                    } else {
+                        device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("idwt"),
                             layout: &pipelines.idwt.layout,
                             entries: &[entry(0, &pyramid), entry(1, &packed), entry(2, &params)],
-                        }),
+                        })
+                    };
+                    IdwtStage {
+                        bind_group,
                         writes_plane: stage.params.comps.iter().any(|comp| comp.is_plane != 0),
                         params,
-                        grid: stage.grid(),
+                        grid: stage.grid_for_tile(64, 32),
                     }
                 })
                 .collect();
@@ -478,11 +509,13 @@ impl Decoder {
                 pending_decode_count: 0,
                 pending_clear_count: 0,
                 pyramid,
+                ll_f16,
                 packed,
                 readback: None,
                 pipelines: Arc::clone(&pipelines),
                 r16_planes: context.supports_plane_format(PLANE_FORMAT_R16),
                 r16_plane_pipeline: context.r16_plane_pipeline(),
+                shader_f16,
                 dequant_params,
                 dequant_grid,
                 concealment: false,
@@ -1490,19 +1523,34 @@ impl Decoder {
             with_error_scope_kind(&self.device, || {
                 let bind_groups: [Option<wgpu::BindGroup>; DECOMPOSITION_LEVELS] =
                     std::array::from_fn(|index| {
-                        self.idwt_stages[index].writes_plane.then(|| {
-                            let level = &self.idwt_stages[index];
-                            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some(label),
-                                layout: &stage.layout,
-                                entries: &[
-                                    entry(0, &self.pyramid),
-                                    entry(2, &level.params),
-                                    texture(3, y),
-                                    texture(4, cb),
-                                    texture(5, cr),
-                                ],
-                            })
+                        let level = &self.idwt_stages[index];
+                        level.writes_plane.then(|| {
+                            if let Some(ll_f16) = &self.ll_f16 {
+                                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: Some(label),
+                                    layout: &stage.layout,
+                                    entries: &[
+                                        entry(0, &self.pyramid),
+                                        entry(2, &level.params),
+                                        texture(3, y),
+                                        texture(4, cb),
+                                        texture(5, cr),
+                                        entry(6, ll_f16),
+                                    ],
+                                })
+                            } else {
+                                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: Some(label),
+                                    layout: &stage.layout,
+                                    entries: &[
+                                        entry(0, &self.pyramid),
+                                        entry(2, &level.params),
+                                        texture(3, y),
+                                        texture(4, cb),
+                                        texture(5, cr),
+                                    ],
+                                })
+                            }
                         })
                     });
                 PlaneFill::Store {
@@ -1513,7 +1561,7 @@ impl Decoder {
         };
 
         if format == PLANE_FORMAT_R16 {
-            let stage = self.r16_plane_pipeline.get(&self.device)?;
+            let stage = self.r16_plane_pipeline.get(&self.device, self.shader_f16)?;
             return build_bind_groups(&stage, "idwt planes r16").map_err(|error| match error {
                 ScopedError::Validation(message) => GpuError::Texture(format!(
                     "a target view is unsuitable for 16-bit plane stores: {message}"
@@ -2156,14 +2204,30 @@ impl Decoder {
             return Ok(None);
         };
         let (width, height) = self.layout().level_size(level);
-        let bytes = u64::from(width) * u64::from(height) * 4;
+        let samples = (width as usize) * (height as usize);
+        let f16_ll = if band == Band::Ll {
+            self.ll_f16
+                .as_ref()
+                .and_then(|buf| Some((buf, self.buffers.ll_f16_offset(component, level)?)))
+        } else {
+            None
+        };
+        let (source, source_offset, copy_bytes) = if let Some((buf, ll_offset)) = f16_ll {
+            (
+                buf,
+                u64::from(ll_offset) * 2,
+                (samples as u64 * 2).next_multiple_of(4),
+            )
+        } else {
+            (&self.pyramid, u64::from(offset) * 4, samples as u64 * 4)
+        };
 
         self.check_device()?;
         let mut recording = take_turn(self.turns.as_deref(), &self.device, &self.queue);
         let submitted = with_error_scope(&self.device, || {
             let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("band readback"),
-                size: bytes,
+                size: copy_bytes,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -2172,7 +2236,7 @@ impl Decoder {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("band readback"),
                 });
-            encoder.copy_buffer_to_buffer(&self.pyramid, u64::from(offset) * 4, &staging, 0, bytes);
+            encoder.copy_buffer_to_buffer(source, source_offset, &staging, 0, copy_bytes);
             submit(&self.queue, self.turns.as_deref(), [encoder.finish()]);
             staging
         });
@@ -2180,15 +2244,49 @@ impl Decoder {
             recording.submitted();
         }
         drop(recording);
-        let copied = submitted.and_then(|staging| read_back(&self.device, &staging, bytes));
+        let copied = submitted.and_then(|staging| read_back(&self.device, &staging, copy_bytes));
         // As in run_gpu: a failure on a device that was lost meanwhile is the loss.
         self.check_device()?;
         let data = copied?;
-        Ok(Some(
-            data.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-        ))
+        if f16_ll.is_some() {
+            Ok(Some(
+                data.chunks_exact(2)
+                    .take(samples)
+                    .map(|c| Self::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect(),
+            ))
+        } else {
+            Ok(Some(
+                data.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            ))
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn f16_to_f32(bits: u16) -> f32 {
+        let sign = u32::from(bits & 0x8000) << 16;
+        let exp = u32::from((bits >> 10) & 0x1F);
+        let frac = u32::from(bits & 0x03FF);
+        let f32_bits = if exp == 0 {
+            if frac == 0 {
+                sign
+            } else {
+                let mut m = frac;
+                let mut e = 127 - 15 + 1;
+                while (m & 0x0400) == 0 {
+                    m <<= 1;
+                    e -= 1;
+                }
+                sign | (e << 23) | ((m & 0x03FF) << 13)
+            }
+        } else if exp == 0x1F {
+            sign | (0xFF << 23) | (frac << 13)
+        } else {
+            sign | ((exp + 127 - 15) << 23) | (frac << 13)
+        };
+        f32::from_bits(f32_bits)
     }
 
     /// Bytes of the block table: where the dequant worklist starts in the staging
@@ -2527,6 +2625,7 @@ impl Drop for Decoder {
     fn drop(&mut self) {
         self.uploads.destroy_all();
         let mut buffers = vec![&self.dirty_ballots, &self.pyramid, &self.packed];
+        buffers.extend(&self.ll_f16);
         buffers.extend(&self.readback);
         if let Some(color) = &self.color {
             buffers.push(&color.rgba);
