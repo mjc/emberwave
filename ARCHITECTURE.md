@@ -2007,3 +2007,22 @@ The last frame's detail, always, gains everything on a still picture and loses u
 
 **Consequence.** Hosts and transcoders can encode 10-bit / 16-bit UNORM and P010 pictures from CPU memory or GPU textures across Vulkan, Metal, and Direct3D 12 and round-trip them through D76's `R16Unorm` decoder plane output with >10-bit gradient fidelity, while keeping 8-bit encoding bit-for-bit identical and strict-WebGPU portable.
 
+### 2026-11-22 — D78: 10-bit Rgb10a2Unorm and linear scRGB Rgba16Float capture input
+
+**Context.** D65 converted 8-bit `Rgba8Unorm` and `Bgra8Unorm` capture textures to 8-bit Y'CbCr in `gather_rgb.wgsl`, while D77 added a lazy 16-bit UNORM transform pipeline (`Planes16Resources`) for planar `R16Unorm` and P010 inputs. Screen and game captures in 10-bit (`Rgb10a2Unorm` / `DXGI_FORMAT_R10G10B10A2_UNORM`) and HDR scRGB (`Rgba16Float` / `DXGI_FORMAT_R16G16B16A16_FLOAT`) also arrive as single RGBA textures and previously had no GPU or FFI encode path without lossy 8-bit downsampling.
+
+**Decision.**
+- **Route 10-bit and FP16 RGB textures into `Planes16Resources`.** `gather_rgb.wgsl` keeps its existing integer `ForwardMatrix` 8-bit entry points (`yuv444`, `yuv420`) unchanged for `Rgba8Unorm` and `Bgra8Unorm`, and adds `yuv444_16` and `yuv420_16` writing two `u16` samples per `u32` word into `Planes16Resources::planes` (`is_plane == 2u` in `fdwt.wgsl`).
+- **Format-specific transfer, gamut, and range handling.**
+  - `Rgb10a2Unorm` (`mode == 0`) carries already-encoded non-linear R'G'B' (`round(saturate(texel.rgb) * 1023.0) / 1023.0`); no primary or OETF conversion is applied, only the stream's matrix (`ycbcr_transform`), range (`ycbcr_range`), and 4:2:0 chroma siting (`chroma_siting`).
+  - `Rgba16Float` (`mode == 1`) carries linear scRGB (`1.0` = 80 nits, BT.709 primaries). Non-finite values are zeroed before primary conversion (`sanitize_finite` via `bitcast<u32>` on GPU, `.is_finite()` on CPU, subject to WGSL finite-math rules) so a non-finite channel does not corrupt finite siblings while preserving negative wide-gamut scRGB coordinates until after primary conversion. When `color_primaries == ColorPrimaries::Bt2020`, a 3x3 CIE-1931-derived BT.709-to-BT.2020 matrix is applied; negative components are then clamped to zero before applying either SMPTE ST 2084 PQ OETF (`80.0 / 10000.0`, guarding `v <= 0.0 -> 0.0` before `pow`) or sRGB OETF.
+  - 16-bit UNORM Y'CbCr levels use ITU-R BT.2100 10-bit-shifted-left-by-6 scaling for limited range (`[4096, 60160]` luma, `32768 ± 28672` chroma) and `[0, 65535]` (`32768` neutral chroma) for full range, matching `sample_level_u16`. Neutral grays (`R' == G' == B'`) compute chroma offset via `(R - G)` / `(B - G)` differences so Cb/Cr remain exact `32768`.
+- **Portable WGSL and no optional GPU feature flags.** All four `gather_rgb.wgsl` entry points validate under `naga::valid::Capabilities::empty()` with `0` bytes of workgroup memory and avoid dynamic local array indexing (D24). Both `Rgb10a2Unorm` and `Rgba16Float` are supported everywhere, including strict WebGPU contexts without `TEXTURE_FORMAT_16BIT_NORM`.
+- **Rust and C API.** `color::RgbFormat` (`Rgba8`, `Bgra8`, `Rgb10a2`, `Rgba16Float`) and `Encoder::encode_rgb_with` / `encode_rgb_with_timed` expose CPU RGB uploads (`4` or `8` bpp), while `Encoder::encode_rgb` and `TexturePicture::Rgb` stay source-compatible. `emberwave-ffi` adds `EMBERWAVE_TEXTURE_RGB10A2 = 2` and `EMBERWAVE_TEXTURE_RGBA16F = 3` for `emberwave_encoder_encode_rgb` and accepts the matching Vulkan, Metal, and Direct3D 12 formats only on encoder source import (`wrapping.read == true`); decoder texture creation and import continue to accept only 8-bit `RGBA8`/`BGRA8`.
+
+**Not done.**
+- Single-resource Direct3D 12 `DXGI_FORMAT_P010` plane-slice import (out of scope per D77).
+- `emberwave-cli` flags for HDR RGB inputs.
+
+**Consequence.** 10-bit and linear scRGB capture surfaces encode cleanly at >10-bit precision on Vulkan, Metal, Direct3D 12, and strict WebGPU without breaking the 8-bit path or C ABI stability.
+
