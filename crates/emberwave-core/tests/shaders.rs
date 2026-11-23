@@ -285,15 +285,7 @@ fn the_r16_plane_shader_requires_only_16bit_norm_storage_textures() {
             (name, layouter[variable.ty].size)
         })
         .collect();
-    // 10240 + 1152 + 1152 = 12544, under 16 KiB.
-    assert_eq!(
-        workgroup,
-        [
-            ("horizontal".to_owned(), 10240),
-            ("band_even".to_owned(), 1152),
-            ("band_odd".to_owned(), 1152),
-        ]
-    );
+    assert_eq!(workgroup, [("horizontal".to_owned(), 10240)]);
     let total: u32 = workgroup.iter().map(|(_, size)| size).sum();
     assert!(total <= 16 * 1024, "{total}");
 

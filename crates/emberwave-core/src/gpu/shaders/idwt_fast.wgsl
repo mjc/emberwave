@@ -9,8 +9,8 @@
 // in tile units. Dispatch only the tiles whose coefficients changed.
 //
 // Workgroup memory is not zeroed (decision D25). `horizontal` is filled before
-// the vertical lift. `band_even` / `band_odd` are filled before a staged row is
-// lifted.
+// the vertical lift. A barrier between the two passes is enough: staging each
+// band row in shared memory and waiting twice per row was slower on Tegra.
 
 struct CompParams {
     band_offset: vec4<u32>,
@@ -51,8 +51,6 @@ const DC_SHIFT: f32 = 0.5;
 const ABSENT: u32 = 0xFFFFFFFFu;
 
 var<workgroup> horizontal: array<f32, 2560>;
-var<workgroup> band_even: array<f32, 288>;
-var<workgroup> band_odd: array<f32, 288>;
 
 fn mirror(index: i32, n: i32) -> i32 {
     var m = index;
@@ -214,29 +212,6 @@ fn horiz_segment(
     store_horizontal(row, segment, &v);
 }
 
-fn lift_staged_row(slot: u32, row: u32, segment: u32) {
-    let local = 4u * segment;
-    var v: array<f32, 16>;
-    v[0] = band_even[slot + local + 0u];
-    v[1] = band_odd[slot + local + 0u];
-    v[2] = band_even[slot + local + 1u];
-    v[3] = band_odd[slot + local + 1u];
-    v[4] = band_even[slot + local + 2u];
-    v[5] = band_odd[slot + local + 2u];
-    v[6] = band_even[slot + local + 3u];
-    v[7] = band_odd[slot + local + 3u];
-    v[8] = band_even[slot + local + 4u];
-    v[9] = band_odd[slot + local + 4u];
-    v[10] = band_even[slot + local + 5u];
-    v[11] = band_odd[slot + local + 5u];
-    v[12] = band_even[slot + local + 6u];
-    v[13] = band_odd[slot + local + 6u];
-    v[14] = band_even[slot + local + 7u];
-    v[15] = band_odd[slot + local + 7u];
-    lift(&v);
-    store_horizontal(row, segment, &v);
-}
-
 fn store_packed_8(
     comp: CompParams,
     x: i32,
@@ -310,35 +285,8 @@ fn main(@builtin(local_invocation_index) tid: u32, @builtin(workgroup_id) wg: ve
         mode = 1u;
     }
 
-    let interior = tile_x >= APRON && tile_y >= APRON && tile_x + i32(TILE) + APRON <= out_width && tile_y + i32(TILE_H) + APRON <= out_height;
-    if (interior) {
-        let warp = tid >> 5u;
-        let lane = tid & 31u;
-        let bx0 = u32(tile_x - APRON) >> 1u;
-        for (var phase: u32 = 0u; phase < 5u; phase++) {
-            let row = warp + phase * 8u;
-            let y = tile_y + i32(row) - APRON;
-            let slot = warp * 36u;
-            if (lane < 32u) {
-                let pair = sample_at(comp, params.band_width, y, bx0 + lane, mode);
-                band_even[slot + lane] = pair.x;
-                band_odd[slot + lane] = pair.y;
-            }
-            if (lane < 4u) {
-                let pair = sample_at(comp, params.band_width, y, bx0 + 32u + lane, mode);
-                band_even[slot + 32u + lane] = pair.x;
-                band_odd[slot + 32u + lane] = pair.y;
-            }
-            workgroupBarrier();
-            if (lane < 8u) {
-                lift_staged_row(slot, row, lane);
-            }
-            workgroupBarrier();
-        }
-    } else {
-        run_scalar_rows(comp, params.band_width, tile_x, tile_y, out_width, out_height, tid, mode);
-        workgroupBarrier();
-    }
+    run_scalar_rows(comp, params.band_width, tile_x, tile_y, out_width, out_height, tid, mode);
+    workgroupBarrier();
 
     let is_final = comp.is_plane != 0u;
     let column = tid % TILE;
