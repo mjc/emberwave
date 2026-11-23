@@ -35,7 +35,30 @@ impl Pipelines {
     /// device must have the adapter's own format features then, and take
     /// [`PLANE_FORMAT`] as a storage texture. A device that fails to build
     /// it decodes with the copies.
-    pub(crate) fn new(device: &wgpu::Device, plane_stores: bool) -> Result<Self, GpuError> {
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        plane_stores: bool,
+        shader_f16: bool,
+    ) -> Result<Self, GpuError> {
+        let idwt_entries: &[wgpu::BindGroupLayoutEntry] = if shader_f16 {
+            &[
+                storage_entry(0, false),
+                storage_entry(1, false),
+                uniform_entry(2),
+                storage_entry(6, false),
+            ]
+        } else {
+            &[
+                storage_entry(0, false),
+                storage_entry(1, false),
+                uniform_entry(2),
+            ]
+        };
+        let idwt_source = if shader_f16 {
+            shader_sources::IDWT_F16
+        } else {
+            shader_sources::IDWT
+        };
         let mut pipelines = with_error_scope(device, || {
             let [dequant, dequant_clear] = create_stages(
                 device,
@@ -53,16 +76,7 @@ impl Pipelines {
             Self {
                 dequant,
                 dequant_clear,
-                idwt: create_stage(
-                    device,
-                    "idwt",
-                    shader_sources::IDWT,
-                    &[
-                        storage_entry(0, false),
-                        storage_entry(1, false),
-                        uniform_entry(2),
-                    ],
-                ),
+                idwt: create_stage(device, "idwt", idwt_source, idwt_entries),
                 idwt_planes: None,
                 yuv2rgb: create_stage(
                     device,
@@ -77,19 +91,31 @@ impl Pipelines {
             }
         })?;
         if plane_stores {
+            let plane_entries: &[wgpu::BindGroupLayoutEntry] = if shader_f16 {
+                &[
+                    storage_entry(0, false),
+                    uniform_entry(2),
+                    plane_entry(3, PLANE_FORMAT),
+                    plane_entry(4, PLANE_FORMAT),
+                    plane_entry(5, PLANE_FORMAT),
+                    storage_entry(6, false),
+                ]
+            } else {
+                &[
+                    storage_entry(0, false),
+                    uniform_entry(2),
+                    plane_entry(3, PLANE_FORMAT),
+                    plane_entry(4, PLANE_FORMAT),
+                    plane_entry(5, PLANE_FORMAT),
+                ]
+            };
+            let plane_source = if shader_f16 {
+                shader_sources::IDWT_PLANES_F16
+            } else {
+                shader_sources::IDWT_PLANES
+            };
             pipelines.idwt_planes = with_error_scope(device, || {
-                create_stage(
-                    device,
-                    "idwt planes",
-                    shader_sources::IDWT_PLANES,
-                    &[
-                        storage_entry(0, false),
-                        uniform_entry(2),
-                        plane_entry(3, PLANE_FORMAT),
-                        plane_entry(4, PLANE_FORMAT),
-                        plane_entry(5, PLANE_FORMAT),
-                    ],
-                )
+                create_stage(device, "idwt planes", plane_source, plane_entries)
             })
             .ok();
         }
@@ -99,20 +125,37 @@ impl Pipelines {
 
 /// The inverse transform stage that stores decoded planes into `r16unorm`
 /// storage textures. Built lazily on first 16-bit plane decode.
-pub(crate) fn idwt_planes_r16_stage(device: &wgpu::Device) -> Result<Stage, GpuError> {
+pub(crate) fn idwt_planes_r16_stage(
+    device: &wgpu::Device,
+    shader_f16: bool,
+) -> Result<Stage, GpuError> {
+    let entries: &[wgpu::BindGroupLayoutEntry] = if shader_f16 {
+        &[
+            storage_entry(0, false),
+            uniform_entry(2),
+            plane_entry(3, PLANE_FORMAT_R16),
+            plane_entry(4, PLANE_FORMAT_R16),
+            plane_entry(5, PLANE_FORMAT_R16),
+            storage_entry(6, false),
+        ]
+    } else {
+        &[
+            storage_entry(0, false),
+            uniform_entry(2),
+            plane_entry(3, PLANE_FORMAT_R16),
+            plane_entry(4, PLANE_FORMAT_R16),
+            plane_entry(5, PLANE_FORMAT_R16),
+            storage_entry(6, false),
+            storage_entry(9, true),
+        ]
+    };
+    let source = if shader_f16 {
+        shader_sources::IDWT_PLANES_R16_F16
+    } else {
+        shader_sources::IDWT_PLANES_R16
+    };
     with_error_scope(device, || {
-        create_stage(
-            device,
-            "idwt planes r16",
-            shader_sources::IDWT_PLANES_R16,
-            &[
-                storage_entry(0, false),
-                uniform_entry(2),
-                plane_entry(3, PLANE_FORMAT_R16),
-                plane_entry(4, PLANE_FORMAT_R16),
-                plane_entry(5, PLANE_FORMAT_R16),
-            ],
-        )
+        create_stage(device, "idwt planes r16", source, entries)
     })
 }
 

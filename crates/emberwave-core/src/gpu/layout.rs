@@ -34,6 +34,11 @@ pub(crate) struct BufferLayout {
     band_offsets: [[[u32; BANDS_PER_LEVEL]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS],
     /// Size of the pyramid in floats.
     pub pyramid_floats: u64,
+    /// Element offset of intermediate `f16` LL band `[component][level]`.
+    ll_f16_offsets: [[u32; DECOMPOSITION_LEVELS]; NUM_COMPONENTS],
+    /// Size of the intermediate `f16` LL buffer in `f16` elements (even, for
+    /// 4-byte copy alignment).
+    pub ll_f16_elements: u64,
     /// Word offset of each packed 8-bit plane.
     pub packed_offsets: [u32; NUM_COMPONENTS],
     /// Words per row of each packed plane.
@@ -79,6 +84,8 @@ impl BufferLayout {
     ) -> Result<Self, GpuError> {
         let mut band_offsets = [[[ABSENT; BANDS_PER_LEVEL]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS];
         let mut pyramid_floats = 0u64;
+        let mut ll_f16_offsets = [[ABSENT; DECOMPOSITION_LEVELS]; NUM_COMPONENTS];
+        let mut ll_f16_elements = 0u64;
 
         for component in Component::ALL {
             // 4:2:0 chroma has no finest level.
@@ -92,6 +99,10 @@ impl BufferLayout {
                 for band in Band::ALL {
                     offsets[band.index()] = to_offset(pyramid_floats)?;
                     pyramid_floats += u64::from(width) * u64::from(height);
+                }
+                if level + 1 < DECOMPOSITION_LEVELS {
+                    ll_f16_offsets[component.index()][level] = to_offset(ll_f16_elements)?;
+                    ll_f16_elements += (u64::from(width) * u64::from(height)).next_multiple_of(2);
                 }
             }
         }
@@ -111,6 +122,8 @@ impl BufferLayout {
         Ok(Self {
             band_offsets,
             pyramid_floats,
+            ll_f16_offsets,
+            ll_f16_elements,
             packed_offsets,
             packed_strides,
             packed_words,
@@ -129,6 +142,13 @@ impl BufferLayout {
             .get(component.index())?
             .get(level)?
             .get(band.index())?;
+        (offset != ABSENT).then_some(offset)
+    }
+
+    /// Element offset of an intermediate `f16` LL band, if the component has that level
+    /// and it is finer than the coarsest level.
+    pub(crate) fn ll_f16_offset(&self, component: Component, level: usize) -> Option<u32> {
+        let offset = *self.ll_f16_offsets.get(component.index())?.get(level)?;
         (offset != ABSENT).then_some(offset)
     }
 }
@@ -603,7 +623,29 @@ pub(crate) struct TransformLevel {
 
 impl TransformLevel {
     /// Parameters for the transform between the bands of `level` and its image.
+    ///
+    /// The fast inverse packs only the lowpass a plane reads. Coarser images
+    /// stay in the f32 pyramid.
     pub(crate) fn new(layout: &FrameLayout, buffers: &BufferLayout, level: usize) -> Self {
+        Self::build(layout, buffers, level, false)
+    }
+
+    /// Parameters for `idwt_f16.wgsl`, which stores every intermediate image
+    /// as one f16 sample in `ll_f16`.
+    pub(crate) fn with_f16_lowpass(
+        layout: &FrameLayout,
+        buffers: &BufferLayout,
+        level: usize,
+    ) -> Self {
+        Self::build(layout, buffers, level, true)
+    }
+
+    fn build(
+        layout: &FrameLayout,
+        buffers: &BufferLayout,
+        level: usize,
+        f16_every_level: bool,
+    ) -> Self {
         let (band_width, band_height) = layout.level_size(level);
         let mut params = LevelParams {
             band_width,
@@ -629,6 +671,10 @@ impl TransformLevel {
 
             let comp = &mut params.comps[component.index()];
             comp.band_offset = offsets;
+            comp.pad[0] = buffers.ll_f16_offset(component, level).unwrap_or(ABSENT);
+            // The plane store selects Y, Cb or Cr from this, which matches the
+            // dispatch z while every missing component is a suffix.
+            comp.pad[2] = u32::try_from(component.index()).unwrap_or(0);
             if level == layout.finest_level(component) {
                 let (width, height) = layout.plane_size(component);
                 comp.image_offset = buffers.packed_offsets[component.index()];
@@ -645,6 +691,16 @@ impl TransformLevel {
                 comp.plane_width = 2 * band_width;
                 comp.plane_height = 2 * band_height;
                 comp.is_plane = 0;
+                // The fast path packs only the lowpass a plane reads. Another
+                // packed hop costs more accuracy than bandwidth. `idwt_f16.wgsl`
+                // stores every intermediate image, so it needs each offset.
+                if f16_every_level || level - 1 == layout.finest_level(component) {
+                    comp.pad[1] = buffers
+                        .ll_f16_offset(component, level - 1)
+                        .unwrap_or(ABSENT);
+                } else {
+                    comp.pad[1] = ABSENT;
+                }
             }
             components += 1;
         }
@@ -654,9 +710,14 @@ impl TransformLevel {
 
     /// Workgroup grid: 32x32 tiles of the image in x and y, components in z.
     pub(crate) fn grid(&self) -> (u32, u32, u32) {
+        self.grid_for_tile(32, 32)
+    }
+
+    /// Workgroup grid for a given `(tile_width, tile_height)` output tile.
+    pub(crate) fn grid_for_tile(&self, tile_width: u32, tile_height: u32) -> (u32, u32, u32) {
         (
-            self.params.image_width.div_ceil(32),
-            self.params.image_height.div_ceil(32),
+            self.params.image_width.div_ceil(tile_width),
+            self.params.image_height.div_ceil(tile_height),
             self.components,
         )
     }
@@ -954,6 +1015,67 @@ mod tests {
         let layout = FrameLayout::new(131, 67, ChromaSubsampling::Yuv444).unwrap();
         let buffers = BufferLayout::new(&layout).unwrap();
         assert_eq!(TransformLevel::new(&layout, &buffers, 0).components, 3);
+    }
+
+    #[test]
+    fn finest_420_luma_reads_the_lowpass_level_one_writes() {
+        let layout = FrameLayout::new(3840, 2160, ChromaSubsampling::Yuv420).unwrap();
+        let buffers = BufferLayout::for_decoder(&layout).unwrap();
+        let finest = TransformLevel::new(&layout, &buffers, 0);
+        // The plane itself is not a packed lowpass. Level 1 writes the band
+        // this level reads on even rows.
+        assert_eq!(finest.params.comps[0].pad[1], 0);
+        assert_eq!(finest.params.comps[0].pad[2], 0);
+        assert_eq!(
+            finest.params.comps[0].pad[0],
+            buffers.ll_f16_offset(Component::Y, 0).unwrap()
+        );
+
+        let level1 = TransformLevel::new(&layout, &buffers, 1);
+        assert_eq!(level1.params.comps[0].pad[1], finest.params.comps[0].pad[0]);
+        let level2 = TransformLevel::new(&layout, &buffers, 2);
+        assert_eq!(level2.params.comps[0].pad[1], ABSENT);
+        assert_eq!(
+            level2.params.comps[1].pad[1],
+            buffers.ll_f16_offset(Component::Cb, 1).unwrap()
+        );
+        assert_eq!(level1.params.comps[1].is_plane, 1);
+        assert_eq!(level1.params.comps[1].pad[1], 0);
+        assert_eq!(level1.params.comps[1].pad[2], 1);
+        assert_eq!(level1.params.comps[2].pad[2], 2);
+
+        let layout = FrameLayout::new(64, 64, ChromaSubsampling::Yuv444).unwrap();
+        let buffers = BufferLayout::new(&layout).unwrap();
+        let finest = TransformLevel::new(&layout, &buffers, 0);
+        assert_eq!(finest.params.comps[0].pad[1], 0);
+        assert_eq!(finest.params.comps[2].pad[2], 2);
+    }
+
+    #[test]
+    fn shader_f16_stores_every_intermediate_lowpass() {
+        let layout = FrameLayout::new(3840, 2160, ChromaSubsampling::Yuv420).unwrap();
+        let buffers = BufferLayout::for_decoder(&layout).unwrap();
+        // Level 2 writes Y's level-1 image. That image is not the plane input,
+        // so the fast path leaves it in the f32 pyramid.
+        let fast = TransformLevel::new(&layout, &buffers, 2);
+        assert_eq!(fast.params.comps[0].pad[1], ABSENT);
+        let f16 = TransformLevel::with_f16_lowpass(&layout, &buffers, 2);
+        assert_eq!(
+            f16.params.comps[0].pad[1],
+            buffers.ll_f16_offset(Component::Y, 1).unwrap()
+        );
+        let coarse = TransformLevel::with_f16_lowpass(&layout, &buffers, 4);
+        assert_eq!(
+            coarse.params.comps[0].pad[1],
+            buffers.ll_f16_offset(Component::Y, 3).unwrap()
+        );
+        let finest = TransformLevel::with_f16_lowpass(&layout, &buffers, 0);
+        assert_eq!(finest.params.comps[0].is_plane, 1);
+        assert_eq!(finest.params.comps[0].pad[1], 0);
+        assert_eq!(
+            finest.params.comps[0].pad[0],
+            buffers.ll_f16_offset(Component::Y, 0).unwrap()
+        );
     }
 
     #[test]

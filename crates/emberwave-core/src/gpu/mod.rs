@@ -17,6 +17,7 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
 mod context;
+mod cull;
 mod decoder;
 mod encoder;
 mod error;
@@ -72,9 +73,24 @@ pub mod shader_sources {
     /// The inverse transform whose last level stores the planes straight into
     /// three 16-bit normalised textures (`r16unorm`), on devices with
     /// [`wgpu::Features::TEXTURE_FORMAT_16BIT_NORM`]. Not among the portable
-    /// shaders of [`ALL`].
+    /// shaders of [`ALL`]. The front packs intermediate lowpass bands and
+    /// dispatches one workgroup per tile id.
     pub const IDWT_PLANES_R16: &str = concat!(
-        include_str!("shaders/idwt.wgsl"),
+        include_str!("shaders/idwt_fast.wgsl"),
+        include_str!("shaders/idwt_planes_r16.wgsl")
+    );
+    /// Capability-gated `f16` intermediate variants for adapters with
+    /// [`wgpu::Features::SHADER_F16`].
+    pub const IDWT_F16: &str = concat!(
+        include_str!("shaders/idwt_f16.wgsl"),
+        include_str!("shaders/idwt_packed_f16.wgsl")
+    );
+    pub const IDWT_PLANES_F16: &str = concat!(
+        include_str!("shaders/idwt_f16.wgsl"),
+        include_str!("shaders/idwt_planes.wgsl")
+    );
+    pub const IDWT_PLANES_R16_F16: &str = concat!(
+        include_str!("shaders/idwt_f16.wgsl"),
         include_str!("shaders/idwt_planes_r16.wgsl")
     );
     /// 8-bit YCbCr planes to RGB.

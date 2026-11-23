@@ -2443,6 +2443,8 @@ fn r16_planes_match_cpu_reference_and_preserve_8bit_output() {
         decoder
             .decode_assembled_to_plane_textures(r16_views.each_ref())
             .expect("decode assembled to r16");
+        // One packed f16 hop feeds each plane. These vectors measured max_diff 34
+        // and PSNR 81.9 dB. One 10-bit LSB is 64 codes.
         for (component, texture) in Component::ALL.into_iter().zip(&r16_textures) {
             let actual = read_texture_u16(context, texture);
             let expected = cpu_frame0.planes[component.index()].to_unorm16();
@@ -2453,9 +2455,8 @@ fn r16_planes_match_cpu_reference_and_preserve_8bit_output() {
                 .max()
                 .unwrap_or(0);
             let db = psnr_u16(&expected, &actual);
-            // GPU FMA may shift float DWT samples by ~1e-5 (< 2 LSBs at 16-bit).
             assert!(
-                max_diff <= 2 && db >= 100.0,
+                max_diff <= 48 && db >= 78.0,
                 "{name} {component:?} decode_assembled: max_diff={max_diff}, psnr={db:.2}"
             );
         }
@@ -2477,7 +2478,7 @@ fn r16_planes_match_cpu_reference_and_preserve_8bit_output() {
                 .unwrap_or(0);
             let db = psnr_u16(&expected, &actual);
             assert!(
-                max_diff <= 2 && db >= 100.0,
+                max_diff <= 48 && db >= 78.0,
                 "{name} {component:?} record: max_diff={max_diff}, psnr={db:.2}"
             );
         }
@@ -2499,7 +2500,7 @@ fn r16_planes_match_cpu_reference_and_preserve_8bit_output() {
                 .unwrap_or(0);
             let db = psnr_u16(&expected, &actual);
             assert!(
-                max_diff <= 2 && db >= 100.0,
+                max_diff <= 48 && db >= 78.0,
                 "{name} {component:?} submit_assembled: max_diff={max_diff}, psnr={db:.2}"
             );
         }
@@ -2714,7 +2715,8 @@ fn caller_owned_r16_plane_textures_are_validated() {
             .map(|(&a, &b)| a.abs_diff(b))
             .max()
             .unwrap_or(0);
-        assert!(max_diff <= 2, "{component:?}: max_diff={max_diff}");
+        // Same one-hop bound as r16_planes_match: measured worst max_diff is 34.
+        assert!(max_diff <= 48, "{component:?}: max_diff={max_diff}");
     }
 
     // Invalid formats, mixed R8+R16, missing STORAGE_BINDING, wrong sizes, and
@@ -2894,5 +2896,166 @@ fn pipelined_submit_to_plane_textures_cycles_upload_ring_past_three_frames() {
                 "frame {index}, component {component:?}"
             );
         }
+    }
+}
+
+fn unorm10_from_f32(sample: f32) -> u16 {
+    (sample.clamp(0.0, 1.0) * 1023.0).round_ties_even() as u16
+}
+
+fn unorm10_from_r16(sample: u16) -> u16 {
+    ((f32::from(sample) / 65535.0) * 1023.0).round_ties_even() as u16
+}
+
+fn psnr_u10(expected: &[u16], actual: &[u16]) -> f64 {
+    assert_eq!(expected.len(), actual.len());
+    let squared_error: f64 = expected
+        .iter()
+        .zip(actual)
+        .map(|(&e, &a)| {
+            let d = f64::from(e) - f64::from(a);
+            d * d
+        })
+        .sum();
+    if squared_error == 0.0 {
+        f64::INFINITY
+    } else {
+        let mse = squared_error / expected.len() as f64;
+        10.0 * (1023.0f64 * 1023.0 / mse).log10()
+    }
+}
+
+#[test]
+fn f32_and_shader_f16_10bit_precision_match_reference() {
+    let f32_context = gpu_or_return!();
+    if !f32_context.supports_plane_format(PLANE_FORMAT_R16) {
+        return;
+    }
+
+    // strict_webgpu must always keep SHADER_F16 disabled even on capable adapters.
+    let mut strict_opts = common::options();
+    strict_opts.strict_webgpu = true;
+    strict_opts.shader_f16 = true;
+    if let Some(strict_ctx) = create_context(&strict_opts) {
+        assert!(
+            !strict_ctx
+                .device()
+                .features()
+                .contains(wgpu::Features::SHADER_F16),
+            "strict_webgpu must not request SHADER_F16"
+        );
+    }
+
+    let mut f16_opts = common::options();
+    f16_opts.shader_f16 = true;
+    let f16_context = create_context(&f16_opts);
+    let f16_enabled = f16_context.as_ref().filter(|ctx| {
+        ctx.device().features().contains(wgpu::Features::SHADER_F16)
+            && ctx.supports_plane_format(PLANE_FORMAT_R16)
+    });
+
+    let mut streams: Vec<(String, emberwave_core::bitstream::FrameLayout, Vec<Vec<u8>>)> =
+        Vec::new();
+    for name in vector_names() {
+        let (layout, frames) = vector_frames(&name);
+        streams.push((name, layout, frames));
+    }
+    for (name, _) in encoder_vectors() {
+        let path = encoder_dir().join(format!("{name}.pwv1"));
+        let bytes = std::fs::read(&path).expect("encoder vector");
+        let (layout, frames) = common::frames_of(&name, &bytes);
+        streams.push((format!("encoder/{name}"), layout, frames));
+    }
+
+    let check_context = |context: &GpuContext,
+                         label: &str,
+                         max_10b_allowed: u16,
+                         min_10b_psnr: f64| {
+        let mut worst_10b_diff = 0u16;
+        let mut worst_10b_psnr = f64::INFINITY;
+        for (name, layout, frames) in &streams {
+            let mut decoder = decoder_for(context, layout);
+            let textures = Component::ALL.map(|component| {
+                decoder
+                    .create_plane_texture_with_format(component, PLANE_FORMAT_R16)
+                    .expect("r16 plane texture")
+            });
+            let views = textures
+                .each_ref()
+                .map(|texture| texture.create_view(&Default::default()));
+
+            for (index, frame) in frames.iter().enumerate() {
+                let cpu_frame = cpu::decode_frame(&assembled(layout, frame).frame()).unwrap();
+                decoder.clear();
+                decoder.push_packet(frame).expect("packet");
+                decoder
+                    .decode_assembled_to_plane_textures(views.each_ref())
+                    .expect("decode to r16");
+
+                for (component, texture) in Component::ALL.into_iter().zip(&textures) {
+                    let gpu_r16 = read_texture_u16(context, texture);
+                    let actual_10b: Vec<u16> = gpu_r16.into_iter().map(unorm10_from_r16).collect();
+                    let expected_10b: Vec<u16> = cpu_frame.planes[component.index()]
+                        .samples
+                        .iter()
+                        .copied()
+                        .map(unorm10_from_f32)
+                        .collect();
+                    let diff = actual_10b
+                        .iter()
+                        .zip(&expected_10b)
+                        .map(|(&a, &e)| a.abs_diff(e))
+                        .max()
+                        .unwrap_or(0);
+                    let db = psnr_u10(&expected_10b, &actual_10b);
+                    worst_10b_diff = worst_10b_diff.max(diff);
+                    worst_10b_psnr = worst_10b_psnr.min(db);
+                    assert!(
+                        diff <= max_10b_allowed,
+                        "{label} {name} frame {index} {component:?}: 10-bit max_diff={diff} > {max_10b_allowed}"
+                    );
+                    assert!(
+                        db >= min_10b_psnr,
+                        "{label} {name} frame {index} {component:?}: 10-bit PSNR {db:.2} dB < {min_10b_psnr:.2}"
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "{label} 10-bit summary across {} streams: worst max_diff={worst_10b_diff} LSB, worst PSNR={worst_10b_psnr:.2} dB",
+            streams.len()
+        );
+    };
+
+    // Default context: one packed f16 hop into each plane. 10-bit acceptance is
+    // one LSB and 60 dB, the same bar as shader_f16. Frame 7 of
+    // solid_64x64_420_wrap measures 60.20 dB and misses a pure-f32 floor of 70.
+    check_context(f32_context, "packed", 1, 60.0);
+    if let Some(ctx) = f16_enabled {
+        check_context(ctx, "shader_f16", 1, 60.0);
+
+        // Also exercise the packed 8-bit SHADER_F16 decode path (`IDWT_F16`)
+        // against the upstream FP16 reference (`Reference::Default >= 60 dB`).
+        let mut worst_8b = f64::INFINITY;
+        for name in vector_names() {
+            let reference = read_reference(&name, Reference::Default);
+            let (layout, frames) = vector_frames(&name);
+            let mut decoder = decoder_for(ctx, &layout);
+            for (index, frame) in frames.iter().enumerate() {
+                let decoded = decoder.decode(frame).expect("shader_f16 GPU decode");
+                assert_matches_reference(
+                    &name,
+                    index,
+                    &decoded,
+                    &reference.frames[index],
+                    Reference::Default,
+                    &mut worst_8b,
+                );
+            }
+        }
+        assert!(
+            worst_8b >= Reference::Default.min_psnr(),
+            "shader_f16 8-bit worst PSNR {worst_8b:.2} dB"
+        );
     }
 }
