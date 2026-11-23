@@ -140,6 +140,18 @@ impl MapTracker {
     }
 }
 
+/// Quad buffers and pipeline for the fast 16-bit dequantisation.
+///
+/// Absent on the portable path. Present, a slot also binds these so a payload
+/// resize rebuilds that group with the new payload buffer.
+#[derive(Clone, Copy)]
+pub(crate) struct QuadBind<'a> {
+    pub stage: &'a Stage,
+    pub params: &'a wgpu::Buffer,
+    pub quads_f16: &'a wgpu::Buffer,
+    pub quads_f32: &'a wgpu::Buffer,
+}
+
 /// Shared dequantisation bindings needed when constructing or resizing upload slots.
 #[derive(Clone, Copy)]
 pub(crate) struct DequantTarget<'a> {
@@ -147,6 +159,7 @@ pub(crate) struct DequantTarget<'a> {
     pub pyramid: &'a wgpu::Buffer,
     pub params: &'a wgpu::Buffer,
     pub dirty_ballots: &'a wgpu::Buffer,
+    pub quad: Option<QuadBind<'a>>,
 }
 
 /// Shared concealment bindings needed when building per-slot concealment bind groups.
@@ -179,6 +192,8 @@ pub(crate) struct UmaSlot {
     pub payload: wgpu::Buffer,
     pub payload_capacity_words: usize,
     pub dequant_bind_group: wgpu::BindGroup,
+    /// Fast 16-bit dequantisation. `None` on the portable path.
+    pub quad_dequant_bind_group: Option<wgpu::BindGroup>,
     pub conceal_bind_group: Option<wgpu::BindGroup>,
     pub tracker: MapTracker,
 }
@@ -220,6 +235,16 @@ impl UmaSlot {
             dequant.params,
             dequant.dirty_ballots,
         );
+        let quad_dequant_bind_group = dequant.quad.map(|quad| {
+            quad_dequant_bind_group(
+                device,
+                quad,
+                &payload,
+                &dequant_work,
+                dequant.pyramid,
+                dequant.dirty_ballots,
+            )
+        });
         let tracker = if shared_uploads {
             MapTracker::mapped()
         } else {
@@ -231,6 +256,7 @@ impl UmaSlot {
             payload,
             payload_capacity_words,
             dequant_bind_group,
+            quad_dequant_bind_group,
             conceal_bind_group: None,
             tracker,
         }
@@ -259,7 +285,7 @@ impl UmaSlot {
         // recreated as `mapped_at_creation`, all remain mapped together.
         let usage = frame_buffer_usage(shared_uploads);
         let mapped_at_creation = shared_uploads && map_new_buffer;
-        let (payload, bind_group) = with_error_scope(device, || {
+        let (payload, bind_group, quad_bind_group) = with_error_scope(device, || {
             let payload = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("payload"),
                 size: capacity_bytes,
@@ -275,11 +301,22 @@ impl UmaSlot {
                 dequant.params,
                 dequant.dirty_ballots,
             );
-            (payload, bind_group)
+            let quad_bind_group = dequant.quad.map(|quad| {
+                quad_dequant_bind_group(
+                    device,
+                    quad,
+                    &payload,
+                    &self.dequant_work,
+                    dequant.pyramid,
+                    dequant.dirty_ballots,
+                )
+            });
+            (payload, bind_group, quad_bind_group)
         })?;
         std::mem::replace(&mut self.payload, payload).destroy();
         self.payload_capacity_words = (capacity_bytes / 4) as usize;
         self.dequant_bind_group = bind_group;
+        self.quad_dequant_bind_group = quad_bind_group;
         if shared_uploads && !mapped_at_creation && self.tracker.is_mapped() {
             // QueueWrite / unmapped caller expects an unmapped slot.
             self.block_offsets.unmap();
@@ -872,6 +909,29 @@ pub(crate) fn frame_buffer_usage(shared_uploads: bool) -> wgpu::BufferUsages {
     let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
     usage.set(wgpu::BufferUsages::MAP_WRITE, shared_uploads);
     usage
+}
+
+fn quad_dequant_bind_group(
+    device: &wgpu::Device,
+    quad: QuadBind<'_>,
+    payload: &wgpu::Buffer,
+    dequant_work: &wgpu::Buffer,
+    pyramid: &wgpu::Buffer,
+    dirty_ballots: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("dequant quads"),
+        layout: &quad.stage.layout,
+        entries: &[
+            entry(0, payload),
+            entry(1, dequant_work),
+            entry(2, pyramid),
+            entry(3, quad.params),
+            entry(4, dirty_ballots),
+            entry(7, quad.quads_f16),
+            entry(8, quad.quads_f32),
+        ],
+    })
 }
 
 pub(crate) fn dequant_bind_group(

@@ -123,11 +123,45 @@ impl Pipelines {
     }
 }
 
+/// The fast-path dequantisation, main and clear, sharing one bind group layout.
+/// Compiled when a decoder can run the fast 16-bit inverse, not with the
+/// portable pipelines: `pack2x16float` is not in the portable set.
+pub(crate) struct QuadStages {
+    pub main: Stage,
+    pub clear: Stage,
+}
+
+pub(crate) fn dequant_quads_stages(device: &wgpu::Device) -> Result<QuadStages, GpuError> {
+    with_error_scope(device, || {
+        let [main, clear] = create_stages(
+            device,
+            "dequant quads",
+            shader_sources::DEQUANT_QUADS,
+            ["main", "clear_blocks"],
+            &[
+                storage_entry(0, true),
+                storage_entry(1, true),
+                storage_entry(2, false),
+                uniform_entry(3),
+                storage_entry(4, false),
+                storage_entry(7, false),
+                storage_entry(8, false),
+            ],
+        );
+        QuadStages { main, clear }
+    })
+}
+
 /// The inverse transform stage that stores decoded planes into `r16unorm`
 /// storage textures. Built lazily on first 16-bit plane decode.
+///
+/// `shader_f16` keeps the scalar `f16` pyramid. Otherwise the stage reads and
+/// writes 2×2 quads. `subgroup` selects the shuffle exchange; the caller uses
+/// it only when the subgroup size is fixed at 32.
 pub(crate) fn idwt_planes_r16_stage(
     device: &wgpu::Device,
     shader_f16: bool,
+    subgroup: bool,
 ) -> Result<Stage, GpuError> {
     let entries: &[wgpu::BindGroupLayoutEntry] = if shader_f16 {
         &[
@@ -146,11 +180,14 @@ pub(crate) fn idwt_planes_r16_stage(
             plane_entry(4, PLANE_FORMAT_R16),
             plane_entry(5, PLANE_FORMAT_R16),
             storage_entry(6, false),
+            storage_entry(7, false),
             storage_entry(9, true),
         ]
     };
     let source = if shader_f16 {
         shader_sources::IDWT_PLANES_R16_F16
+    } else if subgroup {
+        shader_sources::IDWT_PLANES_R16_SUBGROUP
     } else {
         shader_sources::IDWT_PLANES_R16
     };

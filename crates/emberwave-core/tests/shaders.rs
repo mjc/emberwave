@@ -285,7 +285,16 @@ fn the_r16_plane_shader_requires_only_16bit_norm_storage_textures() {
             (name, layouter[variable.ty].size)
         })
         .collect();
-    assert_eq!(workgroup, [("horizontal".to_owned(), 10240)]);
+    // odd_column holds the eight outputs of each odd column (32 rows by 32
+    // columns) until the barrier. horizontal is 10240; together they are
+    // 14336, under the 16 KiB limit. Both are written before they are read.
+    assert_eq!(
+        workgroup,
+        [
+            ("horizontal".to_owned(), 10240),
+            ("odd_column".to_owned(), 4096),
+        ]
+    );
     let total: u32 = workgroup.iter().map(|(_, size)| size).sum();
     assert!(total <= 16 * 1024, "{total}");
 
@@ -304,6 +313,95 @@ fn the_r16_plane_shader_requires_only_16bit_norm_storage_textures() {
         .filter_map(|(_, variable)| variable.name.clone())
         .collect();
     assert!(!names.contains(&"packed".to_owned()), "{names:?}");
+}
+
+#[test]
+fn the_quad_dequant_shader_needs_packed_float16() {
+    // Not in ALL: pack2x16float needs SHADER_FLOAT16_IN_FLOAT32. The workgroup
+    // variables match dequant.wgsl and are written before they are read.
+    let source = shader_sources::DEQUANT_QUADS;
+    let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|e| {
+        panic!(
+            "dequant quads does not parse:\n{}",
+            e.emit_to_string(source)
+        )
+    });
+    assert!(
+        Validator::new(ValidationFlags::all(), Capabilities::empty())
+            .validate(&module)
+            .is_err(),
+        "quad dequant unexpectedly validated with empty capabilities"
+    );
+    Validator::new(
+        ValidationFlags::all(),
+        Capabilities::SHADER_FLOAT16_IN_FLOAT32,
+    )
+    .validate(&module)
+    .unwrap_or_else(|e| panic!("dequant quads does not validate: {e:?}"));
+    let found: Vec<&str> = module
+        .entry_points
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(found, ["clear_blocks", "main"]);
+    let mut layouter = naga::proc::Layouter::default();
+    layouter.update(module.to_ctx()).expect("layout");
+    let workgroup: Vec<(String, u32)> = module
+        .global_variables
+        .iter()
+        .filter(|(_, variable)| variable.space == naga::AddressSpace::WorkGroup)
+        .map(|(_, variable)| {
+            let name = variable.name.clone().unwrap_or_default();
+            (name, layouter[variable.ty].size)
+        })
+        .collect();
+    assert_eq!(
+        workgroup,
+        [
+            ("shared_prev_ballot".to_owned(), 4),
+            ("block8_meta".to_owned(), 64),
+            ("block8_packed_counts".to_owned(), 64),
+        ]
+    );
+}
+
+#[test]
+fn the_subgroup_r16_shader_needs_a_subgroup_shuffle() {
+    // Not in ALL. The neighbour exchange is subgroupShuffleXor, so there is
+    // no odd_column. Desktop adapters whose subgroup size is not fixed at 32
+    // keep the workgroup-memory variant.
+    let source = shader_sources::IDWT_PLANES_R16_SUBGROUP;
+    let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|e| {
+        panic!(
+            "idwt planes r16 subgroup does not parse:\n{}",
+            e.emit_to_string(source)
+        )
+    });
+    let packed =
+        Capabilities::SHADER_FLOAT16_IN_FLOAT32 | Capabilities::STORAGE_TEXTURE_16BIT_NORM_FORMATS;
+    assert!(
+        Validator::new(ValidationFlags::all(), packed)
+            .validate(&module)
+            .is_err(),
+        "subgroup shader unexpectedly validated without SUBGROUP"
+    );
+    Validator::new(ValidationFlags::all(), packed | Capabilities::SUBGROUP)
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("idwt planes r16 subgroup does not validate: {e:?}"));
+    let mut layouter = naga::proc::Layouter::default();
+    layouter.update(module.to_ctx()).expect("layout");
+    let workgroup: Vec<(String, u32)> = module
+        .global_variables
+        .iter()
+        .filter(|(_, variable)| variable.space == naga::AddressSpace::WorkGroup)
+        .map(|(_, variable)| {
+            let name = variable.name.clone().unwrap_or_default();
+            (name, layouter[variable.ty].size)
+        })
+        .collect();
+    assert_eq!(workgroup, [("horizontal".to_owned(), 10240)]);
+    let [x, y, z] = module.entry_points[0].workgroup_size;
+    assert!(x * y * z <= 256, "{x}x{y}x{z}");
 }
 
 #[test]

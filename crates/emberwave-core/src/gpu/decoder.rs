@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::bitstream::consts::DECOMPOSITION_LEVELS;
 use crate::bitstream::packet::{DEFAULT_MINIMUM_PACKET_RATIO, DEFAULT_PRISTINE_BANDS};
 use crate::bitstream::{
-    Band, ChromaSubsampling, Component, FrameAssembler, FrameLayout, SequenceHeader,
+    Band, ChromaSubsampling, Component, FrameAssembler, FrameLayout, MISSING_BLOCK, SequenceHeader,
 };
 use crate::color::ColorParams;
 
@@ -23,14 +23,16 @@ use super::context::{
 use super::cull::{self, PyramidCull, TileRegion};
 use super::error::GpuError;
 use super::layout::{
-    BufferLayout, ConcealParams, DequantParams, TransformLevel, YuvParams, grid_for,
+    BufferLayout, ConcealParams, DequantParams, QuadDequantParams, TransformLevel, YuvParams,
+    grid_for,
 };
 use super::pipelines::{
-    DrawPipeline, Pipelines, ScopedError, Stage, with_error_scope, with_error_scope_kind,
+    DrawPipeline, Pipelines, QuadStages, ScopedError, Stage, dequant_quads_stages,
+    with_error_scope, with_error_scope_kind,
 };
 use super::resources::{
-    ConcealTarget, DecoderUploads, DequantTarget, FrameUpload, PreparedUpload, StageQueries,
-    buffer, check_size, entry, read_back, read_back_with, texture, uniform_buffer,
+    ConcealTarget, DecoderUploads, DequantTarget, FrameUpload, PreparedUpload, QuadBind,
+    StageQueries, buffer, check_size, entry, read_back, read_back_with, texture, uniform_buffer,
 };
 
 /// The payload buffer never shrinks below this many words.
@@ -179,10 +181,36 @@ struct ColorResources {
 /// passes (one per level), and the colour conversion.
 const TIMED_STAGES: u32 = 2 + DECOMPOSITION_LEVELS as u32;
 
+/// Quad bindings for an upload slot. `None` on the portable path.
+fn quad_bind<'a>(
+    stages: Option<&'a QuadStages>,
+    fast: Option<&'a FastTiles>,
+) -> Option<QuadBind<'a>> {
+    stages.zip(fast).map(|(stages, fast)| QuadBind {
+        stage: &stages.main,
+        params: &fast.dequant_params,
+        quads_f16: &fast.quads_f16,
+        quads_f32: &fast.quads_f32,
+    })
+}
+
+/// Quad buffers created with a fast decoder, before the upload slots bind them.
+struct QuadResources {
+    quads_f16: wgpu::Buffer,
+    quads_f32: wgpu::Buffer,
+    dequant_params: wgpu::Buffer,
+    quad_params: Vec<wgpu::Buffer>,
+}
+
 /// Buffers for the r16 inverse transform that dispatches one workgroup per
-/// changed tile and keeps intermediate lowpass bands packed.
+/// changed tile. Even levels below the coarsest are 2×2 quads; the pyramid
+/// stays scalar for the portable path and for the coarsest level.
 struct FastTiles {
-    ll_packed: wgpu::Buffer,
+    quads_f16: wgpu::Buffer,
+    quads_f32: wgpu::Buffer,
+    /// One uniform per level, coarse to fine, the same order as `idwt_stages`.
+    quad_params: Vec<wgpu::Buffer>,
+    dequant_params: wgpu::Buffer,
     tile_ids: wgpu::Buffer,
     regions: Vec<TileRegion>,
     full_counts: [u32; DECOMPOSITION_LEVELS],
@@ -299,6 +327,10 @@ pub struct Decoder {
     r16_planes: bool,
     r16_plane_pipeline: R16PlanePipeline,
     shader_f16: bool,
+    /// Subgroup size is fixed at 32, so the fast inverse may shuffle.
+    subgroup_quads: bool,
+    /// Fast 16-bit dequantisation. `None` when this decoder has no fast path.
+    quad_dequant: Option<QuadStages>,
 
     dequant_params: wgpu::Buffer,
     dequant_grid: (u32, u32),
@@ -443,8 +475,13 @@ impl Decoder {
         if let Some(plan) = &tile_plan {
             check_size(
                 &device,
-                "the packed lowpass",
-                (buffers.ll_f16_elements * 2).max(4),
+                "the fp16 quads",
+                (buffers.quad_fp16_words * 4).max(16),
+            )?;
+            check_size(
+                &device,
+                "the f32 quads",
+                (buffers.quad_f32_floats * 4).max(16),
             )?;
             check_size(&device, "the tile lists", plan.bytes.len() as u64)?;
         }
@@ -454,6 +491,11 @@ impl Decoder {
         // during a turn and submitted at once, so that a decoder not yet
         // used holds none of its command buffers (decision D60).
         let turn = take_turn(context.turns.as_deref(), &device, &queue);
+        let quad_dequant = if fast_r16 {
+            Some(dequant_quads_stages(&device)?)
+        } else {
+            None
+        };
         let made = with_error_scope(&device, || {
             let storage = |label: &str, bytes: u64, usage| buffer(&device, label, bytes, usage);
 
@@ -498,6 +540,43 @@ impl Decoder {
             let dequant_grid = dequant_params_data.grid();
             let dequant_params =
                 uniform_buffer(&device, &queue, "dequant params", &dequant_params_data);
+            let quad_resources = fast_r16.then(|| {
+                let fp16_bytes = (buffers.quad_fp16_words * 4).max(16);
+                let f32_bytes = (buffers.quad_f32_floats * 4).max(16);
+                let quads_f16 = storage(
+                    "quads f16",
+                    fp16_bytes,
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                );
+                let quads_f32 = storage(
+                    "quads f32",
+                    f32_bytes,
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                );
+                // Missing coefficients are zero. The pyramid is left as it is;
+                // these buffers are not.
+                queue.write_buffer(&quads_f16, 0, &vec![0u8; fp16_bytes as usize]);
+                queue.write_buffer(&quads_f32, 0, &vec![0u8; f32_bytes as usize]);
+                let dequant_params = uniform_buffer(
+                    &device,
+                    &queue,
+                    "quad dequant params",
+                    &QuadDequantParams::new(&layout, &buffers),
+                );
+                let quad_params = (0..DECOMPOSITION_LEVELS)
+                    .rev()
+                    .map(|level| {
+                        let level = TransformLevel::for_quads(&layout, &buffers, level);
+                        uniform_buffer(&device, &queue, "quad idwt params", &level.params)
+                    })
+                    .collect();
+                QuadResources {
+                    quads_f16,
+                    quads_f32,
+                    dequant_params,
+                    quad_params,
+                }
+            });
             let uploads = DecoderUploads::new(
                 &device,
                 DequantTarget {
@@ -505,6 +584,14 @@ impl Decoder {
                     pyramid: &pyramid,
                     params: &dequant_params,
                     dirty_ballots: &dirty_ballots,
+                    quad: quad_dequant.as_ref().zip(quad_resources.as_ref()).map(
+                        |(stages, quads)| QuadBind {
+                            stage: &stages.main,
+                            params: &quads.dequant_params,
+                            quads_f16: &quads.quads_f16,
+                            quads_f32: &quads.quads_f32,
+                        },
+                    ),
                 },
                 u64::from(block_count) * 4,
                 (3 + 2 * u64::from(block_count)) * 4,
@@ -555,11 +642,7 @@ impl Decoder {
                 .then(|| StageQueries::new(&device, &queue, TIMED_STAGES));
 
             let fast = tile_plan.map(|plan| {
-                let ll_packed = storage(
-                    "packed ll",
-                    (buffers.ll_f16_elements * 2).max(4),
-                    wgpu::BufferUsages::STORAGE,
-                );
+                let quads = quad_resources.expect("fast r16 quad buffers");
                 let tile_ids = storage(
                     "idwt tiles",
                     plan.bytes.len() as u64,
@@ -590,7 +673,10 @@ impl Decoder {
                     full_counts[index] = count;
                 }
                 FastTiles {
-                    ll_packed,
+                    quads_f16: quads.quads_f16,
+                    quads_f32: quads.quads_f32,
+                    quad_params: quads.quad_params,
+                    dequant_params: quads.dequant_params,
                     tile_ids,
                     regions: plan.regions,
                     full_counts,
@@ -628,6 +714,8 @@ impl Decoder {
                 r16_planes: context.supports_plane_format(PLANE_FORMAT_R16),
                 r16_plane_pipeline: context.r16_plane_pipeline(),
                 shader_f16,
+                subgroup_quads: context.subgroup_quads(),
+                quad_dequant,
                 dequant_params,
                 dequant_grid,
                 concealment: false,
@@ -1682,7 +1770,9 @@ impl Decoder {
         };
 
         if format == PLANE_FORMAT_R16 {
-            let stage = self.r16_plane_pipeline.get(&self.device, self.shader_f16)?;
+            let stage =
+                self.r16_plane_pipeline
+                    .get(&self.device, self.shader_f16, self.subgroup_quads)?;
             return build_bind_groups(&stage, "idwt planes r16").map_err(|error| match error {
                 ScopedError::Validation(message) => GpuError::Texture(format!(
                     "a target view is unsuitable for 16-bit plane stores: {message}"
@@ -1739,10 +1829,12 @@ impl Decoder {
     ///
     /// Levels that do not write a plane still bind a group, aimed at 1×1
     /// stand-in textures, because the pipeline's plane bindings are always
-    /// there. Every level shares the packed lowpass: a coarser level writes
-    /// the band the next finer level reads.
+    /// there. Every level reads the quad buffers: a coarser level writes the
+    /// lowpass the next finer level reads.
     fn bind_fast_planes(&self, targets: [&wgpu::TextureView; 3]) -> Result<PlaneFill, GpuError> {
-        let stage = self.r16_plane_pipeline.get(&self.device, self.shader_f16)?;
+        let stage =
+            self.r16_plane_pipeline
+                .get(&self.device, self.shader_f16, self.subgroup_quads)?;
         let fast = self.fast.as_ref().expect("fast r16 tiles");
         let [y, cb, cr] = targets;
         let planes = [y, cb, cr];
@@ -1760,11 +1852,12 @@ impl Decoder {
                     layout: &stage.layout,
                     entries: &[
                         entry(0, &self.pyramid),
-                        entry(2, &level.params),
+                        entry(2, &fast.quad_params[index]),
                         texture(3, views[0]),
                         texture(4, views[1]),
                         texture(5, views[2]),
-                        entry(6, &fast.ll_packed),
+                        entry(6, &fast.quads_f16),
+                        entry(7, &fast.quads_f32),
                         wgpu::BindGroupEntry {
                             binding: 9,
                             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -1829,12 +1922,25 @@ impl Decoder {
                 fast.gpu_full = false;
                 None
             } else {
+                let offsets = frame.block_offsets();
+                let mut presence = vec![0u64; offsets.len().div_ceil(64)];
+                for (index, offset) in offsets.iter().copied().enumerate() {
+                    if offset != MISSING_BLOCK {
+                        presence[index / 64] |= 1u64 << (index % 64);
+                    }
+                }
                 let mut parent = None;
                 let mut regions = Vec::new();
                 let mut counts = [0u32; DECOMPOSITION_LEVELS];
                 for (index, level) in (0..DECOMPOSITION_LEVELS).rev().enumerate() {
-                    let selected =
-                        cull::select_tiles(layout, level, &change.bits, parent.as_deref(), None);
+                    let selected = cull::select_tiles(
+                        layout,
+                        level,
+                        &change.bits,
+                        parent.as_deref(),
+                        None,
+                        Some(&presence),
+                    );
                     counts[index] = u32::try_from(selected.ids.len()).unwrap_or(u32::MAX);
                     if !selected.ids.is_empty() {
                         regions.push((fast.regions[index].offset, selected.ids));
@@ -2274,16 +2380,34 @@ impl Decoder {
                 label: Some("dequant"),
                 timestamp_writes: writes(0),
             });
-            let dequant_bg = &self.uploads.slot(slot_index).dequant_bind_group;
+            let slot = self.uploads.slot(slot_index);
+            let fast_dequant = output_uses_fast_tiles(output);
+            let (clear_pipeline, main_pipeline, dequant_bg) = if fast_dequant {
+                let stages = self
+                    .quad_dequant
+                    .as_ref()
+                    .expect("fast r16 has quad dequant");
+                let bg = slot
+                    .quad_dequant_bind_group
+                    .as_ref()
+                    .expect("fast r16 quad bind group");
+                (&stages.clear.pipeline, &stages.main.pipeline, bg)
+            } else {
+                (
+                    &self.pipelines.dequant_clear.pipeline,
+                    &self.pipelines.dequant.pipeline,
+                    &slot.dequant_bind_group,
+                )
+            };
             if self.pending_clear_count > 0 {
                 let grid = grid_for(u64::from(self.pending_clear_count));
-                pass.set_pipeline(&self.pipelines.dequant_clear.pipeline);
+                pass.set_pipeline(clear_pipeline);
                 pass.set_bind_group(0, dequant_bg, &[]);
                 pass.dispatch_workgroups(grid.0, grid.1, 1);
             }
             if self.pending_decode_count > 0 {
                 let grid = grid_for(u64::from(self.pending_decode_count));
-                pass.set_pipeline(&self.pipelines.dequant.pipeline);
+                pass.set_pipeline(main_pipeline);
                 pass.set_bind_group(0, dequant_bg, &[]);
                 pass.dispatch_workgroups(grid.0, grid.1, 1);
             }
@@ -2667,6 +2791,7 @@ impl Decoder {
                 pyramid: &self.pyramid,
                 params: &self.dequant_params,
                 dirty_ballots: &self.dirty_ballots,
+                quad: quad_bind(self.quad_dequant.as_ref(), self.fast.as_ref()),
             },
             needed_words,
             MIN_PAYLOAD_WORDS,
@@ -2699,6 +2824,7 @@ impl Decoder {
                 pyramid: &self.pyramid,
                 params: &self.dequant_params,
                 dirty_ballots: &self.dirty_ballots,
+                quad: quad_bind(self.quad_dequant.as_ref(), self.fast.as_ref()),
             },
             FrameUpload {
                 table,
@@ -2738,6 +2864,7 @@ impl Decoder {
                 pyramid: &self.pyramid,
                 params: &self.dequant_params,
                 dirty_ballots: &self.dirty_ballots,
+                quad: quad_bind(self.quad_dequant.as_ref(), self.fast.as_ref()),
             },
             FrameUpload {
                 table,
@@ -2923,6 +3050,10 @@ impl Drop for Decoder {
     fn drop(&mut self) {
         self.uploads.destroy_all();
         let mut buffers = vec![&self.dirty_ballots, &self.pyramid, &self.packed];
+        if let Some(fast) = &self.fast {
+            buffers.push(&fast.quads_f16);
+            buffers.push(&fast.quads_f32);
+        }
         buffers.extend(&self.ll_f16);
         buffers.extend(&self.readback);
         if let Some(color) = &self.color {
