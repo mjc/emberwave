@@ -107,7 +107,7 @@ pub mod shader_sources {
 
     /// Every shader, by name, with its compute entry points.
     pub const ALL: [(&str, &str, &[&str]); 11] = [
-        ("dequant", DEQUANT, &["main"]),
+        ("dequant", DEQUANT, &["clear_blocks", "main"]),
         ("conceal", CONCEAL, &["main"]),
         ("idwt", IDWT, &["main"]),
         ("yuv2rgb", YUV2RGB, &["main"]),

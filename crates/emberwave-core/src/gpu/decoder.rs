@@ -21,7 +21,9 @@ use super::context::{
     notice_loss, submit, take_turn,
 };
 use super::error::GpuError;
-use super::layout::{BufferLayout, ConcealParams, DequantParams, TransformLevel, YuvParams};
+use super::layout::{
+    BufferLayout, ConcealParams, DequantParams, TransformLevel, YuvParams, grid_for,
+};
 use super::pipelines::{
     DrawPipeline, Pipelines, ScopedError, Stage, with_error_scope, with_error_scope_kind,
 };
@@ -248,6 +250,16 @@ pub struct Decoder {
     payload: wgpu::Buffer,
     payload_capacity_words: usize,
     block_offsets: wgpu::Buffer,
+    dequant_work: wgpu::Buffer,
+    dirty_ballots: wgpu::Buffer,
+    block_band: Vec<u8>,
+    first_detail_block: u32,
+    dirty_list: Vec<u32>,
+    next_dirty_list: Vec<u32>,
+    present_mask: Vec<u64>,
+    work_scratch: Vec<u32>,
+    pending_decode_count: u32,
+    pending_clear_count: u32,
     /// Made on the first decode that waits for its frame, and made again
     /// when the payload buffer grows; `record_rgb`, which does not wait,
     /// writes through the queue instead, as a browser has to. Never made
@@ -400,11 +412,28 @@ impl Decoder {
             let payload_capacity_words = MIN_PAYLOAD_WORDS;
             let frame_usage = frame_buffer_usage(context.shares_uploads());
             let payload = storage("payload", payload_capacity_words as u64 * 4, frame_usage);
-            let block_offsets = storage(
-                "block offsets",
-                u64::from(layout.block_count()) * 4,
+            let block_count = layout.block_count();
+            let block_offsets = storage("block offsets", u64::from(block_count) * 4, frame_usage);
+            let dequant_work = storage(
+                "dequant work",
+                (3 + 2 * u64::from(block_count)) * 4,
                 frame_usage,
             );
+            let dirty_ballots = storage(
+                "dirty ballots",
+                u64::from(block_count) * 4,
+                wgpu::BufferUsages::STORAGE,
+            );
+            let mut block_band = vec![0u8; block_count as usize];
+            let mut first_detail_block = block_count;
+            for (slot, (_, level, _, info)) in layout.bands().enumerate() {
+                if level < DECOMPOSITION_LEVELS - 1 && info.first_block < first_detail_block {
+                    first_detail_block = info.first_block;
+                }
+                let start = info.first_block as usize;
+                let end = start + info.block_count() as usize;
+                block_band[start..end].fill(slot as u8);
+            }
             let pyramid = storage(
                 "wavelet pyramid",
                 buffers.pyramid_floats * 4,
@@ -427,9 +456,10 @@ impl Decoder {
                 &device,
                 &pipelines.dequant,
                 &payload,
-                &block_offsets,
+                &dequant_work,
                 &pyramid,
                 &dequant_params,
+                &dirty_ballots,
             );
 
             // Levels from the coarsest to the finest: each consumes the LL band
@@ -465,6 +495,16 @@ impl Decoder {
                 payload,
                 payload_capacity_words,
                 block_offsets,
+                dequant_work,
+                dirty_ballots,
+                block_band,
+                first_detail_block,
+                dirty_list: Vec::new(),
+                next_dirty_list: Vec::new(),
+                present_mask: vec![0u64; (block_count as usize).div_ceil(64)],
+                work_scratch: Vec::new(),
+                pending_decode_count: 0,
+                pending_clear_count: 0,
                 upload: None,
                 shared_uploads: context.shares_uploads(),
                 pyramid,
@@ -617,6 +657,7 @@ impl Decoder {
         self.check_device()?;
         self.assemble_complete(frame)?;
         self.record_assembled(Some(color), Read::Nothing, None, encoder)?;
+        self.commit_dequant_dirty();
         self.assembler.mark_frame_decoded();
         Ok(())
     }
@@ -663,6 +704,7 @@ impl Decoder {
         self.check_target(target)?;
         self.assemble_complete(frame)?;
         self.record_assembled(Some(color), Read::Texture(target), None, encoder)?;
+        self.commit_dequant_dirty();
         self.assembler.mark_frame_decoded();
         Ok(())
     }
@@ -781,6 +823,7 @@ impl Decoder {
         let fill = self.prepare_plane_targets(targets)?;
         self.assemble_complete(frame)?;
         self.record_assembled(None, Read::Planes(targets), Some(fill), encoder)?;
+        self.commit_dequant_dirty();
         self.assembler.mark_frame_decoded();
         Ok(())
     }
@@ -1310,12 +1353,14 @@ impl Decoder {
         let prepare_start = Instant::now();
         self.ensure_payload_capacity()?;
         self.compile_concealment()?;
+        let conceal = self.will_conceal();
+        self.prepare_dequant_work(conceal);
         let turns = self.turns.clone();
-        let (table_bytes, payload_bytes, upload, queue_turn, mut recording) =
+        let (table_bytes, work_bytes, payload_bytes, upload, queue_turn, mut recording) =
             match timing_opts.upload {
                 TimedUpload::Mapped => {
                     let upload_start = Instant::now();
-                    let (table_bytes, payload_bytes) = self.upload_mapped()?;
+                    let (table_bytes, work_bytes, payload_bytes) = self.upload_mapped(conceal)?;
                     let upload = upload_start.elapsed();
                     // The decode makes command buffers from here to its submission, and
                     // takes its turn at them (decision D60); the upload above waits for
@@ -1323,16 +1368,23 @@ impl Decoder {
                     let turn_start = Instant::now();
                     let recording = take_turn(turns.as_deref(), &self.device, &self.queue);
                     let queue_turn = turn_start.elapsed();
-                    (table_bytes, payload_bytes, upload, queue_turn, recording)
+                    (
+                        table_bytes,
+                        work_bytes,
+                        payload_bytes,
+                        upload,
+                        queue_turn,
+                        recording,
+                    )
                 }
                 TimedUpload::QueueWrite => {
                     let turn_start = Instant::now();
                     let recording = take_turn(turns.as_deref(), &self.device, &self.queue);
                     let queue_turn = turn_start.elapsed();
                     let upload_start = Instant::now();
-                    with_error_scope(&self.device, || self.upload())?;
+                    with_error_scope(&self.device, || self.upload(conceal))?;
                     let upload = upload_start.elapsed();
-                    (0, 0, upload, queue_turn, recording)
+                    (0, 0, 0, upload, queue_turn, recording)
                 }
             };
         let submit_prep_start = Instant::now();
@@ -1369,14 +1421,26 @@ impl Decoder {
             if timing_opts.upload == TimedUpload::Mapped
                 && let Some(upload) = &self.upload
             {
-                let payload_start = self.table_capacity_bytes();
-                encoder.copy_buffer_to_buffer(
-                    &upload.buffer,
-                    0,
-                    &self.block_offsets,
-                    0,
-                    table_bytes,
-                );
+                let work_start = self.table_capacity_bytes();
+                let payload_start = work_start + self.dequant_work_capacity_bytes();
+                if table_bytes > 0 {
+                    encoder.copy_buffer_to_buffer(
+                        &upload.buffer,
+                        0,
+                        &self.block_offsets,
+                        0,
+                        table_bytes,
+                    );
+                }
+                if work_bytes > 0 {
+                    encoder.copy_buffer_to_buffer(
+                        &upload.buffer,
+                        work_start,
+                        &self.dequant_work,
+                        0,
+                        work_bytes,
+                    );
+                }
                 encoder.copy_buffer_to_buffer(
                     &upload.buffer,
                     payload_start,
@@ -1401,6 +1465,9 @@ impl Decoder {
         })?;
         recording.submitted();
         drop(recording);
+        // The dequant pass has been submitted; keep host dirty tracking aligned
+        // with GPU `dirty_ballots` even if readback or the row closure fails.
+        std::mem::swap(&mut self.dirty_list, &mut self.next_dirty_list);
         let submit_dur = submit_prep + encode_start.elapsed();
 
         // The wait for the frame polls the device, which records a loss. A
@@ -1578,7 +1645,9 @@ impl Decoder {
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<(), GpuError> {
         self.ensure_payload_capacity()?;
-        with_error_scope(&self.device, || self.upload())?;
+        let conceal = self.will_conceal();
+        self.prepare_dequant_work(conceal);
+        with_error_scope(&self.device, || self.upload(conceal))?;
         let output = self.prepare_output(color, read, prepared_planes)?;
         let conceal = self.prepare_concealment()?;
         self.encode_passes(encoder, color.is_some(), conceal, None, false, &output);
@@ -1633,6 +1702,7 @@ impl Decoder {
         }
         drop(recording);
         if outcome.is_ok() {
+            self.commit_dequant_dirty();
             self.assembler.mark_frame_decoded();
         }
         // Nothing waits for the work, so nothing else polls the device: one
@@ -1882,9 +1952,18 @@ impl Decoder {
                 label: Some("dequant"),
                 timestamp_writes: writes(0),
             });
-            pass.set_pipeline(&self.pipelines.dequant.pipeline);
-            pass.set_bind_group(0, &self.dequant_bind_group, &[]);
-            pass.dispatch_workgroups(self.dequant_grid.0, self.dequant_grid.1, 1);
+            if self.pending_clear_count > 0 {
+                let grid = grid_for(u64::from(self.pending_clear_count));
+                pass.set_pipeline(&self.pipelines.dequant_clear.pipeline);
+                pass.set_bind_group(0, &self.dequant_bind_group, &[]);
+                pass.dispatch_workgroups(grid.0, grid.1, 1);
+            }
+            if self.pending_decode_count > 0 {
+                let grid = grid_for(u64::from(self.pending_decode_count));
+                pass.set_pipeline(&self.pipelines.dequant.pipeline);
+                pass.set_bind_group(0, &self.dequant_bind_group, &[]);
+                pass.dispatch_workgroups(grid.0, grid.1, 1);
+            }
             // A dispatch of a compute pass sees the writes of the ones
             // before it: the concealment, the frame's coarsest level.
             if let (true, Some(resources)) = (conceal, &self.conceal) {
@@ -2145,9 +2224,10 @@ impl Decoder {
                 &self.device,
                 &self.pipelines.dequant,
                 &payload,
-                &self.block_offsets,
+                &self.dequant_work,
                 &self.pyramid,
                 &self.dequant_params,
+                &self.dirty_ballots,
             );
             (payload, bind_group)
         })?;
@@ -2159,22 +2239,87 @@ impl Decoder {
         Ok(())
     }
 
-    /// Bytes of the block table: where the payload starts in the upload
+    /// Bytes of the block table: where the dequant worklist starts in the upload
     /// buffer.
     fn table_capacity_bytes(&self) -> u64 {
         u64::from(self.layout().block_count()) * 4
     }
 
-    /// Writes the block table and the payload of the assembled frame into
-    /// the upload buffer, which is made, or made larger, first if it has to
-    /// be, and returns the bytes of each for the copies at the start of the
-    /// frame's command buffer. The previous frame is done, so mapping the
-    /// buffer waits for nothing.
-    fn upload_mapped(&mut self) -> Result<(u64, u64), GpuError> {
-        if self.shared_uploads {
-            return self.upload_in_place();
+    /// Maximum bytes of `dequant_work`: where the payload starts in the upload
+    /// buffer.
+    fn dequant_work_capacity_bytes(&self) -> u64 {
+        (3 + 2 * u64::from(self.layout().block_count())) * 4
+    }
+
+    fn will_conceal(&self) -> bool {
+        self.concealment && self.assembler.received_blocks() < self.assembler.total_blocks()
+    }
+
+    /// Builds the compact worklist of received blocks to decode and previously
+    /// dirty missing blocks to clear, without mutating `dirty_list` until the
+    /// submission succeeds.
+    fn prepare_dequant_work(&mut self, conceal: bool) {
+        let frame = self.assembler.frame();
+        let filled = frame.filled();
+        let offsets = frame.block_offsets();
+
+        self.work_scratch.clear();
+        self.work_scratch.push(filled.len() as u32);
+        let clear_offset = 2 + 2 * filled.len() as u32;
+        self.work_scratch.push(clear_offset);
+
+        self.next_dirty_list.clear();
+        for &block_index in filled {
+            let idx = block_index as usize;
+            self.present_mask[idx >> 6] |= 1u64 << (idx & 63);
+            let band_slot = u32::from(self.block_band[idx]);
+            self.work_scratch.push((band_slot << 24) | block_index);
+            self.work_scratch.push(offsets[idx]);
+            self.next_dirty_list.push(block_index);
         }
-        let payload_start = self.table_capacity_bytes();
+
+        let clear_count_pos = self.work_scratch.len();
+        self.work_scratch.push(0);
+        let mut clear_count = 0u32;
+        for &block_index in &self.dirty_list {
+            let idx = block_index as usize;
+            if (self.present_mask[idx >> 6] >> (idx & 63)) & 1 != 0 {
+                continue;
+            }
+            if conceal && block_index >= self.first_detail_block {
+                self.next_dirty_list.push(block_index);
+            } else {
+                let band_slot = u32::from(self.block_band[idx]);
+                self.work_scratch.push((band_slot << 24) | block_index);
+                clear_count += 1;
+            }
+        }
+        self.work_scratch[clear_count_pos] = clear_count;
+
+        for &block_index in filled {
+            let idx = block_index as usize;
+            self.present_mask[idx >> 6] &= !(1u64 << (idx & 63));
+        }
+
+        self.pending_decode_count = filled.len() as u32;
+        self.pending_clear_count = clear_count;
+    }
+
+    fn commit_dequant_dirty(&mut self) {
+        std::mem::swap(&mut self.dirty_list, &mut self.next_dirty_list);
+    }
+
+    /// Writes the block table (when concealing), dequant worklist, and payload
+    /// of the assembled frame into the upload buffer, which is made, or made
+    /// larger, first if it has to be, and returns the bytes of each for the
+    /// copies at the start of the frame's command buffer. The previous frame is
+    /// done, so mapping the buffer waits for nothing.
+    fn upload_mapped(&mut self, conceal: bool) -> Result<(u64, u64, u64), GpuError> {
+        if self.shared_uploads {
+            return self.upload_in_place(conceal);
+        }
+        let work_start = self.table_capacity_bytes();
+        let payload_start = work_start + self.dequant_work_capacity_bytes();
         let capacity_bytes = payload_start + self.payload_capacity_words as u64 * 4;
         let upload = match &mut self.upload {
             Some(upload) if upload.buffer.size() >= capacity_bytes => upload,
@@ -2204,7 +2349,10 @@ impl Decoder {
 
         let frame = self.assembler.frame();
         let table: &[u8] = bytemuck::cast_slice(frame.block_offsets());
+        let work: &[u8] = bytemuck::cast_slice(&self.work_scratch);
         let payload: &[u8] = bytemuck::cast_slice(frame.payload());
+        let table_bytes = if conceal { table.len() as u64 } else { 0 };
+        let work_bytes = work.len() as u64;
         let payload_bytes = (payload.len() + PAYLOAD_PADDING_WORDS * 4) as u64;
         {
             let mut view = upload
@@ -2212,42 +2360,59 @@ impl Decoder {
                 .slice(..payload_start + payload_bytes)
                 .get_mapped_range_mut()
                 .map_err(|error| GpuError::Device(error.to_string()))?;
-            let start = payload_start as usize;
-            view.slice(..table.len()).copy_from_slice(table);
-            view.slice(start..start + payload.len())
+            if conceal {
+                view.slice(..table.len()).copy_from_slice(table);
+            }
+            let w_start = work_start as usize;
+            view.slice(w_start..w_start + work.len())
+                .copy_from_slice(work);
+            let p_start = payload_start as usize;
+            view.slice(p_start..p_start + payload.len())
                 .copy_from_slice(payload);
-            view.slice(start + payload.len()..start + payload_bytes as usize)
+            view.slice(p_start + payload.len()..p_start + payload_bytes as usize)
                 .fill(0);
         }
         with_error_scope(&self.device, || upload.buffer.unmap())?;
         upload.mapped = false;
-        Ok((table.len() as u64, payload_bytes))
+        Ok((table_bytes, work_bytes, payload_bytes))
     }
 
-    /// Writes the block table and the payload of the assembled frame where
-    /// the shaders read them, on a GPU that shares its memory with the CPU
-    /// (decision D53): no upload buffer, and no copies at the start of the
-    /// frame's command buffer, whose sizes this returns as zero. The previous
-    /// frame is done, so mapping the buffers waits for nothing.
-    fn upload_in_place(&mut self) -> Result<(u64, u64), GpuError> {
-        let written = map_for_writing(&self.device, &[&self.block_offsets, &self.payload])
-            .and_then(|()| self.write_in_place());
+    /// Writes the dequant worklist, payload, and (when concealing) block table
+    /// where the shaders read them, on a GPU that shares its memory with the
+    /// CPU (decision D53): no upload buffer, and no copies at the start of
+    /// the frame's command buffer, whose sizes this returns as zero. The
+    /// previous frame is done, so mapping the buffers waits for nothing.
+    fn upload_in_place(&mut self, conceal: bool) -> Result<(u64, u64, u64), GpuError> {
+        let written = if conceal {
+            map_for_writing(
+                &self.device,
+                &[&self.block_offsets, &self.dequant_work, &self.payload],
+            )
+            .and_then(|()| self.write_in_place(true))
+        } else {
+            map_for_writing(&self.device, &[&self.dequant_work, &self.payload])
+                .and_then(|()| self.write_in_place(false))
+        };
         // Unmapped whatever happened: a buffer left mapped would fail every
         // later decode and every write through the queue.
         let unmapped = with_error_scope(&self.device, || {
-            self.block_offsets.unmap();
+            if conceal {
+                self.block_offsets.unmap();
+            }
+            self.dequant_work.unmap();
             self.payload.unmap();
         });
         written?;
         unmapped?;
-        Ok((0, 0))
+        Ok((0, 0, 0))
     }
 
     /// The writing of [`upload_in_place`](Self::upload_in_place), into the
     /// mapped buffers.
-    fn write_in_place(&self) -> Result<(), GpuError> {
+    fn write_in_place(&self, conceal: bool) -> Result<(), GpuError> {
         let frame = self.assembler.frame();
         let table: &[u8] = bytemuck::cast_slice(frame.block_offsets());
+        let work: &[u8] = bytemuck::cast_slice(&self.work_scratch);
         let payload: &[u8] = bytemuck::cast_slice(frame.payload());
         let padded = payload.len() + PAYLOAD_PADDING_WORDS * 4;
         let mapped = |buffer: &wgpu::Buffer, bytes: usize| {
@@ -2256,24 +2421,36 @@ impl Decoder {
                 .get_mapped_range_mut()
                 .map_err(|error| GpuError::Device(error.to_string()))
         };
-        mapped(&self.block_offsets, table.len())?
+        if conceal {
+            mapped(&self.block_offsets, table.len())?
+                .slice(..)
+                .copy_from_slice(table);
+        }
+        mapped(&self.dequant_work, work.len())?
             .slice(..)
-            .copy_from_slice(table);
+            .copy_from_slice(work);
         let mut view = mapped(&self.payload, padded)?;
         view.slice(..payload.len()).copy_from_slice(payload);
         view.slice(payload.len()..).fill(0);
         Ok(())
     }
 
-    /// Uploads the block table and the payload of the assembled frame through
-    /// the queue, for `record_rgb`, which does not wait for its frame and so
-    /// cannot map the upload buffer.
-    fn upload(&self) {
+    /// Uploads the dequant worklist, payload, and (when concealing) block table
+    /// through the queue, for `record_rgb`, which does not wait for its frame
+    /// and so cannot map the upload buffer.
+    fn upload(&self, conceal: bool) {
         let frame = self.assembler.frame();
+        if conceal {
+            self.queue.write_buffer(
+                &self.block_offsets,
+                0,
+                bytemuck::cast_slice(frame.block_offsets()),
+            );
+        }
         self.queue.write_buffer(
-            &self.block_offsets,
+            &self.dequant_work,
             0,
-            bytemuck::cast_slice(frame.block_offsets()),
+            bytemuck::cast_slice(&self.work_scratch),
         );
 
         let payload = frame.payload();
@@ -2394,6 +2571,8 @@ impl Drop for Decoder {
         let mut buffers = vec![
             &self.payload,
             &self.block_offsets,
+            &self.dequant_work,
+            &self.dirty_ballots,
             &self.pyramid,
             &self.packed,
         ];
@@ -2442,18 +2621,20 @@ fn dequant_bind_group(
     device: &wgpu::Device,
     stage: &Stage,
     payload: &wgpu::Buffer,
-    block_offsets: &wgpu::Buffer,
+    dequant_work: &wgpu::Buffer,
     pyramid: &wgpu::Buffer,
     params: &wgpu::Buffer,
+    dirty_ballots: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("dequant"),
         layout: &stage.layout,
         entries: &[
             entry(0, payload),
-            entry(1, block_offsets),
+            entry(1, dequant_work),
             entry(2, pyramid),
             entry(3, params),
+            entry(4, dirty_ballots),
         ],
     })
 }
