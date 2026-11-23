@@ -1168,7 +1168,8 @@ fn rgb_pictures_an_encode_cannot_read_are_refused() {
     refused(
         good,
         7,
-        "format is 7, not EMBERWAVE_TEXTURE_RGBA8 or EMBERWAVE_TEXTURE_BGRA8",
+        "format is 7, not EMBERWAVE_TEXTURE_RGBA8, EMBERWAVE_TEXTURE_BGRA8, \
+         EMBERWAVE_TEXTURE_RGB10A2 or EMBERWAVE_TEXTURE_RGBA16F",
     );
     refused(
         EmberwaveSourcePlane {
@@ -1395,4 +1396,122 @@ fn frames_u16_through_the_c_api_equal_the_rust_encoder_and_reject_bad_inputs() {
         emberwave_encoder_destroy(encoder);
         emberwave_context_destroy(context);
     }
+}
+
+#[test]
+fn c_api_encodes_hdr_rgb10a2_and_rgba16f_captures() {
+    let Some(context) = context() else {
+        return;
+    };
+    let signalling = EmberwaveSignalling {
+        matrix: EMBERWAVE_MATRIX_BT2020,
+        range: EMBERWAVE_RANGE_LIMITED,
+        chroma_siting: EMBERWAVE_SITING_CENTER,
+        primaries: EMBERWAVE_PRIMARIES_BT2020,
+        transfer: EMBERWAVE_TRANSFER_PQ,
+        ..Default::default()
+    };
+
+    let f32_to_f16 = |value: f32| -> u16 {
+        let bits = value.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = ((bits >> 23) & 0xff) as i32;
+        let frac = bits & 0x007f_ffff;
+        if exp == 0xff {
+            let payload = if frac != 0 { (frac >> 13).max(1) } else { 0 };
+            return sign | 0x7c00 | (payload as u16);
+        }
+        let new_exp = exp - 127 + 15;
+        if new_exp >= 31 {
+            return sign | 0x7c00;
+        }
+        if new_exp <= 0 {
+            if new_exp < -10 {
+                return sign;
+            }
+            let mant = (frac | 0x0080_0000) >> (1 - new_exp + 13);
+            return sign | (mant as u16);
+        }
+        sign | ((new_exp as u16) << 10) | ((frac >> 13) as u16)
+    };
+
+    // emberwave_texture_create stays limited to 8-bit RGBA8/BGRA8.
+    let layout = FrameLayout::new(64, 32, ChromaSubsampling::Yuv420).unwrap();
+    let decoder = decoder_for(context, &layout);
+    for fmt in [EMBERWAVE_TEXTURE_RGB10A2, EMBERWAVE_TEXTURE_RGBA16F] {
+        let mut tex = ptr::null_mut();
+        // SAFETY: live decoder, valid out pointer.
+        let status = unsafe { emberwave_texture_create(decoder, fmt, &mut tex) };
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert!(tex.is_null());
+    }
+    // SAFETY: live, destroyed once.
+    unsafe { emberwave_decoder_destroy(decoder) };
+
+    for (width, height, chroma) in [
+        (64u32, 32u32, ChromaSubsampling::Yuv420),
+        (35, 19, ChromaSubsampling::Yuv444),
+    ] {
+        let layout = FrameLayout::new(width, height, chroma).unwrap();
+        let enc10 = encoder_for(context, &layout, Some(&signalling));
+        let enc16f = encoder_for(context, &layout, Some(&signalling));
+
+        let stride10 = 4 * width as usize + 12;
+        let mut rgb10 = vec![0xAAu8; stride10 * (height as usize - 1) + 4 * width as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let w = ((x * 1023 / width as usize) as u32)
+                    | (((y * 1023 / height as usize) as u32) << 10)
+                    | (512 << 20);
+                rgb10[y * stride10 + 4 * x..][..4].copy_from_slice(&w.to_le_bytes());
+            }
+        }
+        let plane10 = EmberwaveSourcePlane {
+            data: rgb10.as_ptr(),
+            stride: stride10,
+            size: rgb10.len(),
+        };
+        let (status, frame10, _) = encode_rgb_c(enc10, plane10, EMBERWAVE_TEXTURE_RGB10A2, 32_000);
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        assert!(!frame10.is_empty());
+
+        let stride16f = 8 * width as usize + 16;
+        let mut fp16 = vec![0x55u8; stride16f * (height as usize - 1) + 8 * width as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let nit = (x + y) as f32 * 0.5;
+                let at = y * stride16f + 8 * x;
+                for (c, v) in [nit, nit * 0.6, nit * 0.3, 1.0].into_iter().enumerate() {
+                    fp16[at + 2 * c..][..2].copy_from_slice(&f32_to_f16(v).to_le_bytes());
+                }
+            }
+        }
+        let plane16f = EmberwaveSourcePlane {
+            data: fp16.as_ptr(),
+            stride: stride16f,
+            size: fp16.len(),
+        };
+        let (status, frame16f, _) =
+            encode_rgb_c(enc16f, plane16f, EMBERWAVE_TEXTURE_RGBA16F, 32_000);
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        assert!(!frame16f.is_empty());
+
+        // Bad stride for 8-bpp RGBA16F fails with InvalidArgument.
+        let bad_stride = EmberwaveSourcePlane {
+            data: fp16.as_ptr(),
+            stride: 8 * width as usize - 1,
+            size: fp16.len(),
+        };
+        let (status, _, _) = encode_rgb_c(enc16f, bad_stride, EMBERWAVE_TEXTURE_RGBA16F, 32_000);
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+
+        // SAFETY: live, destroyed once.
+        unsafe {
+            emberwave_encoder_destroy(enc10);
+            emberwave_encoder_destroy(enc16f);
+        }
+    }
+
+    // SAFETY: live, destroyed once.
+    unsafe { emberwave_context_destroy(context) };
 }

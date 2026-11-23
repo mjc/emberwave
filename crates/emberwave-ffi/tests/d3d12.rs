@@ -876,7 +876,10 @@ fn a_hosts_shared_bgra_picture_is_encoded_as_rgb() {
     .unwrap_err();
     assert_eq!(status, EmberwaveStatus::InvalidArgument);
     assert!(
-        error.contains("not DXGI_FORMAT_B8G8R8A8_UNORM or DXGI_FORMAT_R8G8B8A8_UNORM"),
+        error.contains(
+            "not DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, \
+             DXGI_FORMAT_R10G10B10A2_UNORM or DXGI_FORMAT_R16G16B16A16_FLOAT"
+        ),
         "{error}"
     );
     drop(srgb);

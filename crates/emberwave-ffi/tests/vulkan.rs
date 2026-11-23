@@ -987,6 +987,7 @@ impl Client {
                 texel: match format {
                     vk::Format::R8_UNORM => 1,
                     vk::Format::R8G8_UNORM | vk::Format::R16_UNORM => 2,
+                    vk::Format::R16G16B16A16_SFLOAT => 8,
                     _ => 4,
                 },
             }
@@ -2540,7 +2541,10 @@ fn the_callers_bgra_images_are_encoded_as_rgb() {
             .unwrap_err();
             assert_eq!(status, EmberwaveStatus::InvalidArgument);
             assert!(
-                error.contains("not VK_FORMAT_B8G8R8A8_UNORM or VK_FORMAT_R8G8B8A8_UNORM"),
+                error.contains(
+                    "not VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, \
+                     VK_FORMAT_A2B10G10R10_UNORM_PACK32 or VK_FORMAT_R16G16B16A16_SFLOAT"
+                ),
                 "{error}"
             );
         }
@@ -3762,6 +3766,215 @@ fn vulkan_r16_and_p010_source_images_encode_as_u16_memory_with_semaphores() {
     }
 
     // SAFETY: live context and device.
+    unsafe {
+        emberwave_context_destroy(context);
+        device.destroy_device(None);
+    }
+}
+
+#[test]
+fn vulkan_hdr_rgb10a2_and_rgba16f_source_images_encode_as_cpu() {
+    let Some(client) = Client::new() else {
+        return;
+    };
+    let (names, device) = client.device();
+    let context = client.context(&device, &names, 0, None);
+    let signalling = EmberwaveSignalling {
+        matrix: EMBERWAVE_MATRIX_BT2020,
+        range: EMBERWAVE_RANGE_LIMITED,
+        chroma_siting: EMBERWAVE_SITING_CENTER,
+        primaries: EMBERWAVE_PRIMARIES_BT2020,
+        transfer: EMBERWAVE_TRANSFER_PQ,
+        ..Default::default()
+    };
+    let f32_to_f16 = |value: f32| -> u16 {
+        let bits = value.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = ((bits >> 23) & 0xff) as i32;
+        let frac = bits & 0x007f_ffff;
+        if exp == 0xff {
+            let payload = if frac != 0 { (frac >> 13).max(1) } else { 0 };
+            return sign | 0x7c00 | (payload as u16);
+        }
+        let new_exp = exp - 127 + 15;
+        if new_exp >= 31 {
+            return sign | 0x7c00;
+        }
+        if new_exp <= 0 {
+            if new_exp < -10 {
+                return sign;
+            }
+            let mant = (frac | 0x0080_0000) >> (1 - new_exp + 13);
+            return sign | (mant as u16);
+        }
+        sign | ((new_exp as u16) << 10) | ((frac >> 13) as u16)
+    };
+    let size = (96u32, 64u32);
+    let readable = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+
+    // Decoder still rejects RGB10A2 and RGBA16F images on format even when
+    // dimensions and usage otherwise satisfy a decoder target.
+    let dec_size = (128u32, 64u32);
+    let mut decoder = ptr::null_mut();
+    let decoder_status =
+        // SAFETY: live context and out pointer.
+        unsafe {
+            emberwave_decoder_create(
+                context,
+                dec_size.0,
+                dec_size.1,
+                EMBERWAVE_CHROMA_420,
+                &mut decoder,
+            )
+        };
+    assert_eq!(decoder_status, EmberwaveStatus::Ok);
+    let dec_usage =
+        SOURCE_USAGE | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+    for fmt in [
+        vk::Format::A2B10G10R10_UNORM_PACK32,
+        vk::Format::R16G16B16A16_SFLOAT,
+    ] {
+        let img = client.image(&device, fmt, dec_size, dec_usage);
+        client.make_readable(&device, img.image);
+        let desc = EmberwaveVulkanImage {
+            image: img.image.as_raw(),
+            format: fmt.as_raw() as u32,
+            usage: dec_usage.as_raw(),
+            layout: readable.as_raw() as u32,
+            ..Default::default()
+        };
+        let mut tex = ptr::null_mut();
+        // SAFETY: live decoder, rejected image description.
+        let status = unsafe { emberwave_texture_from_vulkan(decoder, &desc, &mut tex) };
+        assert_eq!(status, EmberwaveStatus::InvalidArgument);
+        assert!(tex.is_null());
+        let err = last_error();
+        assert!(
+            err.contains("not VK_FORMAT_B8G8R8A8_UNORM or VK_FORMAT_R8G8B8A8_UNORM"),
+            "{fmt:?}: {err}"
+        );
+        // SAFETY: image owned by test.
+        unsafe {
+            device.destroy_image(img.image, None);
+            device.free_memory(img.memory, None);
+        }
+    }
+    // SAFETY: live decoder, destroyed once.
+    unsafe { emberwave_decoder_destroy(decoder) };
+
+    // Encoder wraps both formats cleanly and matches CPU encode_rgb.
+    for (vk_fmt, api_fmt, bytes) in [
+        (
+            vk::Format::A2B10G10R10_UNORM_PACK32,
+            EMBERWAVE_TEXTURE_RGB10A2,
+            (0..size.0 * size.1)
+                .flat_map(|i| {
+                    let word = (i & 0x3ff) | (((i * 3) & 0x3ff) << 10) | (((i * 7) & 0x3ff) << 20);
+                    word.to_le_bytes()
+                })
+                .collect::<Vec<u8>>(),
+        ),
+        (
+            vk::Format::R16G16B16A16_SFLOAT,
+            EMBERWAVE_TEXTURE_RGBA16F,
+            (0..size.0 * size.1)
+                .flat_map(|i| {
+                    let v = (i % 100) as f32 * 0.5;
+                    [v, v * 0.5, v * 0.25, 1.0]
+                        .into_iter()
+                        .flat_map(|c| f32_to_f16(c).to_le_bytes())
+                })
+                .collect::<Vec<u8>>(),
+        ),
+    ] {
+        let mut enc_mem = ptr::null_mut();
+        let mut enc_img = ptr::null_mut();
+        // SAFETY: live context and out pointers.
+        unsafe {
+            assert_eq!(
+                emberwave_encoder_create(
+                    context,
+                    size.0,
+                    size.1,
+                    EMBERWAVE_CHROMA_420,
+                    &signalling,
+                    &mut enc_mem
+                ),
+                EmberwaveStatus::Ok
+            );
+            assert_eq!(
+                emberwave_encoder_create(
+                    context,
+                    size.0,
+                    size.1,
+                    EMBERWAVE_CHROMA_420,
+                    &signalling,
+                    &mut enc_img
+                ),
+                EmberwaveStatus::Ok
+            );
+        }
+        let img = client.image(&device, vk_fmt, size, SOURCE_USAGE);
+        client
+            .upload(
+                &device,
+                &[(&img, &bytes)],
+                vk::ImageLayout::UNDEFINED,
+                None,
+                None,
+            )
+            .finish(&device);
+        let wrapped = source(
+            enc_img,
+            &img,
+            vk_fmt,
+            SOURCE_USAGE,
+            readable,
+            EMBERWAVE_PLANE_RGB,
+        )
+        .unwrap();
+
+        let bpp = if api_fmt == EMBERWAVE_TEXTURE_RGBA16F {
+            8
+        } else {
+            4
+        };
+        let mut expected = vec![0u8; 9_000];
+        let mut exp_size = 0usize;
+        let src_plane = EmberwaveSourcePlane {
+            data: bytes.as_ptr(),
+            stride: bpp * size.0 as usize,
+            size: bytes.len(),
+        };
+        // SAFETY: live encoder and valid buffers.
+        let status = unsafe {
+            emberwave_encoder_encode_rgb(
+                enc_mem,
+                src_plane,
+                api_fmt,
+                expected.as_mut_ptr(),
+                expected.len(),
+                &mut exp_size,
+            )
+        };
+        assert_eq!(status, EmberwaveStatus::Ok, "{}", last_error());
+        expected.truncate(exp_size);
+
+        let got = encoded_from_images(enc_img, [wrapped, ptr::null_mut(), ptr::null_mut()], None)
+            .unwrap();
+        assert_eq!(got, expected, "vk format {vk_fmt:?}");
+
+        // SAFETY: live objects destroyed once each.
+        unsafe {
+            emberwave_texture_destroy(wrapped);
+            emberwave_encoder_destroy(enc_mem);
+            emberwave_encoder_destroy(enc_img);
+            device.destroy_image(img.image, None);
+            device.free_memory(img.memory, None);
+        }
+    }
+
+    // SAFETY: live objects destroyed once each.
     unsafe {
         emberwave_context_destroy(context);
         device.destroy_device(None);
