@@ -8,7 +8,7 @@
 //! blocks dispatch the whole level.
 
 use crate::bitstream::consts::{BLOCK_SIZE, DECOMPOSITION_LEVELS};
-use crate::bitstream::{Band, Component, FrameLayout, MISSING_BLOCK};
+use crate::bitstream::{Band, BandLayout, Component, FrameLayout, MISSING_BLOCK};
 
 /// Output tile of the inverse transform, in samples.
 pub(crate) const TILE_W: u32 = 64;
@@ -219,8 +219,59 @@ fn same_coefficients(old: &[u32], new: &[u32]) -> bool {
 
 /// `x | (y << 16) | (component << 28)`, in tile units. Grids of a legal frame
 /// fit: the widest tile row is `16384 / 64` and the tallest is `16384 / 32`.
+/// Bits 25..27 and 30..31 stay clear. The sparse fast path sets those for a
+/// band mask and a load mode; full lists keep this encoding.
 pub(crate) fn pack_tile(x: u32, y: u32, component: u32) -> u32 {
     x | (y << 16) | (component << 28)
+}
+
+/// Tile id for the fast inverse when `present` says which blocks exist.
+///
+/// Mode 0 loads every band and leaves the mask clear, so an all-active tile
+/// matches [`pack_tile`]. Mode 1 loads only LL. Mode 2 loads LL and the high
+/// bands in `mask`: bit 0 HL, bit 1 LH, bit 2 HH.
+fn pack_quad_tile(x: u32, y: u32, component: u32, mask: u32) -> u32 {
+    let mode = if mask == 0 {
+        1
+    } else if mask == 7 {
+        0
+    } else {
+        2
+    };
+    let stored = if mode == 2 { mask & 7 } else { 0 };
+    x | (y << 16) | (stored << 25) | (component << 28) | (mode << 30)
+}
+
+fn high_band_mask(
+    present: &[u64],
+    bands: &[(Band, &BandLayout)],
+    bx0: u32,
+    by0: u32,
+    bx1: u32,
+    by1: u32,
+) -> u32 {
+    let mut mask = 0u32;
+    for (band, info) in bands {
+        let bit = match band {
+            Band::Hl => 0u32,
+            Band::Lh => 1,
+            Band::Hh => 2,
+            Band::Ll => continue,
+        };
+        if rect_hits(
+            present,
+            info.first_block,
+            info.blocks_x,
+            info.blocks_y,
+            bx0,
+            by0,
+            bx1,
+            by1,
+        ) {
+            mask |= 1 << bit;
+        }
+    }
+    mask
 }
 
 /// Every tile of `level`, coarse levels included. `skip` is left out of the
@@ -278,13 +329,17 @@ pub(crate) fn plan_tiles(layout: &FrameLayout, align: u64, fuse_y_l1: bool) -> T
 
 /// Tiles of `level` whose inputs differ in `changed`. `parent` is the coarser
 /// level's output coverage; the coarsest level has none. `skip` is computed
-/// into `coverage` and left out of `ids`.
+/// into `coverage` and left out of `ids`. `present` is the blocks this frame
+/// received. `None` keeps every id in [`pack_tile`] form. `Some` stores a load
+/// mode for the fast inverse: a high band with no received block in the
+/// window is not loaded.
 pub(crate) fn select_tiles(
     layout: &FrameLayout,
     level: usize,
     changed: &[u64],
     parent: Option<&[CompCoverage]>,
     skip: Option<Component>,
+    present: Option<&[u64]>,
 ) -> Selected {
     let (band_w, band_h) = layout.level_size(level);
     let (tiles_x, tiles_y) = tile_grid(layout, level);
@@ -305,16 +360,20 @@ pub(crate) fn select_tiles(
             continue;
         }
         let mut bits = vec![0u64; (tiles_x as usize * tiles_y as usize).div_ceil(64)];
-        let info: Vec<_> = bands
+        let info: Vec<(Band, &BandLayout)> = bands
             .iter()
-            .filter_map(|band| layout.band(component, level, *band))
+            .filter_map(|band| {
+                layout
+                    .band(component, level, *band)
+                    .map(|info| (*band, info))
+            })
             .collect();
         let parent_comp = parent.and_then(|levels| levels.get(component.index()));
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
                 let (bx0, by0, bx1, by1) =
                     covered_band(tx, ty, band_w, band_h, 2 * band_w, 2 * band_h);
-                let detail = info.iter().any(|band| {
+                let detail = info.iter().any(|(_, band)| {
                     rect_hits(
                         changed,
                         band.first_block,
@@ -334,7 +393,16 @@ pub(crate) fn select_tiles(
                 let index = ty * tiles_x + tx;
                 bits[index as usize / 64] |= 1u64 << (index % 64);
                 if skip != Some(component) {
-                    ids.push(pack_tile(tx, ty, component.index() as u32));
+                    let id = match present {
+                        Some(present) => pack_quad_tile(
+                            tx,
+                            ty,
+                            component.index() as u32,
+                            high_band_mask(present, &info, bx0, by0, bx1, by1),
+                        ),
+                        None => pack_tile(tx, ty, component.index() as u32),
+                    };
+                    ids.push(id);
                 }
             }
         }
@@ -615,7 +683,7 @@ mod tests {
         // Block (0, 0) of luma's finest horizontal detail.
         let block = hl.first_block;
         let changed = bitset(layout.block_count(), &[block]);
-        let selected = select_tiles(&layout, 0, &changed, None, None);
+        let selected = select_tiles(&layout, 0, &changed, None, None, None);
         let (tiles_x, tiles_y) = tile_grid(&layout, 0);
 
         assert!(selected.ids.contains(&pack_tile(0, 0, 0)));
@@ -635,7 +703,7 @@ mod tests {
         let mut parent = None;
         let mut finest = None;
         for level in (0..DECOMPOSITION_LEVELS).rev() {
-            let selected = select_tiles(&layout, level, &changed, parent.as_deref(), None);
+            let selected = select_tiles(&layout, level, &changed, parent.as_deref(), None, None);
             parent = Some(selected.coverage);
             if level == 0 {
                 finest = Some(selected.ids);
@@ -652,13 +720,50 @@ mod tests {
         let layout = FrameLayout::new(3840, 2160, ChromaSubsampling::Yuv420).unwrap();
         let hl = layout.band(Component::Y, 1, Band::Hl).unwrap();
         let changed = bitset(layout.block_count(), &[hl.first_block]);
-        let level1 = select_tiles(&layout, 1, &changed, None, Some(Component::Y));
+        let level1 = select_tiles(&layout, 1, &changed, None, Some(Component::Y), None);
         assert!(level1.ids.iter().all(|id| id >> 28 != 0));
         assert!(bit(&level1.coverage[0].bits, 0));
 
-        let level0 = select_tiles(&layout, 0, &changed, Some(&level1.coverage), None);
+        let level0 = select_tiles(&layout, 0, &changed, Some(&level1.coverage), None, None);
         assert!(level0.ids.contains(&pack_tile(0, 0, 0)));
         assert!(level0.ids.iter().all(|id| id >> 28 == 0));
+    }
+
+    #[test]
+    fn sparse_tiles_record_which_high_bands_are_present() {
+        let layout = layout_512();
+        let y = Component::Y;
+        let hl = layout.band(y, 0, Band::Hl).unwrap().first_block;
+        let lh = layout.band(y, 0, Band::Lh).unwrap().first_block;
+        let hh = layout.band(y, 0, Band::Hh).unwrap().first_block;
+        let changed = bitset(layout.block_count(), &[hl]);
+
+        let absent = vec![0u64; (layout.block_count() as usize).div_ceil(64)];
+        let empty = select_tiles(&layout, 0, &changed, None, None, Some(&absent));
+        let ll_only = empty
+            .ids
+            .iter()
+            .copied()
+            .find(|id| id & 0xFFFF == 0 && (id >> 16) & 0x1FF == 0)
+            .expect("tile (0, 0)");
+        assert_eq!(ll_only >> 30, 1);
+        assert_eq!((ll_only >> 28) & 3, 0);
+        assert_eq!((ll_only >> 25) & 7, 0);
+
+        let hl_only = bitset(layout.block_count(), &[hl]);
+        let mixed = select_tiles(&layout, 0, &changed, None, None, Some(&hl_only));
+        let mixed_id = mixed
+            .ids
+            .iter()
+            .copied()
+            .find(|id| id & 0xFFFF == 0 && (id >> 16) & 0x1FF == 0)
+            .expect("tile (0, 0)");
+        assert_eq!(mixed_id >> 30, 2);
+        assert_eq!((mixed_id >> 25) & 7, 1);
+
+        let all = bitset(layout.block_count(), &[hl, lh, hh]);
+        let active = select_tiles(&layout, 0, &all, None, None, Some(&all));
+        assert!(active.ids.contains(&pack_tile(0, 0, 0)));
     }
 
     #[test]

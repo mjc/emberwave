@@ -27,6 +27,22 @@ const YUV_GROUP_SIZE: u64 = 256;
 /// Largest workgroup grid dimension that every backend supports.
 pub(crate) const MAX_GRID_DIMENSION: u32 = 65_535;
 
+/// How the fast 16-bit inverse stores one decomposition level.
+///
+/// The portable 8-bit path ignores this and keeps every band as scalar
+/// row-major floats in the pyramid. The coarsest level stays scalar even on
+/// the fast path, and so does any level whose width or height is odd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum QuadStorage {
+    /// Row-major `f32` samples in the pyramid.
+    Scalar = 0,
+    /// 2×2 quads of `f16` samples, two `u32` words per quad.
+    Fp16 = 1,
+    /// 2×2 quads of `f32` samples, four floats per quad.
+    F32 = 2,
+}
+
 /// Where everything lives in the GPU buffers, in elements (floats or words).
 #[derive(Debug, Clone)]
 pub(crate) struct BufferLayout {
@@ -39,6 +55,16 @@ pub(crate) struct BufferLayout {
     /// Size of the intermediate `f16` LL buffer in `f16` elements (even, for
     /// 4-byte copy alignment).
     pub ll_f16_elements: u64,
+    /// [`QuadStorage`] of `[component][level]` on the fast 16-bit path.
+    quad_storage: [[u8; DECOMPOSITION_LEVELS]; NUM_COMPONENTS],
+    /// Word offset of an fp16 quad band `[component][level][band]`.
+    quad_fp16_offsets: [[[u32; BANDS_PER_LEVEL]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS],
+    /// Float offset of an f32 quad band `[component][level][band]`.
+    quad_f32_offsets: [[[u32; BANDS_PER_LEVEL]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS],
+    /// Size of the fp16 quad buffer in `u32` words.
+    pub quad_fp16_words: u64,
+    /// Size of the f32 quad buffer in floats.
+    pub quad_f32_floats: u64,
     /// Word offset of each packed 8-bit plane.
     pub packed_offsets: [u32; NUM_COMPONENTS],
     /// Words per row of each packed plane.
@@ -86,6 +112,13 @@ impl BufferLayout {
         let mut pyramid_floats = 0u64;
         let mut ll_f16_offsets = [[ABSENT; DECOMPOSITION_LEVELS]; NUM_COMPONENTS];
         let mut ll_f16_elements = 0u64;
+        let mut quad_storage = [[QuadStorage::Scalar as u8; DECOMPOSITION_LEVELS]; NUM_COMPONENTS];
+        let mut quad_fp16_offsets =
+            [[[ABSENT; BANDS_PER_LEVEL]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS];
+        let mut quad_f32_offsets =
+            [[[ABSENT; BANDS_PER_LEVEL]; DECOMPOSITION_LEVELS]; NUM_COMPONENTS];
+        let mut quad_fp16_words = 0u64;
+        let mut quad_f32_floats = 0u64;
 
         for component in Component::ALL {
             // 4:2:0 chroma has no finest level.
@@ -103,6 +136,27 @@ impl BufferLayout {
                 if level + 1 < DECOMPOSITION_LEVELS {
                     ll_f16_offsets[component.index()][level] = to_offset(ll_f16_elements)?;
                     ll_f16_elements += (u64::from(width) * u64::from(height)).next_multiple_of(2);
+                }
+                let storage = quad_storage_of(layout, component, level);
+                quad_storage[component.index()][level] = storage as u8;
+                match storage {
+                    QuadStorage::Scalar => {}
+                    QuadStorage::Fp16 => {
+                        let words = u64::from(width / 2) * u64::from(height / 2) * 2;
+                        for band in Band::ALL {
+                            quad_fp16_offsets[component.index()][level][band.index()] =
+                                to_offset(quad_fp16_words)?;
+                            quad_fp16_words += words;
+                        }
+                    }
+                    QuadStorage::F32 => {
+                        let floats = u64::from(width) * u64::from(height);
+                        for band in Band::ALL {
+                            quad_f32_offsets[component.index()][level][band.index()] =
+                                to_offset(quad_f32_floats)?;
+                            quad_f32_floats += floats;
+                        }
+                    }
                 }
             }
         }
@@ -124,6 +178,11 @@ impl BufferLayout {
             pyramid_floats,
             ll_f16_offsets,
             ll_f16_elements,
+            quad_storage,
+            quad_fp16_offsets,
+            quad_f32_offsets,
+            quad_fp16_words,
+            quad_f32_floats,
             packed_offsets,
             packed_strides,
             packed_words,
@@ -150,6 +209,60 @@ impl BufferLayout {
     pub(crate) fn ll_f16_offset(&self, component: Component, level: usize) -> Option<u32> {
         let offset = *self.ll_f16_offsets.get(component.index())?.get(level)?;
         (offset != ABSENT).then_some(offset)
+    }
+
+    /// How the fast 16-bit path stores `level` of `component`.
+    pub(crate) fn quad_storage(&self, component: Component, level: usize) -> QuadStorage {
+        match self
+            .quad_storage
+            .get(component.index())
+            .and_then(|levels| levels.get(level))
+            .copied()
+        {
+            Some(1) => QuadStorage::Fp16,
+            Some(2) => QuadStorage::F32,
+            _ => QuadStorage::Scalar,
+        }
+    }
+
+    /// Offset of a packed quad band: words in the fp16 buffer, or floats in
+    /// the f32 quad buffer. `None` when the level stays scalar.
+    pub(crate) fn quad_offset(
+        &self,
+        component: Component,
+        level: usize,
+        band: Band,
+    ) -> Option<u32> {
+        let table = match self.quad_storage(component, level) {
+            QuadStorage::Fp16 => &self.quad_fp16_offsets,
+            QuadStorage::F32 => &self.quad_f32_offsets,
+            QuadStorage::Scalar => return None,
+        };
+        let offset = *table
+            .get(component.index())?
+            .get(level)?
+            .get(band.index())?;
+        (offset != ABSENT).then_some(offset)
+    }
+}
+
+/// Fast-path storage of one level.
+///
+/// The two finest even levels of a component are fp16 quads. Coarser even
+/// levels below the coarsest are f32 quads. The coarsest level, and any level
+/// with an odd side, stay scalar in the pyramid.
+fn quad_storage_of(layout: &FrameLayout, component: Component, level: usize) -> QuadStorage {
+    if level + 1 >= DECOMPOSITION_LEVELS || level < layout.finest_level(component) {
+        return QuadStorage::Scalar;
+    }
+    let (width, height) = layout.level_size(level);
+    if width % 2 != 0 || height % 2 != 0 {
+        return QuadStorage::Scalar;
+    }
+    if level <= layout.finest_level(component) + 1 {
+        QuadStorage::Fp16
+    } else {
+        QuadStorage::F32
     }
 }
 
@@ -228,6 +341,75 @@ impl DequantParams {
     /// Workgroup grid of the dispatch: one workgroup per block.
     pub(crate) fn grid(&self) -> (u32, u32) {
         grid_for(u64::from(self.block_count))
+    }
+}
+
+/// One transmitted band in the fast-path dequantisation table.
+///
+/// `format` is a [`QuadStorage`] value. `dst_offset` is a pyramid float
+/// offset, an fp16 quad word offset, or an f32 quad float offset. Clearing a
+/// block that disappeared also zeroes `pyramid_offset`, so a later 8-bit
+/// decode still sees scalar zeros in the pyramid.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct QuadBandInfo {
+    pub first_block: u32,
+    pub blocks_x: u32,
+    pub width: u32,
+    pub height: u32,
+    pub dst_offset: u32,
+    pub level: u32,
+    pub component: u32,
+    pub format: u32,
+    pub pyramid_offset: u32,
+    pub pad: [u32; 3],
+}
+
+/// Uniform block of `dequant_quads.wgsl`. Not the portable dequant block.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub(crate) struct QuadDequantParams {
+    pub band_count: u32,
+    pub block_count: u32,
+    pub grid_width: u32,
+    pub conceal: u32,
+    pub bands: [QuadBandInfo; MAX_BANDS],
+}
+
+impl QuadDequantParams {
+    /// Band table for the fast 16-bit dequantisation.
+    pub(crate) fn new(layout: &FrameLayout, buffers: &BufferLayout) -> Self {
+        let mut params = Self::zeroed();
+        let mut count = 0;
+        for (component, level, band, info) in layout.bands() {
+            let storage = buffers.quad_storage(component, level);
+            let pyramid_offset = buffers
+                .band_offset(component, level, band)
+                .expect("a transmitted band has pyramid space");
+            let dst_offset = match storage {
+                QuadStorage::Scalar => pyramid_offset,
+                QuadStorage::Fp16 | QuadStorage::F32 => buffers
+                    .quad_offset(component, level, band)
+                    .expect("a packed band has quad space"),
+            };
+            params.bands[count] = QuadBandInfo {
+                first_block: info.first_block,
+                blocks_x: info.blocks_x,
+                width: info.width,
+                height: info.height,
+                dst_offset,
+                level: level as u32,
+                component: component.index() as u32,
+                format: u32::from(storage as u8),
+                pyramid_offset,
+                pad: [0; 3],
+            };
+            count += 1;
+        }
+        params.band_count = count as u32;
+        params.block_count = layout.block_count();
+        params.grid_width = grid_for(u64::from(layout.block_count())).0;
+        params
     }
 }
 
@@ -630,6 +812,75 @@ impl TransformLevel {
         Self::build(layout, buffers, level, false)
     }
 
+    /// Parameters for the fast 16-bit inverse, which reads and writes 2×2 quads.
+    ///
+    /// `pad[0]` is the input [`QuadStorage`]. `is_plane` is 1 for a final
+    /// r16 plane, 2 for an fp16 quad image, 3 for an f32 quad image, and 0
+    /// for a scalar pyramid image. `pad[1]` is the quad-buffer offset of a
+    /// quad image. These buffers are not the ones the portable inverse binds.
+    pub(crate) fn for_quads(layout: &FrameLayout, buffers: &BufferLayout, level: usize) -> Self {
+        let (band_width, band_height) = layout.level_size(level);
+        let mut params = LevelParams {
+            band_width,
+            band_height,
+            image_width: 2 * band_width,
+            image_height: 2 * band_height,
+            ..LevelParams::zeroed()
+        };
+        let mut components = 0;
+        for component in Component::ALL {
+            if level < layout.finest_level(component) {
+                continue;
+            }
+            let storage = buffers.quad_storage(component, level);
+            let comp = &mut params.comps[component.index()];
+            comp.band_offset = Band::ALL.map(|band| match storage {
+                QuadStorage::Scalar => buffers
+                    .band_offset(component, level, band)
+                    .expect("the level exists for this component"),
+                QuadStorage::Fp16 | QuadStorage::F32 => buffers
+                    .quad_offset(component, level, band)
+                    .expect("a packed level has quad space"),
+            });
+            comp.pad[0] = u32::from(storage as u8);
+            comp.pad[2] = u32::try_from(component.index()).unwrap_or(0);
+            if level == layout.finest_level(component) {
+                let (width, height) = layout.plane_size(component);
+                comp.image_offset = buffers.packed_offsets[component.index()];
+                comp.image_stride = buffers.packed_strides[component.index()];
+                comp.plane_width = width;
+                comp.plane_height = height;
+                comp.is_plane = 1;
+            } else {
+                comp.plane_width = 2 * band_width;
+                comp.plane_height = 2 * band_height;
+                match buffers.quad_storage(component, level - 1) {
+                    QuadStorage::Scalar => {
+                        comp.image_offset = buffers
+                            .band_offset(component, level - 1, Band::Ll)
+                            .expect("the next finer level exists");
+                        comp.image_stride = 2 * band_width;
+                        comp.is_plane = 0;
+                    }
+                    QuadStorage::Fp16 => {
+                        comp.is_plane = 2;
+                        comp.pad[1] = buffers
+                            .quad_offset(component, level - 1, Band::Ll)
+                            .expect("the next finer level is packed");
+                    }
+                    QuadStorage::F32 => {
+                        comp.is_plane = 3;
+                        comp.pad[1] = buffers
+                            .quad_offset(component, level - 1, Band::Ll)
+                            .expect("the next finer level is packed");
+                    }
+                }
+            }
+            components += 1;
+        }
+        Self { params, components }
+    }
+
     /// Parameters for `idwt_f16.wgsl`, which stores every intermediate image
     /// as one f16 sample in `ll_f16`.
     pub(crate) fn with_f16_lowpass(
@@ -800,6 +1051,8 @@ mod tests {
         // Uniform buffers need struct sizes that are multiples of 16 bytes.
         assert_eq!(size_of::<BandInfo>(), 32);
         assert_eq!(size_of::<DequantParams>(), 16 + 32 * MAX_BANDS);
+        assert_eq!(size_of::<QuadBandInfo>(), 48);
+        assert_eq!(size_of::<QuadDequantParams>(), 16 + 48 * MAX_BANDS);
         // The decoder writes the one word through the queue by its offset.
         assert_eq!(
             std::mem::offset_of!(DequantParams, conceal) as u64,
@@ -1049,6 +1302,45 @@ mod tests {
         let finest = TransformLevel::new(&layout, &buffers, 0);
         assert_eq!(finest.params.comps[0].pad[1], 0);
         assert_eq!(finest.params.comps[2].pad[2], 2);
+    }
+
+    #[test]
+    fn fast_quads_pack_the_two_finest_levels_and_leave_the_coarsest_scalar() {
+        let layout = FrameLayout::new(3840, 2160, ChromaSubsampling::Yuv420).unwrap();
+        let buffers = BufferLayout::for_decoder(&layout).unwrap();
+        assert_eq!(buffers.quad_storage(Component::Y, 0), QuadStorage::Fp16);
+        assert_eq!(buffers.quad_storage(Component::Y, 1), QuadStorage::Fp16);
+        assert_eq!(buffers.quad_storage(Component::Y, 2), QuadStorage::F32);
+        assert_eq!(buffers.quad_storage(Component::Y, 3), QuadStorage::F32);
+        assert_eq!(buffers.quad_storage(Component::Y, 4), QuadStorage::Scalar);
+        assert_eq!(buffers.quad_storage(Component::Cb, 1), QuadStorage::Fp16);
+        assert_eq!(buffers.quad_storage(Component::Cb, 2), QuadStorage::Fp16);
+        assert_eq!(buffers.quad_storage(Component::Cb, 3), QuadStorage::F32);
+        assert_eq!(buffers.quad_storage(Component::Cb, 4), QuadStorage::Scalar);
+        assert!(buffers.quad_offset(Component::Y, 4, Band::Ll).is_none());
+        assert_eq!(buffers.quad_offset(Component::Y, 0, Band::Ll), Some(0));
+
+        let level4 = TransformLevel::for_quads(&layout, &buffers, 4);
+        assert_eq!(level4.params.comps[0].pad[0], QuadStorage::Scalar as u32);
+        assert_eq!(level4.params.comps[0].is_plane, 3);
+        let level0 = TransformLevel::for_quads(&layout, &buffers, 0);
+        assert_eq!(level0.params.comps[0].is_plane, 1);
+        assert_eq!(level0.params.comps[0].pad[0], QuadStorage::Fp16 as u32);
+        // The portable parameters still describe the f32 pyramid.
+        let portable = TransformLevel::new(&layout, &buffers, 2);
+        assert_eq!(portable.params.comps[0].is_plane, 0);
+        assert_eq!(portable.params.comps[0].pad[1], ABSENT);
+
+        let odd = FrameLayout::new(131, 67, ChromaSubsampling::Yuv444).unwrap();
+        let odd_buffers = BufferLayout::new(&odd).unwrap();
+        assert_eq!(
+            odd_buffers.quad_storage(Component::Y, 4),
+            QuadStorage::Scalar
+        );
+        let params = QuadDequantParams::new(&layout, &buffers);
+        assert_eq!(params.band_count, layout.bands().count() as u32);
+        assert!(params.bands.iter().any(|band| band.format == 1));
+        assert!(params.bands.iter().any(|band| band.format == 0));
     }
 
     #[test]

@@ -1,7 +1,9 @@
 // Stage: the store of the inverse transform's last level into r16unorm textures.
 //
-// Behind idwt_fast.wgsl, or idwt_f16.wgsl when the device has shader f16, for
-// decodes into 16-bit normalised Y, Cb and Cr plane textures.
+// Behind idwt_quads_lib.wgsl on the fast path, or idwt_f16.wgsl when the device
+// has shader f16, for decodes into 16-bit normalised Y, Cb and Cr plane textures.
+// Both fronts define DC_SHIFT. `to_unorm16` stays in this file: a test slices
+// it out of the concatenated shader.
 
 @group(0) @binding(3) var plane_y: texture_storage_2d<r16unorm, write>;
 @group(0) @binding(4) var plane_cb: texture_storage_2d<r16unorm, write>;

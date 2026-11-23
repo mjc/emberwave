@@ -53,6 +53,9 @@ const _: () = {
 pub mod shader_sources {
     /// Coefficient decoding and dequantisation.
     pub const DEQUANT: &str = include_str!("shaders/dequant.wgsl");
+    /// Fast 16-bit dequantisation. Packed bands are 2×2 quads. Not among
+    /// [`ALL`]: `pack2x16float` needs `SHADER_FLOAT16_IN_FLOAT32`.
+    pub const DEQUANT_QUADS: &str = include_str!("shaders/dequant_quads.wgsl");
     /// The blocks of detail a frame drawn in part lacks, after the
     /// dequantisation (decision D66).
     pub const CONCEAL: &str = include_str!("shaders/conceal.wgsl");
@@ -73,11 +76,21 @@ pub mod shader_sources {
     /// The inverse transform whose last level stores the planes straight into
     /// three 16-bit normalised textures (`r16unorm`), on devices with
     /// [`wgpu::Features::TEXTURE_FORMAT_16BIT_NORM`]. Not among the portable
-    /// shaders of [`ALL`]. The front packs intermediate lowpass bands and
-    /// dispatches one workgroup per tile id.
+    /// shaders of [`ALL`]. Levels are 2×2 quads. One workgroup per tile id.
+    /// The neighbour exchange uses workgroup memory, so this variant does not
+    /// need subgroups.
     pub const IDWT_PLANES_R16: &str = concat!(
-        include_str!("shaders/idwt_fast.wgsl"),
-        include_str!("shaders/idwt_planes_r16.wgsl")
+        include_str!("shaders/idwt_quads_lib.wgsl"),
+        include_str!("shaders/idwt_planes_r16.wgsl"),
+        include_str!("shaders/idwt_quads_main.wgsl"),
+    );
+    /// Same inverse as [`IDWT_PLANES_R16`], exchanging neighbouring columns
+    /// with `subgroupShuffleXor`. Not among [`ALL`]. Used only when the
+    /// subgroup size is fixed at 32.
+    pub const IDWT_PLANES_R16_SUBGROUP: &str = concat!(
+        include_str!("shaders/idwt_quads_lib.wgsl"),
+        include_str!("shaders/idwt_planes_r16.wgsl"),
+        include_str!("shaders/idwt_quads_subgroup_main.wgsl"),
     );
     /// Capability-gated `f16` intermediate variants for adapters with
     /// [`wgpu::Features::SHADER_F16`].

@@ -174,6 +174,9 @@ pub struct GpuContext {
     /// Whether the device enables `SHADER_F16` for `f16` intermediate iDWT
     /// storage.
     shader_f16: bool,
+    /// Whether the fast inverse may exchange columns with a subgroup shuffle.
+    /// True only when the subgroup size is fixed at 32.
+    subgroup_quads: bool,
     /// Built on first use, shared by every clone of the context: the
     /// decoder's and the encoder's, so that neither compiles the other's.
     pipelines: Arc<Mutex<Option<Arc<Pipelines>>>>,
@@ -308,6 +311,11 @@ impl GpuContext {
         let shader_f16 = options.shader_f16
             && !options.strict_webgpu
             && adapter.features().contains(wgpu::Features::SHADER_F16);
+        let subgroup_info = adapter.get_info();
+        let subgroup_quads = !options.strict_webgpu
+            && adapter.features().contains(wgpu::Features::SUBGROUP)
+            && subgroup_info.subgroup_min_size == 32
+            && subgroup_info.subgroup_max_size == 32;
         let mut required_features = wgpu::Features::empty();
         required_features.set(wgpu::Features::TIMESTAMP_QUERY, timestamps);
         required_features.set(
@@ -317,6 +325,7 @@ impl GpuContext {
         required_features.set(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS, shared_uploads);
         required_features.set(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM, r16_planes);
         required_features.set(wgpu::Features::SHADER_F16, shader_f16);
+        required_features.set(wgpu::Features::SUBGROUP, subgroup_quads);
         wgpu::DeviceDescriptor {
             label: Some("emberwave"),
             required_features,
@@ -374,6 +383,10 @@ impl GpuContext {
             .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
             && supports_r16_planes(&adapter);
         let shader_f16 = device.features().contains(wgpu::Features::SHADER_F16);
+        let subgroup_info = adapter.get_info();
+        let subgroup_quads = device.features().contains(wgpu::Features::SUBGROUP)
+            && subgroup_info.subgroup_min_size == 32
+            && subgroup_info.subgroup_max_size == 32;
 
         // A lost device stays lost. Errors of a lost device do not reach the
         // error scopes, so the decoders check this record before and after
@@ -396,6 +409,7 @@ impl GpuContext {
             shared_uploads,
             r16_planes,
             shader_f16,
+            subgroup_quads,
             pipelines: Arc::default(),
             encoder_pipelines: Arc::default(),
             rgb_pipelines: RgbPipelines::default(),
@@ -510,6 +524,12 @@ impl GpuContext {
         self.shader_f16
     }
 
+    /// The fast inverse may use `subgroupShuffleXor`. The subgroup size is
+    /// fixed at 32, so a shuffle of 1 swaps adjacent columns.
+    pub(crate) fn subgroup_quads(&self) -> bool {
+        self.subgroup_quads
+    }
+
     /// The decoder's compute pipelines, compiled the first time they are
     /// asked for.
     pub(crate) fn pipelines(&self) -> Result<Arc<Pipelines>, GpuError> {
@@ -552,12 +572,24 @@ pub(crate) struct R16PlanePipeline(Arc<Mutex<Option<Arc<Stage>>>>);
 
 impl R16PlanePipeline {
     /// The pipeline, compiled on `device` if it is not yet.
+    ///
+    /// When `subgroup` is set and this is not the `f16` shader, the shuffle
+    /// exchange is tried first. A pipeline that fails to build falls back to
+    /// the workgroup exchange, and that result is what the cache keeps.
     pub(crate) fn get(
         &self,
         device: &wgpu::Device,
         shader_f16: bool,
+        subgroup: bool,
     ) -> Result<Arc<Stage>, GpuError> {
-        cached(&self.0, || idwt_planes_r16_stage(device, shader_f16))
+        cached(&self.0, || {
+            if !shader_f16 && subgroup {
+                if let Ok(stage) = idwt_planes_r16_stage(device, false, true) {
+                    return Ok(stage);
+                }
+            }
+            idwt_planes_r16_stage(device, shader_f16, false)
+        })
     }
 }
 

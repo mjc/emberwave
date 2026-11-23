@@ -2443,8 +2443,9 @@ fn r16_planes_match_cpu_reference_and_preserve_8bit_output() {
         decoder
             .decode_assembled_to_plane_textures(r16_views.each_ref())
             .expect("decode assembled to r16");
-        // One packed f16 hop feeds each plane. These vectors measured max_diff 34
-        // and PSNR 81.9 dB. One 10-bit LSB is 64 codes.
+        // Two fp16 quad levels feed each plane. Gradient luma measures max_diff
+        // 37 and PSNR 75.93 dB. The other planes of these vectors are at least
+        // 78 dB, with max_diff at most 40. One 10-bit LSB is 64 codes.
         for (component, texture) in Component::ALL.into_iter().zip(&r16_textures) {
             let actual = read_texture_u16(context, texture);
             let expected = cpu_frame0.planes[component.index()].to_unorm16();
@@ -3027,9 +3028,10 @@ fn f32_and_shader_f16_10bit_precision_match_reference() {
         );
     };
 
-    // Default context: one packed f16 hop into each plane. 10-bit acceptance is
-    // one LSB and 60 dB, the same bar as shader_f16. Frame 7 of
-    // solid_64x64_420_wrap measures 60.20 dB and misses a pure-f32 floor of 70.
+    // Default context: two fp16 quad levels, then an f32 lift into each plane.
+    // 10-bit acceptance is one LSB and 60 dB, the same bar as shader_f16.
+    // Frame 7 of solid_64x64_420_wrap still measures 60.20 dB and misses a
+    // pure-f32 floor of 70.
     check_context(f32_context, "packed", 1, 60.0);
     if let Some(ctx) = f16_enabled {
         check_context(ctx, "shader_f16", 1, 60.0);
