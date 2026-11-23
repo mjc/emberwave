@@ -87,6 +87,7 @@ typedef struct VulkanContext {
     VkQueue queue;
     VkCommandPool command_pool;
     VkPhysicalDeviceMemoryProperties mem_props;
+    int gpu_busy;
 } VulkanContext;
 
 typedef struct PlaneImage {
@@ -122,6 +123,8 @@ static int create_plane_image(const VulkanContext *vk,
     VkImageCreateInfo img_info = {0};
     VkMemoryRequirements reqs = {0};
     VkMemoryAllocateInfo alloc_info = {0};
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
     uint32_t mem_type;
     VkResult res;
 
@@ -144,41 +147,39 @@ static int create_plane_image(const VulkanContext *vk,
     img_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     img_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    res = vkCreateImage(vk->device, &img_info, NULL, &out->image);
+    res = vkCreateImage(vk->device, &img_info, NULL, &image);
     if (res != VK_SUCCESS) {
         return fail_vk("vkCreateImage", res);
     }
 
-    vkGetImageMemoryRequirements(vk->device, out->image, &reqs);
+    vkGetImageMemoryRequirements(vk->device, image, &reqs);
     mem_type = find_memory_type(vk, reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mem_type == UINT32_MAX) {
         mem_type = find_memory_type(vk, reqs.memoryTypeBits, 0);
     }
     if (mem_type == UINT32_MAX) {
         fprintf(stderr, "no compatible memory type for plane image\n");
-        vkDestroyImage(vk->device, out->image, NULL);
-        out->image = VK_NULL_HANDLE;
+        vkDestroyImage(vk->device, image, NULL);
         return 1;
     }
 
     alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     alloc_info.allocationSize = reqs.size;
     alloc_info.memoryTypeIndex = mem_type;
-    res = vkAllocateMemory(vk->device, &alloc_info, NULL, &out->memory);
+    res = vkAllocateMemory(vk->device, &alloc_info, NULL, &memory);
     if (res != VK_SUCCESS) {
-        vkDestroyImage(vk->device, out->image, NULL);
-        out->image = VK_NULL_HANDLE;
+        vkDestroyImage(vk->device, image, NULL);
         return fail_vk("vkAllocateMemory", res);
     }
 
-    res = vkBindImageMemory(vk->device, out->image, out->memory, 0);
+    res = vkBindImageMemory(vk->device, image, memory, 0);
     if (res != VK_SUCCESS) {
-        vkFreeMemory(vk->device, out->memory, NULL);
-        vkDestroyImage(vk->device, out->image, NULL);
-        out->memory = VK_NULL_HANDLE;
-        out->image = VK_NULL_HANDLE;
+        vkFreeMemory(vk->device, memory, NULL);
+        vkDestroyImage(vk->device, image, NULL);
         return fail_vk("vkBindImageMemory", res);
     }
+    out->image = image;
+    out->memory = memory;
     return 0;
 }
 
@@ -194,7 +195,7 @@ static void destroy_plane_image(const VulkanContext *vk, PlaneImage *img)
     }
 }
 
-static int readback_image(const VulkanContext *vk,
+static int readback_image(VulkanContext *vk,
                           VkImage image,
                           uint32_t width,
                           uint32_t height,
@@ -204,12 +205,15 @@ static int readback_image(const VulkanContext *vk,
     VkDeviceSize byte_size = (VkDeviceSize)width * height * texel_bytes;
     VkBufferCreateInfo buf_info = {0};
     VkBuffer buffer = VK_NULL_HANDLE;
+    VkBuffer tmp_buffer = VK_NULL_HANDLE;
     VkMemoryRequirements reqs = {0};
     VkMemoryAllocateInfo alloc_info = {0};
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceMemory tmp_memory = VK_NULL_HANDLE;
     uint32_t mem_type;
     VkCommandBufferAllocateInfo cmd_alloc = {0};
     VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBuffer tmp_cmd = VK_NULL_HANDLE;
     VkCommandBufferBeginInfo begin_info = {0};
     VkImageMemoryBarrier to_src = {0};
     VkImageMemoryBarrier to_read = {0};
@@ -218,19 +222,21 @@ static int readback_image(const VulkanContext *vk,
     VkSubmitInfo submit = {0};
     VkFenceCreateInfo fence_info = {0};
     VkFence fence = VK_NULL_HANDLE;
+    VkFence tmp_fence = VK_NULL_HANDLE;
     void *mapped = NULL;
     VkResult res;
-    int gpu_busy = 0;
+    int pending = 0;
     int rc = 1;
 
     buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buf_info.size = byte_size;
     buf_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    res = vkCreateBuffer(vk->device, &buf_info, NULL, &buffer);
+    res = vkCreateBuffer(vk->device, &buf_info, NULL, &tmp_buffer);
     if (res != VK_SUCCESS) {
         return fail_vk("vkCreateBuffer", res);
     }
+    buffer = tmp_buffer;
 
     vkGetBufferMemoryRequirements(vk->device, buffer, &reqs);
     mem_type = find_memory_type(
@@ -244,11 +250,12 @@ static int readback_image(const VulkanContext *vk,
     alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     alloc_info.allocationSize = reqs.size;
     alloc_info.memoryTypeIndex = mem_type;
-    res = vkAllocateMemory(vk->device, &alloc_info, NULL, &memory);
+    res = vkAllocateMemory(vk->device, &alloc_info, NULL, &tmp_memory);
     if (res != VK_SUCCESS) {
         fail_vk("vkAllocateMemory(staging)", res);
         goto cleanup;
     }
+    memory = tmp_memory;
     res = vkBindBufferMemory(vk->device, buffer, memory, 0);
     if (res != VK_SUCCESS) {
         fail_vk("vkBindBufferMemory", res);
@@ -259,11 +266,12 @@ static int readback_image(const VulkanContext *vk,
     cmd_alloc.commandPool = vk->command_pool;
     cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cmd_alloc.commandBufferCount = 1;
-    res = vkAllocateCommandBuffers(vk->device, &cmd_alloc, &cmd);
+    res = vkAllocateCommandBuffers(vk->device, &cmd_alloc, &tmp_cmd);
     if (res != VK_SUCCESS) {
         fail_vk("vkAllocateCommandBuffers", res);
         goto cleanup;
     }
+    cmd = tmp_cmd;
 
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -321,11 +329,12 @@ static int readback_image(const VulkanContext *vk,
     }
 
     fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    res = vkCreateFence(vk->device, &fence_info, NULL, &fence);
+    res = vkCreateFence(vk->device, &fence_info, NULL, &tmp_fence);
     if (res != VK_SUCCESS) {
         fail_vk("vkCreateFence", res);
         goto cleanup;
     }
+    fence = tmp_fence;
 
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
@@ -335,16 +344,20 @@ static int readback_image(const VulkanContext *vk,
         fail_vk("vkQueueSubmit", res);
         goto cleanup;
     }
-    gpu_busy = 1;
+    pending = 1;
     res = vkWaitForFences(vk->device, 1, &fence, VK_TRUE, 10000000000ULL);
     if (res != VK_SUCCESS) {
+        VkResult idle_res;
         fail_vk("vkWaitForFences", res);
-        if (vkDeviceWaitIdle(vk->device) == VK_SUCCESS) {
-            gpu_busy = 0;
+        idle_res = vkDeviceWaitIdle(vk->device);
+        if (idle_res == VK_SUCCESS || idle_res == VK_ERROR_DEVICE_LOST) {
+            pending = 0;
+        } else {
+            vk->gpu_busy = 1;
         }
         goto cleanup;
     }
-    gpu_busy = 0;
+    pending = 0;
 
     res = vkMapMemory(vk->device, memory, 0, byte_size, 0, &mapped);
     if (res != VK_SUCCESS) {
@@ -356,7 +369,7 @@ static int readback_image(const VulkanContext *vk,
     rc = 0;
 
 cleanup:
-    if (!gpu_busy) {
+    if (!pending) {
         if (fence != VK_NULL_HANDLE) {
             vkDestroyFence(vk->device, fence, NULL);
         }
@@ -498,11 +511,15 @@ int main(int argc, char **argv)
     inst_info.enabledExtensionCount = inst_ext_count;
     inst_info.ppEnabledExtensionNames = inst_ext_names;
 
-    vk_res = vkCreateInstance(&inst_info, NULL, &vk.instance);
-    if (vk_res != VK_SUCCESS) {
-        free(inst_ext_names);
-        free(file_bytes);
-        return fail_vk("vkCreateInstance", vk_res);
+    {
+        VkInstance tmp_inst = VK_NULL_HANDLE;
+        vk_res = vkCreateInstance(&inst_info, NULL, &tmp_inst);
+        if (vk_res != VK_SUCCESS) {
+            free(inst_ext_names);
+            free(file_bytes);
+            return fail_vk("vkCreateInstance", vk_res);
+        }
+        vk.instance = tmp_inst;
     }
 
     vk_res = vkEnumeratePhysicalDevices(vk.instance, &phys_count, NULL);
@@ -596,20 +613,28 @@ int main(int argc, char **argv)
     dev_info.enabledExtensionCount = dev_ext_count;
     dev_info.ppEnabledExtensionNames = dev_ext_names;
 
-    vk_res = vkCreateDevice(vk.physical_device, &dev_info, NULL, &vk.device);
-    if (vk_res != VK_SUCCESS) {
-        fail_vk("vkCreateDevice", vk_res);
-        goto cleanup;
+    {
+        VkDevice tmp_dev = VK_NULL_HANDLE;
+        vk_res = vkCreateDevice(vk.physical_device, &dev_info, NULL, &tmp_dev);
+        if (vk_res != VK_SUCCESS) {
+            fail_vk("vkCreateDevice", vk_res);
+            goto cleanup;
+        }
+        vk.device = tmp_dev;
     }
     vkGetDeviceQueue(vk.device, vk.queue_family, 0, &vk.queue);
 
     pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pool_info.queueFamilyIndex = vk.queue_family;
-    vk_res = vkCreateCommandPool(vk.device, &pool_info, NULL, &vk.command_pool);
-    if (vk_res != VK_SUCCESS) {
-        fail_vk("vkCreateCommandPool", vk_res);
-        goto cleanup;
+    {
+        VkCommandPool tmp_pool = VK_NULL_HANDLE;
+        vk_res = vkCreateCommandPool(vk.device, &pool_info, NULL, &tmp_pool);
+        if (vk_res != VK_SUCCESS) {
+            fail_vk("vkCreateCommandPool", vk_res);
+            goto cleanup;
+        }
+        vk.command_pool = tmp_pool;
     }
 
     ew_dev.instance = &ew_inst;
@@ -665,6 +690,11 @@ int main(int argc, char **argv)
         uint32_t widths[3];
         uint32_t heights[3];
         uint32_t planes[3] = {EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_CB, EMBERWAVE_PLANE_CR};
+
+        if (require_sub8) {
+            fprintf(stderr, "PLANE_R16 required (--require-sub8) but unsupported on this device\n");
+            goto cleanup;
+        }
 
         status = emberwave_texture_create_plane_with_format(
             decoder, EMBERWAVE_PLANE_Y, EMBERWAVE_PLANE_FORMAT_R16, &probe_tex);
@@ -945,21 +975,33 @@ cleanup:
         fprintf(stderr, "expected 3 image release callbacks, got %u\n", g_released_count);
         exit_code = 1;
     }
-    if (vk.device != VK_NULL_HANDLE) {
-        vkDeviceWaitIdle(vk.device);
-    }
-    destroy_plane_image(&vk, &probe_img);
-    for (i = 0; i < 3; i++) {
-        destroy_plane_image(&vk, &plane_imgs[i]);
-    }
-    if (vk.command_pool != VK_NULL_HANDLE) {
-        vkDestroyCommandPool(vk.device, vk.command_pool, NULL);
-    }
-    if (vk.device != VK_NULL_HANDLE) {
-        vkDestroyDevice(vk.device, NULL);
-    }
-    if (vk.instance != VK_NULL_HANDLE) {
-        vkDestroyInstance(vk.instance, NULL);
+    {
+        int can_destroy_device = 1;
+        if (vk.device != VK_NULL_HANDLE) {
+            if (vk.gpu_busy) {
+                can_destroy_device = 0;
+            } else {
+                VkResult idle_res = vkDeviceWaitIdle(vk.device);
+                if (idle_res != VK_SUCCESS && idle_res != VK_ERROR_DEVICE_LOST) {
+                    can_destroy_device = 0;
+                }
+            }
+        }
+        if (can_destroy_device) {
+            destroy_plane_image(&vk, &probe_img);
+            for (i = 0; i < 3; i++) {
+                destroy_plane_image(&vk, &plane_imgs[i]);
+            }
+            if (vk.command_pool != VK_NULL_HANDLE) {
+                vkDestroyCommandPool(vk.device, vk.command_pool, NULL);
+            }
+            if (vk.device != VK_NULL_HANDLE) {
+                vkDestroyDevice(vk.device, NULL);
+            }
+            if (vk.instance != VK_NULL_HANDLE) {
+                vkDestroyInstance(vk.instance, NULL);
+            }
+        }
     }
     free(phys_devices);
     free((void *)inst_ext_names);
