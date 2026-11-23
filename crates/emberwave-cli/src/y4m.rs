@@ -1,12 +1,123 @@
-//! A minimal reader and writer of 8-bit planar YUV4MPEG2 (`.y4m`) files.
+//! A minimal reader and writer of 8-bit and 10-bit planar YUV4MPEG2 (`.y4m`) files.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use emberwave_core::bitstream::{ChromaSiting, ChromaSubsampling, YcbcrRange};
+use emberwave_core::cpu::unorm16;
 
 use crate::Result;
+
+/// Sample bit depth supported by the Y4M reader and writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitDepth {
+    /// 8-bit unsigned samples (`C420`, `C420jpeg`, `C420mpeg2`, `C420paldv`, `C444`).
+    Eight,
+    /// 10-bit samples in little-endian 16-bit words (`C420p10`, `C444p10`).
+    Ten,
+}
+
+impl BitDepth {
+    /// Number of bits per sample (`8` or `10`).
+    pub fn bits(self) -> u8 {
+        match self {
+            Self::Eight => 8,
+            Self::Ten => 10,
+        }
+    }
+
+    /// Number of bytes per sample in a Y4M plane (`1` or `2`).
+    pub fn bytes_per_sample(self) -> usize {
+        match self {
+            Self::Eight => 1,
+            Self::Ten => 2,
+        }
+    }
+}
+
+/// Converts a 10-bit code value (`0..=1023`) to 16-bit UNORM (`0..=65535`).
+pub fn u10_to_unorm16(sample: u16) -> Result<u16> {
+    if sample > 1023 {
+        return Err(format!("10-bit Y4M sample {sample} exceeds 1023").into());
+    }
+    Ok(unorm16(f32::from(sample) / 1023.0))
+}
+
+/// Converts a 16-bit UNORM sample (`0..=65535`) to the nearest 10-bit code
+/// value (`0..=1023`). Since `65535` is odd, `sample * 1023 / 65535` never hits
+/// an exact half-integer tie, so `(sample * 1023 + 32767) / 65535` matches exact
+/// round-to-nearest for every `u16`.
+pub fn unorm16_to_u10(sample: u16) -> u16 {
+    ((u32::from(sample) * 1023 + 32_767) / 65_535) as u16
+}
+
+/// Converts a 16-bit UNORM sample (`0..=65535`) from a stream with
+/// `source_bit_depth` and `range` to a 10-bit code value (`0..=1023`).
+///
+/// Limited-range 8-bit (`c8 / 255`) and 16-bit (`c16 / 65535`) streams place
+/// nominal levels at multiples of `4 / 1020` and `64 / 65535` rather than
+/// `1 / 1023`, so convert those scales explicitly to preserve `64..=940`
+/// (chroma `64..=960`, neutral `512`).
+pub fn unorm16_to_u10_with_range(sample: u16, source_bit_depth: u8, range: YcbcrRange) -> u16 {
+    if range == YcbcrRange::Limited {
+        match source_bit_depth {
+            8 => ((u32::from(sample) * 1020 + 32_767) / 65_535).min(1023) as u16,
+            16 => {
+                let s = u32::from(sample);
+                ((s + 31 + ((s >> 6) & 1)) >> 6).min(1023) as u16
+            }
+            _ => unorm16_to_u10(sample),
+        }
+    } else {
+        unorm16_to_u10(sample)
+    }
+}
+
+/// Converts a 16-bit UNORM sample (`0..=65535`) from a 10-bit limited-range
+/// stream to an 8-bit limited-range sample (`c10 / 4`, rounded ties to even,
+/// clamped to `0..=255`), preserving nominal levels `64 -> 16`, `512 -> 128`,
+/// `940 -> 235`, and `960 -> 240`.
+pub fn unorm16_to_u8_limited_from_u10(sample: u16) -> u8 {
+    let c10 = u32::from(unorm16_to_u10(sample));
+    ((c10 + 1 + ((c10 >> 2) & 1)) >> 2).min(255) as u8
+}
+
+/// Fallback conversion from an 8-bit UNORM sample of a 10-bit limited-range
+/// stream (`c10 / 1023 * 255`) to 8-bit limited range when `R16Unorm` is
+/// unavailable on the adapter.
+pub fn unorm8_to_u8_limited_from_u10(sample: u8) -> u8 {
+    ((u32::from(sample) * 1023 + 510) / 1020).min(255) as u8
+}
+
+/// Decodes a little-endian 10-bit Y4M plane buffer into `u16` code values in `0..=1023`.
+pub fn decode_u10_le_plane(bytes: &[u8]) -> Result<Vec<u16>> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(format!("10-bit Y4M plane has odd byte length {}", bytes.len()).into());
+    }
+    let mut samples = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let sample = u16::from_le_bytes([pair[0], pair[1]]);
+        if sample > 1023 {
+            return Err(format!("10-bit Y4M sample {sample} exceeds 1023").into());
+        }
+        samples.push(sample);
+    }
+    Ok(samples)
+}
+
+/// Converts a little-endian 10-bit Y4M plane buffer into 16-bit UNORM samples (`0..=65535`).
+pub fn u10_plane_to_unorm16(bytes: &[u8]) -> Result<Vec<u16>> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(format!("10-bit Y4M plane has odd byte length {}", bytes.len()).into());
+    }
+    let mut samples = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let sample = u16::from_le_bytes([pair[0], pair[1]]);
+        samples.push(u10_to_unorm16(sample)?);
+    }
+    Ok(samples)
+}
 
 /// The frame rate a Y4M file gets when the stream has none: Y4M has no word
 /// for "unrelated images".
@@ -27,6 +138,7 @@ pub struct StreamInfo {
     /// Numerator and denominator. A zero in either means the stream has none.
     pub frame_rate: (u32, u32),
     pub range: YcbcrRange,
+    pub bit_depth: BitDepth,
 }
 
 impl StreamInfo {
@@ -48,10 +160,14 @@ impl StreamInfo {
         };
         // `420jpeg` has chroma centred between the luma samples both ways,
         // `420mpeg2` has it on the left luma column and centred vertically.
-        let chroma = match (self.chroma, self.siting) {
-            (ChromaSubsampling::Yuv444, _) => "444",
-            (ChromaSubsampling::Yuv420, ChromaSiting::Center) => "420jpeg",
-            (ChromaSubsampling::Yuv420, ChromaSiting::Left) => "420mpeg2",
+        // Y4M defines no siting-specific `C420p10` tag, so 10-bit 4:2:0 always
+        // writes `C420p10` (callers warn if a left-sited stream is written).
+        let chroma = match (self.bit_depth, self.chroma, self.siting) {
+            (BitDepth::Eight, ChromaSubsampling::Yuv444, _) => "444",
+            (BitDepth::Eight, ChromaSubsampling::Yuv420, ChromaSiting::Center) => "420jpeg",
+            (BitDepth::Eight, ChromaSubsampling::Yuv420, ChromaSiting::Left) => "420mpeg2",
+            (BitDepth::Ten, ChromaSubsampling::Yuv444, _) => "444p10",
+            (BitDepth::Ten, ChromaSubsampling::Yuv420, _) => "420p10",
         };
         format!(
             "YUV4MPEG2 W{} H{} F{num}:{den} Ip A1:1 XCOLORRANGE={range} C{chroma}",
@@ -60,7 +176,7 @@ impl StreamInfo {
     }
 }
 
-/// Writes frames of 8-bit planar YUV.
+/// Writes frames of 8-bit or 10-bit planar YUV.
 pub struct Writer {
     out: BufWriter<File>,
 }
@@ -97,6 +213,7 @@ pub struct Video {
     pub width: usize,
     pub height: usize,
     pub chroma: ChromaSubsampling,
+    pub bit_depth: BitDepth,
     /// Per frame: the Y, Cb and Cr planes.
     pub frames: Vec<[Vec<u8>; 3]>,
 }
@@ -107,6 +224,7 @@ pub struct Header {
     pub width: usize,
     pub height: usize,
     pub chroma: ChromaSubsampling,
+    pub bit_depth: BitDepth,
     /// Where 4:2:0 chroma sits: left for `C420mpeg2` and `C420paldv`, whose
     /// chroma is co-sited with the left luma sample, otherwise the centre.
     pub siting: ChromaSiting,
@@ -118,8 +236,8 @@ pub struct Header {
     sizes: [usize; 3],
 }
 
-/// Reads an 8-bit 4:2:0 or 4:4:4 Y4M stream one frame at a time, so that
-/// only one frame is in memory.
+/// Reads an 8-bit or 10-bit 4:2:0 or 4:4:4 Y4M stream one frame at a time, so
+/// that only one frame is in memory.
 pub struct Reader<R> {
     input: R,
     header: Header,
@@ -180,8 +298,8 @@ pub fn open(path: &Path) -> Result<Reader<BufReader<File>>> {
         .map_err(|error| format!("{}: {error}", path.display()).into())
 }
 
-/// Parses the contents of an 8-bit 4:2:0 or 4:4:4 Y4M file, for the tests
-/// of the reader; the commands read frame by frame.
+/// Parses the contents of an 8-bit or 10-bit 4:2:0 or 4:4:4 Y4M file, for the
+/// tests of the reader; the commands read frame by frame.
 #[cfg(test)]
 fn parse(data: &[u8]) -> Result<Video> {
     let mut reader = Reader::new(data)?;
@@ -194,6 +312,7 @@ fn parse(data: &[u8]) -> Result<Video> {
         width: header.width,
         height: header.height,
         chroma: header.chroma,
+        bit_depth: header.bit_depth,
         frames,
     })
 }
@@ -204,7 +323,8 @@ fn parse_header(line: &str) -> Result<Header> {
         return Err("not a Y4M file".into());
     }
 
-    let (mut width, mut height, mut chroma) = (0usize, 0usize, ChromaSubsampling::Yuv420);
+    let (mut width, mut height, mut chroma, mut bit_depth) =
+        (0usize, 0usize, ChromaSubsampling::Yuv420, BitDepth::Eight);
     let (mut siting, mut range, mut frame_rate) =
         (ChromaSiting::Center, YcbcrRange::Limited, (0, 0));
     for token in line.split_whitespace().skip(1) {
@@ -228,12 +348,16 @@ fn parse_header(line: &str) -> Result<Header> {
                     "420mpeg2" | "420paldv" => ChromaSiting::Left,
                     _ => ChromaSiting::Center,
                 };
-                chroma = match value {
-                    "420" | "420jpeg" | "420mpeg2" | "420paldv" => ChromaSubsampling::Yuv420,
-                    "444" => ChromaSubsampling::Yuv444,
+                (chroma, bit_depth) = match value {
+                    "420" | "420jpeg" | "420mpeg2" | "420paldv" => {
+                        (ChromaSubsampling::Yuv420, BitDepth::Eight)
+                    }
+                    "444" => (ChromaSubsampling::Yuv444, BitDepth::Eight),
+                    "420p10" => (ChromaSubsampling::Yuv420, BitDepth::Ten),
+                    "444p10" => (ChromaSubsampling::Yuv444, BitDepth::Ten),
                     other => {
                         return Err(format!(
-                            "unsupported Y4M colour space C{other} (8-bit 420 and 444 only)"
+                            "unsupported Y4M colour space C{other} (8-bit or 10-bit 420 and 444 only)"
                         )
                         .into());
                     }
@@ -250,10 +374,12 @@ fn parse_header(line: &str) -> Result<Header> {
         ChromaSubsampling::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
         ChromaSubsampling::Yuv444 => (width, height),
     };
+    let bytes_per_sample = bit_depth.bytes_per_sample();
     // A header can name sizes whose product does not fit: that is an error,
     // not a picture of no samples.
     let plane_size = |w: usize, h: usize| {
         w.checked_mul(h)
+            .and_then(|samples| samples.checked_mul(bytes_per_sample))
             .ok_or("the picture size in the Y4M header is too large")
     };
     let sizes = [
@@ -266,6 +392,7 @@ fn parse_header(line: &str) -> Result<Header> {
         width,
         height,
         chroma,
+        bit_depth,
         siting,
         range,
         frame_rate,
@@ -285,6 +412,7 @@ mod tests {
             siting,
             frame_rate: (60, 1),
             range: YcbcrRange::Limited,
+            bit_depth: BitDepth::Eight,
         }
     }
 
@@ -396,5 +524,93 @@ mod tests {
         let video = parse(&file("YUV4MPEG2 W4 H1 한국어 C420", 1)).unwrap();
         assert_eq!((video.width, video.height), (4, 1));
         assert!(parse(&file("YUV4MPEG2 W", 1)).is_err());
+    }
+
+    #[test]
+    fn ten_bit_headers_and_sample_buffers_round_trip() {
+        for (chroma, expected_tag, chroma_samples) in [
+            (ChromaSubsampling::Yuv420, "C420p10", 2usize),
+            (ChromaSubsampling::Yuv444, "C444p10", 8usize),
+        ] {
+            let stream = StreamInfo {
+                bit_depth: BitDepth::Ten,
+                ..info(chroma, ChromaSiting::Center)
+            };
+            let line = stream.header_line();
+            assert!(line.ends_with(expected_tag), "{line}");
+
+            let mut data = format!("{line}\nFRAME\n").into_bytes();
+            let y_samples = [0u16, 64, 512, 940, 1023, 1, 255, 768];
+            for s in y_samples {
+                data.extend_from_slice(&s.to_le_bytes());
+            }
+            for c in 0..chroma_samples * 2 {
+                data.extend_from_slice(&((128 + c as u16 * 111) % 1024).to_le_bytes());
+            }
+
+            let header = *Reader::new(data.as_slice()).unwrap().header();
+            assert_eq!(header.siting, ChromaSiting::Center);
+            assert_eq!(header.bit_depth, BitDepth::Ten);
+
+            let video = parse(&data).unwrap();
+            assert_eq!(video.bit_depth, BitDepth::Ten);
+            assert_eq!(video.chroma, chroma);
+            assert_eq!(video.frames.len(), 1);
+            assert_eq!(decode_u10_le_plane(&video.frames[0][0]).unwrap(), y_samples);
+        }
+    }
+
+    #[test]
+    fn ten_bit_sample_conversions_preserve_all_10bit_levels_and_reject_bad_inputs() {
+        for code in 0u16..=1023 {
+            let unorm = u10_to_unorm16(code).unwrap();
+            assert_eq!(unorm16_to_u10(unorm), code, "code {code}");
+        }
+        // Exhaustively verify unorm16_to_u10 matches exact rounding over all u16.
+        for sample in 0u16..=u16::MAX {
+            let exact = (f64::from(sample) * 1023.0 / 65_535.0).round_ties_even() as u16;
+            assert_eq!(unorm16_to_u10(sample), exact, "sample {sample}");
+        }
+        assert_eq!(unorm16_to_u10(19_763), 309);
+
+        // Limited-range cross-depth conversion preserves nominal BT.709/BT.2020 levels.
+        for (c8, c10) in [(16u8, 64u16), (128, 512), (235, 940), (240, 960)] {
+            let u16_from_8 = unorm16(f32::from(c8) / 255.0);
+            assert_eq!(
+                unorm16_to_u10_with_range(u16_from_8, 8, YcbcrRange::Limited),
+                c10,
+                "8->10 limited c8={c8}"
+            );
+            let u16_from_10 = u10_to_unorm16(c10).unwrap();
+            assert_eq!(
+                unorm16_to_u8_limited_from_u10(u16_from_10),
+                c8,
+                "10->8 limited c10={c10}"
+            );
+            let u8_from_10 = ((f32::from(c10) / 1023.0) * 255.0).round_ties_even() as u8;
+            assert_eq!(
+                unorm8_to_u8_limited_from_u10(u8_from_10),
+                c8,
+                "10->8 fallback c10={c10}"
+            );
+        }
+        assert_eq!(unorm16_to_u10_with_range(65_535, 8, YcbcrRange::Full), 1023);
+        for (c16, c10) in [
+            (4096u16, 64u16),
+            (32_768, 512),
+            (60_160, 940),
+            (61_440, 960),
+        ] {
+            assert_eq!(
+                unorm16_to_u10_with_range(c16, 16, YcbcrRange::Limited),
+                c10,
+                "16->10 limited c16={c16}"
+            );
+        }
+        assert!(u10_to_unorm16(1024).is_err());
+        assert!(decode_u10_le_plane(&[0, 4]).is_err()); // 1024 in LE
+        assert!(decode_u10_le_plane(&[0]).is_err()); // odd byte count
+        assert!(u10_plane_to_unorm16(&[0, 4]).is_err());
+        assert!(u10_plane_to_unorm16(&[0]).is_err());
     }
 }

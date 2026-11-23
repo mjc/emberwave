@@ -293,6 +293,7 @@ dependencies = [
  "clap",
  "emberwave-core",
  "png",
+ "pollster",
  "serde_json",
  "wgpu",
 ]

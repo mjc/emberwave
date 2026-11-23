@@ -1627,3 +1627,120 @@ fn encoding_u16_frame_after_frame_allocates_nothing() {
         "live GPU objects and memory"
     );
 }
+
+#[test]
+fn planar_10bit_le_gpu_encode_and_r16_decode_roundtrip_for_420_and_444() {
+    let context = gpu_or_return!();
+    if !context.supports_plane_format(emberwave_core::gpu::PLANE_FORMAT_R16) {
+        return;
+    }
+
+    let psnr_u10 = |a: &[u16], b: &[u16]| -> f64 {
+        let sq: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2))
+            .sum();
+        if sq == 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (1023.0 * 1023.0 / (sq / a.len() as f64)).log10()
+        }
+    };
+
+    for (width, height, chroma, budget) in [
+        (200, 120, ChromaSubsampling::Yuv420, 80_000),
+        (131, 67, ChromaSubsampling::Yuv444, 80_000),
+    ] {
+        let layout = FrameLayout::new(width, height, chroma).unwrap();
+        let src_u10: [Vec<u16>; 3] = Component::ALL.map(|component| {
+            let (w, h) = layout.plane_size(component);
+            let offset = component.index() as u32 * 110;
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    ((64 + offset + x * 4 + y * 3) % 940) as u16
+                })
+                .collect()
+        });
+        let src_unorm16: [Vec<u16>; 3] = [0, 1, 2].map(|i| {
+            src_u10[i]
+                .iter()
+                .map(|&c| emberwave_core::cpu::unorm16(f32::from(c) / 1023.0))
+                .collect()
+        });
+        let src_le: [Vec<u8>; 3] = [0, 1, 2].map(|i| {
+            src_unorm16[i]
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect()
+        });
+        let strides_le = [0, 1, 2].map(|i| layout.plane_size(Component::ALL[i]).0 as usize * 2);
+        let src_u8: [Vec<u8>; 3] = [0, 1, 2].map(|i| {
+            src_u10[i]
+                .iter()
+                .map(|&c| ((u32::from(c) * 255 + 511) / 1023) as u8)
+                .collect()
+        });
+
+        let mut cpu_enc =
+            emberwave_core::encode::Encoder::new(width, height, chroma, Signalling::default())
+                .unwrap();
+        let cpu_frame = cpu_enc
+            .encode_u16([&src_unorm16[0], &src_unorm16[1], &src_unorm16[2]], budget)
+            .unwrap();
+
+        let mut gpu_enc = encoder_for(context, &layout);
+        let gpu_frame = gpu_enc
+            .encode_u16_le_strided([&src_le[0], &src_le[1], &src_le[2]], strides_le, budget)
+            .unwrap();
+        assert!(
+            gpu_frame.len().abs_diff(cpu_frame.len()) <= 64,
+            "{width}x{height} {chroma:?}: gpu {} vs cpu {}",
+            gpu_frame.len(),
+            cpu_frame.len()
+        );
+
+        let mut enc8 = encoder_for(context, &layout);
+        let frame8 = enc8
+            .encode([&src_u8[0], &src_u8[1], &src_u8[2]], budget)
+            .unwrap();
+
+        let mut decoder = Decoder::new(context, width, height, chroma).unwrap();
+        let out_tex = Component::ALL.map(|c| {
+            decoder
+                .create_plane_texture_with_format(c, emberwave_core::gpu::PLANE_FORMAT_R16)
+                .unwrap()
+        });
+        let out_views: [_; 3] =
+            std::array::from_fn(|i| out_tex[i].create_view(&Default::default()));
+
+        let decode_u10 = |decoder: &mut Decoder, frame: &[u8]| -> [Vec<u16>; 3] {
+            decoder.clear();
+            decoder.push_packet(frame).unwrap();
+            decoder
+                .decode_assembled_to_plane_textures([&out_views[0], &out_views[1], &out_views[2]])
+                .unwrap();
+            std::array::from_fn(|i| {
+                read_u16_texture(context, &out_tex[i])
+                    .into_iter()
+                    .map(|s| ((u32::from(s) * 1023 + 32_767) / 65_535) as u16)
+                    .collect()
+            })
+        };
+
+        let dec10 = decode_u10(&mut decoder, &gpu_frame);
+        let dec8 = decode_u10(&mut decoder, &frame8);
+
+        let worst10 = (0..3)
+            .map(|i| psnr_u10(&src_u10[i], &dec10[i]))
+            .fold(f64::INFINITY, f64::min);
+        let worst8 = (0..3)
+            .map(|i| psnr_u10(&src_u10[i], &dec8[i]))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            worst10 > 60.0 && worst10 > worst8 + 5.0,
+            "{width}x{height} {chroma:?}: GPU 10-bit PSNR {worst10:.2} dB vs 8-bit {worst8:.2} dB"
+        );
+    }
+}
