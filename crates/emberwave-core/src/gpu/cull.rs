@@ -1,12 +1,14 @@
 //! Which inverse-transform tiles a frame has to run.
 //!
-//! The encoder repeats nonzero blocks even when their bytes did not change, so
-//! a tile is skipped only after its payload matches the previous frame. The
-//! first frame, a concealed frame and a frame that changes most of its blocks
-//! dispatch the whole level.
+//! The encoder repeats nonzero blocks even when their coefficients did not
+//! change. A tile is skipped only after those words match the previous frame.
+//! The three sequence bits in each block header change every frame and the
+//! inverse transform never reads them, so they are left out of the compare.
+//! The first frame, a concealed frame and a frame that changes most of its
+//! blocks dispatch the whole level.
 
 use crate::bitstream::consts::{BLOCK_SIZE, DECOMPOSITION_LEVELS};
-use crate::bitstream::{Band, Component, FrameLayout};
+use crate::bitstream::{Band, Component, FrameLayout, MISSING_BLOCK};
 
 /// Output tile of the inverse transform, in samples.
 pub(crate) const TILE_W: u32 = 64;
@@ -54,15 +56,16 @@ pub(crate) struct TilePlan {
     pub bytes: Vec<u8>,
 }
 
+/// Sequence field of a block header (bits 28–30). The inverse transform does
+/// not read it.
+const SEQUENCE_BITS: u32 = 0x7000_0000;
+
 /// Previous block payloads, so a repeated block does not redraw its tiles.
 #[derive(Debug, Default)]
 pub(crate) struct PyramidCull {
-    start: Vec<u32>,
-    len: Vec<u32>,
-    arena: Vec<u32>,
-    next_start: Vec<u32>,
-    next_len: Vec<u32>,
-    next_arena: Vec<u32>,
+    offsets: Vec<u32>,
+    payload: Vec<u32>,
+    scratch: Vec<u64>,
     have_image: bool,
 }
 
@@ -74,41 +77,54 @@ impl PyramidCull {
         self.have_image = false;
     }
 
-    /// Compares each block with the previous frame and keeps the new payloads.
-    /// `block` returns the block's words, or an empty slice when it is missing.
-    pub(crate) fn observe<'payload>(
+    /// Compares each block's coefficients with the previous frame and keeps the
+    /// new payloads when any differ. `offsets` are word offsets into `payload`,
+    /// or [`MISSING_BLOCK`] where a block was not received. A frame that
+    /// changes more than half its blocks stops there: the bitset is unused
+    /// once every tile is dispatched.
+    pub(crate) fn observe_frame(
         &mut self,
         block_count: u32,
-        mut block: impl FnMut(u32) -> &'payload [u32],
+        offsets: &[u32],
+        payload: &[u32],
     ) -> ChangeSet {
         let n = block_count as usize;
-        let mut bits = vec![0u64; n.div_ceil(64)];
-        let mut count = 0u32;
-        self.next_start.clear();
-        self.next_len.clear();
-        self.next_arena.clear();
-        self.next_start.reserve(n);
-        self.next_len.reserve(n);
-
-        for index in 0..n {
-            let words = block(index as u32);
-            if self.have_image && self.previous(index) != words {
-                bits[index / 64] |= 1u64 << (index % 64);
-                count += 1;
-            }
-            let start = u32::try_from(self.next_arena.len()).unwrap_or(u32::MAX);
-            self.next_start.push(start);
-            self.next_len
-                .push(u32::try_from(words.len()).unwrap_or(u32::MAX));
-            self.next_arena.extend_from_slice(words);
+        if !self.have_image || self.offsets.len() != n {
+            self.remember(n, offsets, payload);
+            self.have_image = true;
+            return ChangeSet {
+                bits: Vec::new(),
+                count: 0,
+                force_full: true,
+            };
         }
 
-        std::mem::swap(&mut self.start, &mut self.next_start);
-        std::mem::swap(&mut self.len, &mut self.next_len);
-        std::mem::swap(&mut self.arena, &mut self.next_arena);
+        self.scratch.resize(n.div_ceil(64), 0);
+        self.scratch.fill(0);
+        let mut count = 0u32;
+        let mut force_full = false;
+        for index in 0..n {
+            let old = block_words(&self.offsets, &self.payload, index);
+            let new = block_words(offsets, payload, index);
+            if same_coefficients(old, new) {
+                continue;
+            }
+            self.scratch[index / 64] |= 1u64 << (index % 64);
+            count += 1;
+            if count.saturating_mul(2) > block_count {
+                force_full = true;
+                break;
+            }
+        }
 
-        let force_full = !self.have_image || count.saturating_mul(2) > block_count;
-        self.have_image = true;
+        if force_full || count != 0 {
+            self.remember(n, offsets, payload);
+        }
+        let bits = if force_full || count == 0 {
+            Vec::new()
+        } else {
+            self.scratch.clone()
+        };
         ChangeSet {
             bits,
             count,
@@ -116,11 +132,47 @@ impl PyramidCull {
         }
     }
 
-    fn previous(&self, index: usize) -> &[u32] {
-        let start = self.start[index] as usize;
-        let len = self.len[index] as usize;
-        &self.arena[start..start + len]
+    fn remember(&mut self, n: usize, offsets: &[u32], payload: &[u32]) {
+        self.offsets.clear();
+        let have = n.min(offsets.len());
+        self.offsets.extend_from_slice(&offsets[..have]);
+        self.offsets.resize(n, MISSING_BLOCK);
+        self.payload.clear();
+        self.payload.extend_from_slice(payload);
     }
+}
+
+/// Words of one block, header included, or empty when it is missing or short.
+fn block_words<'a>(offsets: &'a [u32], payload: &'a [u32], index: usize) -> &'a [u32] {
+    let Some(&offset) = offsets.get(index) else {
+        return &[];
+    };
+    if offset == MISSING_BLOCK {
+        return &[];
+    }
+    let offset = offset as usize;
+    let Some(&header) = payload.get(offset) else {
+        return &[];
+    };
+    let words = ((header >> 16) & 0xfff) as usize;
+    match offset.checked_add(words) {
+        Some(end) if words > 0 && end <= payload.len() => &payload[offset..end],
+        _ => &[],
+    }
+}
+
+/// Coefficient words, ignoring the frame counter in the first header word.
+fn same_coefficients(old: &[u32], new: &[u32]) -> bool {
+    if old.len() != new.len() {
+        return false;
+    }
+    if old.is_empty() {
+        return true;
+    }
+    if (old[0] ^ new[0]) & !SEQUENCE_BITS != 0 {
+        return false;
+    }
+    old[1..] == new[1..]
 }
 
 /// `x | (y << 16) | (component << 28)`, in tile units. Grids of a legal frame
@@ -385,36 +437,66 @@ mod tests {
         bits
     }
 
+    /// `blocks[i] == None` is a block that was not received. The words are the
+    /// coefficient payload after the two header words.
+    fn frame(blocks: &[Option<&[u32]>], sequence: u8) -> (Vec<u32>, Vec<u32>) {
+        let mut offsets = vec![MISSING_BLOCK; blocks.len()];
+        let mut payload = Vec::new();
+        for (index, block) in blocks.iter().enumerate() {
+            let Some(coeffs) = block else {
+                continue;
+            };
+            offsets[index] = payload.len() as u32;
+            let words = (2 + coeffs.len()) as u32;
+            payload.push((words << 16) | (u32::from(sequence) << 28));
+            payload.push((index as u32) << 8);
+            payload.extend_from_slice(coeffs);
+        }
+        (offsets, payload)
+    }
+
+    fn watch(cull: &mut PyramidCull, blocks: &[Option<&[u32]>], sequence: u8) -> ChangeSet {
+        let (offsets, payload) = frame(blocks, sequence);
+        cull.observe_frame(blocks.len() as u32, &offsets, &payload)
+    }
+
     #[test]
     fn repeated_payloads_select_nothing() {
         let mut cull = PyramidCull::default();
-        let first = cull.observe(4, |_| &[]);
+        let none = [None, None, None, None];
+        let first = watch(&mut cull, &none, 0);
         assert!(first.force_full);
-        let second = cull.observe(4, |_| &[]);
+        let second = watch(&mut cull, &none, 1);
         assert!(!second.force_full);
         assert_eq!(second.count, 0);
 
-        let mut blocks = [Vec::<u32>::new(), vec![7, 8], Vec::new(), Vec::new()];
-        let changed = cull.observe(4, |index| blocks[index as usize].as_slice());
+        let mut blocks = [None, Some(&[7, 8][..]), None, None];
+        let changed = watch(&mut cull, &blocks, 2);
         assert!(!changed.force_full);
         assert_eq!(changed.count, 1);
         assert!(bit(&changed.bits, 1));
         assert!(!bit(&changed.bits, 0));
 
-        let same = cull.observe(4, |index| blocks[index as usize].as_slice());
+        // The frame counter moved and the coefficients did not.
+        let same = watch(&mut cull, &blocks, 3);
         assert_eq!(same.count, 0);
-        blocks[1] = vec![7, 9];
-        let edited = cull.observe(4, |index| blocks[index as usize].as_slice());
+        assert!(!same.force_full);
+        blocks[1] = Some(&[7, 9][..]);
+        let edited = watch(&mut cull, &blocks, 4);
         assert_eq!(edited.count, 1);
         assert!(bit(&edited.bits, 1));
 
         // More than half the blocks is a full dispatch: building the tile list
         // costs more than running the level.
-        let many = cull.observe(4, |index| if index < 3 { &[1u32][..] } else { &[] });
+        let many = watch(
+            &mut cull,
+            &[Some(&[1][..]), Some(&[1][..]), Some(&[1][..]), None],
+            5,
+        );
         assert!(many.force_full);
 
         cull.forget();
-        let after_clear = cull.observe(4, |_| &[]);
+        let after_clear = watch(&mut cull, &none, 6);
         assert!(after_clear.force_full);
     }
 

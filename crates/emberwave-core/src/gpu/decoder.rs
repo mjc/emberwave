@@ -193,6 +193,14 @@ struct FastTiles {
     dummy_views: [wgpu::TextureView; 3],
     _dummy_textures: [wgpu::Texture; 3],
     cull: PyramidCull,
+    /// Bind groups for the plane views last decoded into. A player passes the
+    /// same views every frame.
+    cached_planes: Option<CachedPlanes>,
+}
+
+struct CachedPlanes {
+    views: [usize; 3],
+    fill: PlaneFill,
 }
 
 /// A dispatch of the inverse transform for one decomposition level.
@@ -207,6 +215,7 @@ struct IdwtStage {
 }
 
 /// How the planes of a decode into plane textures get there.
+#[derive(Clone)]
 enum PlaneFill {
     /// Copies of the packed planes (decision D41).
     Copy,
@@ -591,6 +600,7 @@ impl Decoder {
                     dummy_views,
                     _dummy_textures: dummy_textures,
                     cull: PyramidCull::default(),
+                    cached_planes: None,
                 }
             });
 
@@ -1187,12 +1197,12 @@ impl Decoder {
     /// any optional pipeline and building store bind groups) before assembling a
     /// new frame or taking a turn at the queue (decision D60).
     fn prepare_plane_targets(
-        &self,
+        &mut self,
         targets: [&wgpu::TextureView; 3],
     ) -> Result<PlaneFill, GpuError> {
         self.check_device()?;
         self.check_plane_targets(targets)?;
-        let outcome = self.plane_fill(targets);
+        let outcome = self.plane_fill_cached(targets);
         if outcome.is_err() {
             notice_loss(&self.device, &self.lost);
             self.check_device()?;
@@ -1604,7 +1614,7 @@ impl Decoder {
             Read::Texture(target) => Output::Picture(Fill::of(target.texture())),
             Read::Planes(targets) => Output::Planes(match prepared_planes {
                 Some(fill) => fill,
-                None => self.plane_fill(targets)?,
+                None => self.plane_fill_cached(targets)?,
             }),
             Read::Nothing | Read::Yuv | Read::Rgb => Output::None,
         };
@@ -1694,6 +1704,37 @@ impl Decoder {
         Ok(build_bind_groups(stage, "idwt planes").unwrap_or(PlaneFill::Copy))
     }
 
+    /// [`plane_fill`](Self::plane_fill), reusing the fast inverse transform's
+    /// bind groups when `targets` are the views built last time.
+    fn plane_fill_cached(
+        &mut self,
+        targets: [&wgpu::TextureView; 3],
+    ) -> Result<PlaneFill, GpuError> {
+        let keys = targets.map(|view| std::ptr::from_ref(view) as usize);
+        if let Some(cached) = self
+            .fast
+            .as_ref()
+            .and_then(|fast| fast.cached_planes.as_ref())
+        {
+            if cached.views == keys {
+                return Ok(cached.fill.clone());
+            }
+        }
+        let fill = self.plane_fill(targets)?;
+        if let PlaneFill::Store {
+            fast_tiles: true, ..
+        } = fill
+        {
+            if let Some(fast) = &mut self.fast {
+                fast.cached_planes = Some(CachedPlanes {
+                    views: keys,
+                    fill: fill.clone(),
+                });
+            }
+        }
+        Ok(fill)
+    }
+
     /// Bind groups for every level of the fast 16-bit inverse transform.
     ///
     /// Levels that do not write a plane still bind a group, aimed at 1×1
@@ -1766,9 +1807,11 @@ impl Decoder {
             let layout = self.assembler.layout();
             let frame = self.assembler.frame();
             let fast = self.fast.as_mut().expect("fast r16 tiles");
-            let mut change = fast.cull.observe(layout.block_count(), |index| {
-                frame.block(index).unwrap_or(&[])
-            });
+            let mut change = fast.cull.observe_frame(
+                layout.block_count(),
+                frame.block_offsets(),
+                frame.payload(),
+            );
             if conceal {
                 change.force_full = true;
                 fast.cull.forget();
@@ -1781,6 +1824,10 @@ impl Decoder {
                     fast.gpu_full = true;
                     Some(TileUpload::Full)
                 }
+            } else if change.count == 0 {
+                fast.counts = [0; DECOMPOSITION_LEVELS];
+                fast.gpu_full = false;
+                None
             } else {
                 let mut parent = None;
                 let mut regions = Vec::new();
